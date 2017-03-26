@@ -1405,13 +1405,16 @@ proc parseRoutine(p: var TParser): PNode =
   getTok(p)
   skipCom(p, result)
   expectIdent(p)
+  let oldSelfClass = p.selfClass
   var next = p.peekTok
-  if next.xkind == pxDot:
+  if next.xkind == pxDot: # is it method ?
     p.selfClass = p.tok.ident
     p.removeNextTok
     getTok(p)
     skipCom(p, result)
     expectIdent(p)
+  else:
+    p.selfClass = nil
   addSon(result, identVis(p))
   # patterns, generic parameters:
   addSon(result, ast.emptyNode)
@@ -1435,13 +1438,14 @@ proc parseRoutine(p: var TParser): PNode =
       of pxType: addSon(stmts, parseTypeSection(p))
       of pxComment: skipCom(p, result)
       of pxBegin: break 
+      of pxProcedure, pxFunction: addSon(stmts, parseRoutine(p))
       else: 
         parMessage(p, errTokenExpected, "begin")
         break 
     var a = parseStmt(p)
     for i in countup(0, sonsLen(a) - 1): addSon(stmts, a.sons[i])
     addSon(result, stmts)
-  p.selfClass = nil
+  p.selfClass = oldSelfClass
 
 proc fixExit(p: var TParser, n: PNode): bool = 
   if (p.tok.ident.id == getIdent(p.lex.cache, "exit").id): 
