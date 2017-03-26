@@ -68,6 +68,8 @@ proc openParser*(p: var TParser, filename: string, inputStream: PLLStream,
 proc closeParser*(p: var TParser)
 proc exSymbol*(n: var PNode)
 proc fixRecordDef*(n: var PNode)
+proc parseRoutine(p: var TParser; noBody: bool = false): PNode
+
   # XXX: move these two to an auxiliary module
 
 # implementation
@@ -972,7 +974,6 @@ proc parseCallingConvention(p: var TParser): PNode =
 proc parseRoutineSpecifiers(p: var TParser, noBody: var bool, isVirtual: var bool): PNode = 
   var e: PNode
   result = parseCallingConvention(p)
-  noBody = false
   while p.tok.xkind == pxSymbol: 
     case toLower(p.tok.ident.s)
     of "assembler", "overload", "far": 
@@ -1204,6 +1205,8 @@ proc parseRecordPart(p: var TParser): PNode =
       getTok(p)
     of pxComment: 
       skipCom(p, lastSon(result))
+    of pxFunction, pxProcedure:
+      discard parseRoutine(p, true) # TODO: forward all methods defs and mark virtual methods as "method" and keep the calling conventions
     else: 
       parMessage(p, errIdentifierExpected, $p.tok)
       break
@@ -1419,8 +1422,9 @@ proc parseVar(p: var TParser): PNode =
     addSon(result, parseIdentColonEquals(p, identVis))
   p.lastVarSection = result
 
-proc parseRoutine(p: var TParser): PNode = 
-  var noBody, isVirtual: bool
+proc parseRoutine(p: var TParser; noBody: bool): PNode = 
+  var noBody = noBody
+  var isVirtual: bool
   result = newNodeP(nkProcDef, p)
   getTok(p)
   skipCom(p, result)
