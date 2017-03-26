@@ -12,7 +12,7 @@
 # used to convert the AST to its text representation.
 
 import 
-  os, llstream, paslex, idents, strutils, ast, astalgo, msgs, options
+  os, llstream, paslex, idents, strutils, ast, astalgo, msgs, options, deques
 
 type 
   TSection = enum 
@@ -32,7 +32,9 @@ type
     tok: TToken
     repl: TIdTable           # replacements
     flags: set[TParserFlag]
-  
+    ahead: Deque[TToken]
+    selfClass: PIdent
+
   TReplaceTuple* = array[0..1, string]
 
 const 
@@ -67,6 +69,26 @@ proc fixRecordDef*(n: var PNode)
 
 # implementation
 
+proc idTableGet(t: TIdTable, key: PIdent): RootRef =
+  when false:
+    var first {.global.} = true
+    if first:
+      echo t.repr
+      first = false
+  let s = key.s.toLower
+  var key = key
+  var next = key.next
+  while next != nil:
+    if next.s.toLower == s :
+      key = next
+      break
+    next = next.next
+    # echo next.repr
+  # echo key.repr
+  let res = astalgo.idTableGet(t, key)
+  # echo res.repr
+  res
+
 proc openParser(p: var TParser, filename: string, 
                 inputStream: PLLStream, flags: set[TParserFlag] = {}) = 
   openLexer(p.lex, filename, inputStream)
@@ -79,9 +101,24 @@ proc openParser(p: var TParser, filename: string,
       idTablePut(p.repl, getIdent(nimReplacements[i][0]), 
                  getIdent(nimReplacements[i][1]))
   p.flags = flags
-  
+  p.ahead = initDeque[TToken]()
+
 proc closeParser(p: var TParser) = closeLexer(p.lex)
-proc getTok(p: var TParser) = getTok(p.lex, p.tok)
+proc getTok(p: var TParser) = 
+  if p.ahead.len > 0 :
+    p.tok = p.ahead.popFirst
+  else:
+    getTok(p.lex, p.tok)
+
+proc peekTok(p: var TParser): TToken =
+  if p.ahead.len == 0:
+    var next: TToken
+    getTok(p.lex, next)
+    p.ahead.addLast(next)
+  result = p.ahead.peekFirst
+
+proc removeNextTok(p: var TParser) =
+  discard p.ahead.popFirst
 
 proc parMessage(p: TParser, msg: TMsgKind, arg = "") = 
   lexMessage(p.lex, msg, arg)
@@ -870,11 +907,23 @@ proc parseParam(p: var TParser): PNode =
     addSon(result, parseExpr(p))
   else: 
     addSon(result, ast.emptyNode)
-  
+
+proc genSelfParam(p: var TParser): PNode =
+  var a: PNode
+  result = newNodeP(nkIdentDefs, p)
+  var name = newNodeP(nkIdent, p)
+  name.ident = getIdent(p.lex.cache, "self")
+  result.addSon(name)
+  a = createIdentNodeP(p.selfClass, p)
+  result.addSon(a)
+  result.addSon(ast.emptyNode)
+
 proc parseParamList(p: var TParser): PNode = 
   var a: PNode
   result = newNodeP(nkFormalParams, p)
   addSon(result, ast.emptyNode)         # return type
+  if not isNil(p.selfClass):
+    addSon(result, genSelfParam(p))
   if p.tok.xkind == pxParLe: 
     p.inParamList = true
     getTok(p)
@@ -902,7 +951,7 @@ proc parseParamList(p: var TParser): PNode =
 
 proc parseCallingConvention(p: var TParser): PNode = 
   result = ast.emptyNode
-  if p.tok.xkind == pxSymbol: 
+  if p.tok.xkind in {pxSymbol, pxInline} : 
     case toLower(p.tok.ident.s)
     of "stdcall", "cdecl", "safecall", "syscall", "inline", "fastcall": 
       result = newNodeP(nkPragma, p)
@@ -917,7 +966,7 @@ proc parseCallingConvention(p: var TParser): PNode =
     else: 
       discard
 
-proc parseRoutineSpecifiers(p: var TParser, noBody: var bool): PNode = 
+proc parseRoutineSpecifiers(p: var TParser, noBody: var bool, isVirtual: var bool): PNode = 
   var e: PNode
   result = parseCallingConvention(p)
   noBody = false
@@ -977,6 +1026,17 @@ proc parseRoutineSpecifiers(p: var TParser, noBody: var bool): PNode =
       else: 
         addSon(result, newIdentNodeP(getIdent("importc"), p))
       opt(p, pxSemicolon)
+    of "virtual":
+      isVirtual = true
+      getTok(p)
+      opt(p, pxSemicolon)
+    of "override":
+      isVirtual = true
+      if result.kind == nkEmpty: result = newNodeP(nkPragma, p)
+      addSon(result, newIdentNodeP(getIdent("override"), p))
+      getTok(p)
+      opt(p, pxSemicolon)
+        
     else: 
       e = parseCallingConvention(p)
       if e.kind == nkEmpty: break 
@@ -1340,18 +1400,29 @@ proc parseVar(p: var TParser): PNode =
   p.lastVarSection = result
 
 proc parseRoutine(p: var TParser): PNode = 
-  var noBody: bool
+  var noBody, isVirtual: bool
   result = newNodeP(nkProcDef, p)
   getTok(p)
   skipCom(p, result)
   expectIdent(p)
+  var next = p.peekTok
+  if next.xkind == pxDot:
+    p.selfClass = p.tok.ident
+    p.removeNextTok
+    getTok(p)
+    skipCom(p, result)
+    expectIdent(p)
   addSon(result, identVis(p))
   # patterns, generic parameters:
   addSon(result, ast.emptyNode)
   addSon(result, ast.emptyNode)   
   addSon(result, parseParamList(p))
   opt(p, pxSemicolon)
-  addSon(result, parseRoutineSpecifiers(p, noBody))
+  addSon(result, parseRoutineSpecifiers(p, noBody, isVirtual))
+  if isVirtual :
+    var resMethod = newNodeP(nkMethodDef, p)
+    resMethod.sons = result.sons
+    result = resMethod
   addSon(result, ast.emptyNode)
   if (p.section == seInterface) or noBody: 
     addSon(result, ast.emptyNode)
@@ -1370,6 +1441,7 @@ proc parseRoutine(p: var TParser): PNode =
     var a = parseStmt(p)
     for i in countup(0, sonsLen(a) - 1): addSon(stmts, a.sons[i])
     addSon(result, stmts)
+  p.selfClass = nil
 
 proc fixExit(p: var TParser, n: PNode): bool = 
   if (p.tok.ident.id == getIdent("exit").id): 
