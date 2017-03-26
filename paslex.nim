@@ -75,7 +75,7 @@ type
 
   TLexer* = object of TBaseLexer
     filename*: string
-
+    cache*: IdentCache
 
 proc getTok*(L: var TLexer, tok: var TToken)
 proc printTok*(tok: TToken)
@@ -85,7 +85,7 @@ proc `$`*(tok: TToken): string
 var
   dummyIdent: PIdent
   gLinesCompiled: int
-
+  
 proc fillToken(L: var TToken) =
   L.xkind = pxInvalid
   L.iNumber = 0
@@ -97,6 +97,7 @@ proc fillToken(L: var TToken) =
 proc openLexer*(lex: var TLexer, filename: string, inputstream: PLLStream) =
   openBaseLexer(lex, inputstream)
   lex.filename = filename
+  lex.cache = newIdentCache()
 
 proc closeLexer*(lex: var TLexer) =
   inc(gLinesCompiled, lex.lineNumber)
@@ -326,31 +327,50 @@ proc getString(L: var TLexer, tok: var TToken) =
   tok.xkind = pxStrLit
   L.bufpos = pos
 
-proc getSymbol(L: var TLexer, tok: var TToken) =
-  var h: THash = 0
-  var pos = L.bufpos
-  var buf = L.buf
-  while true:
-    var c = buf[pos]
-    case c
-    of 'a'..'z', '0'..'9', '\x80'..'\xFF':
-      h = h +% ord(c)
-      h = h +% h shl 10
-      h = h xor (h shr 6)
-    of 'A'..'Z':
-      c = chr(ord(c) + (ord('a') - ord('A'))) # toLower()
-      h = h +% ord(c)
-      h = h +% h shl 10
-      h = h xor (h shr 6)
-    of '_': discard
-    else: break
-    inc(pos)
-  h = h +% h shl 3
-  h = h xor (h shr 11)
-  h = h +% h shl 15
-  tok.ident = getIdent(addr(L.buf[L.bufpos]), pos - L.bufpos, h)
-  L.bufpos = pos
-  setKeyword(L, tok)
+when false:
+  proc getSymbol(L: var TLexer, tok: var TToken) =
+    var pos = L.bufpos
+    var buf = L.buf
+    while true:
+      var c = buf[pos]
+      case c
+      of 'a'..'z', '0'..'9', '\x80'..'\xFF',
+        'A'..'Z', '_': discard
+      else: break
+      inc(pos)
+    var s = newStringOfCap(pos - L.bufpos)
+    copyMem(addr(s[0]), addr(L.buf[L.bufpos]), pos - L.bufpos)
+    echo s
+    tok.ident = getIdent(L.cache, s)
+    L.bufpos = pos
+    setKeyword(L, tok)
+
+when true:
+  proc getSymbol(L: var TLexer, tok: var TToken) =
+    var h: THash = 0
+    var pos = L.bufpos
+    var buf = L.buf
+    while true:
+      var c = buf[pos]
+      case c
+      of 'a'..'z', '0'..'9', '\x80'..'\xFF':
+        h = h +% ord(c)
+        h = h +% h shl 10
+        h = h xor (h shr 6)
+      of 'A'..'Z':
+        c = chr(ord(c) + (ord('a') - ord('A'))) # toLower()
+        h = h +% ord(c)
+        h = h +% h shl 10
+        h = h xor (h shr 6)
+      of '_': discard
+      else: break
+      inc(pos)
+    h = h +% h shl 3
+    h = h xor (h shr 11)
+    h = h +% h shl 15
+    tok.ident = getIdent(L.cache, addr(L.buf[L.bufpos]), pos - L.bufpos, h)
+    L.bufpos = pos
+    setKeyword(L, tok)
 
 proc scanLineComment(L: var TLexer, tok: var TToken) =
   var pos = L.bufpos
