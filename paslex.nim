@@ -31,7 +31,8 @@ type
     pxExports, pxFinalization, pxFinally, pxFor, pxFunction, pxGoto, pxIf,
     pxImplementation, pxIn, pxInherited, pxInitialization, pxInline,
     pxInterface, pxIs, pxLabel, pxLibrary, pxMod, pxNil, pxNot, pxObject, pxOf,
-    pxOr, pxOut, pxPacked, pxProcedure, pxProgram, pxProperty, pxRaise,
+    pxOr, pxOut, pxPacked, pxPrivate, pxProcedure, pxProgram, pxProperty, pxProtected
+    pxPublic, pxPublished, pxRaise,
     pxRecord, pxRepeat, pxResourcestring, pxSet, pxShl, pxShr, pxThen,
     pxThreadvar, pxTo, pxTry, pxType, pxUnit, pxUntil, pxUses, pxVar, pxWhile,
     pxWith, pxXor,
@@ -54,7 +55,8 @@ const
     "exports", "finalization", "finally", "for", "function", "goto", "if",
     "implementation", "in", "inherited", "initialization", "inline",
     "interface", "is", "label", "library", "mod", "nil", "not", "object", "of",
-    "or", "out", "packed", "procedure", "program", "property", "raise",
+    "or", "out", "packed", "private", "procedure", "program", "property", "protected", 
+    "public", "published", "raise",
     "record", "repeat", "resourcestring", "set", "shl", "shr", "then",
     "threadvar", "to", "try", "type", "unit", "until", "uses", "var", "while",
     "with", "xor"]

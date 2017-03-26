@@ -19,6 +19,8 @@ type
     seImplementation, seInterface
   TContext = enum 
     conExpr, conStmt, conTypeDesc
+  TVisibilty = enum
+    visPrivate, visProtected, visPublic, visPublished
   TParserFlag* = enum
     pfRefs,             ## use "ref" instead of "ptr" for Pascal's ^typ
     pfMoreReplacements, ## use more than the default replacements
@@ -34,6 +36,7 @@ type
     flags: set[TParserFlag]
     ahead: Deque[TToken]
     selfClass: PIdent
+    visibility: TVisibilty
 
   TReplaceTuple* = array[0..1, string]
 
@@ -1179,11 +1182,26 @@ proc parseRecordPart(p: var TParser): PNode =
     if result.kind == nkEmpty: result = newNodeP(nkRecList, p)
     case p.tok.xkind
     of pxSymbol: 
-      addSon(result, parseIdentColonEquals(p, rawIdent))
+      var defs = parseIdentColonEquals(p, rawIdent)
+      if p.visibility != visPrivate : 
+        fixRecordDef(defs)
+      addSon(result, defs)
       opt(p, pxSemicolon)
       skipCom(p, lastSon(result))
     of pxCase: 
       addSon(result, parseRecordCase(p))
+    of pxPrivate: 
+      p.visibility = visPrivate
+      getTok(p)
+    of pxProtected: 
+      p.visibility = visProtected
+      getTok(p)
+    of pxPublic: 
+      p.visibility = visPublic
+      getTok(p)      
+    of pxPublished: 
+      p.visibility = visPublished
+      getTok(p)
     of pxComment: 
       skipCom(p, lastSon(result))
     else: 
@@ -1231,10 +1249,11 @@ proc addPragmaToIdent(ident: var PNode, pragma: PNode) =
       internalError(ident.info, "addPragmaToIdent")
   addSon(pragmasNode, pragma)
 
-proc parseRecordBody(p: var TParser, result, definition: PNode) = 
+proc parseRecordBody(p: var TParser, result, definition: PNode) =
   skipCom(p, result)
+  p.visibility = if result.kind != nkTupleTy: visPublic else: visPrivate
   var a = parseRecordPart(p)
-  if result.kind != nkTupleTy: fixRecordDef(a)
+  # if result.kind != nkTupleTy: fixRecordDef(a)
   addSon(result, a)
   eat(p, pxEnd)
   case p.tok.xkind
@@ -1259,6 +1278,7 @@ proc parseRecordOrObject(p: var TParser, kind: TNodeKind,
                          definition: PNode): PNode = 
   result = newNodeP(kind, p)
   getTok(p)
+  echo "here"
   addSon(result, ast.emptyNode)
   if p.tok.xkind == pxParLe: 
     var a = newNodeP(nkOfInherit, p)
