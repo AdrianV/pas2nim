@@ -962,7 +962,8 @@ proc parseParamList(p: var TParser): PNode =
 
 proc parseCallingConvention(p: var TParser): PNode = 
   result = ast.emptyNode
-  if p.tok.xkind in {pxSymbol, pxInline} : 
+  case p.tok.xkind 
+  of pxSymbol, pxInline: 
     case toLower(p.tok.ident.s)
     of "stdcall", "cdecl", "safecall", "syscall", "inline", "fastcall": 
       result = newNodeP(nkPragma, p)
@@ -971,11 +972,18 @@ proc parseCallingConvention(p: var TParser): PNode =
       opt(p, pxSemicolon)
     of "register": 
       result = newNodeP(nkPragma, p)
-      addSon(result, newIdentNodeP(getIdent(p.lex.cache, "fastcall"), p))
+      addSon(result, newIdentNameNodeP("fastcall", p))
       getTok(p)
       opt(p, pxSemicolon)
     else: 
       discard
+  of pxOf:
+    if p.peekTok.xkind == pxObject:
+      result = newNodeP(nkPragma, p)
+      addSon(result, newIdentNameNodeP("closure", p))
+      p.eat(pxOf)
+      p.eat(pxObject)
+  else: discard
 
 proc parseRoutineSpecifiers(p: var TParser, noBody: var bool, isVirtual: var bool): PNode = 
   var e: PNode
