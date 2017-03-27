@@ -12,7 +12,8 @@
 # used to convert the AST to its text representation.
 
 import 
-  os, llstream, paslex, idents, strutils, ast, astalgo, msgs, options, deques
+  os, llstream, paslex, idents, strutils, ast, astalgo, msgs, options, 
+  deques, parsetools
 
 type 
   TSection = enum 
@@ -42,13 +43,14 @@ type
 
 const 
   ImportBlackList*: array[1..3, string] = ["nsystem", "sysutils", "charsets"]
-  stdReplacements*: array[1..19, TReplaceTuple] = [["include", "incl"], 
+  stdReplacements*: seq[TReplaceTuple] = @[["include", "incl"], 
     ["exclude", "excl"], ["pchar", "cstring"], ["assignfile", "open"], 
     ["integer", "int"], ["longword", "int32"], ["cardinal", "int"], 
     ["boolean", "bool"], ["shortint", "int8"], ["smallint", "int16"], 
     ["longint", "int32"], ["byte", "int8"], ["word", "int16"], 
     ["single", "float32"], ["double", "float64"], ["real", "float"], 
-    ["length", "len"], ["len", "length"], ["setlength", "setlen"]]
+    ["length", "len"], ["len", "length"], ["setlength", "setlen"],
+    ["TObject", "RootRef"]]
   nimReplacements*: array[1..35, TReplaceTuple] = [["nimread", "read"], 
     ["nimwrite", "write"], ["nimclosefile", "close"], ["closefile", "close"], 
     ["openfile", "open"], ["nsystem", "system"], ["ntime", "times"], 
@@ -68,7 +70,7 @@ proc openParser*(p: var TParser, filename: string, inputStream: PLLStream,
 proc closeParser*(p: var TParser)
 proc exSymbol*(n: var PNode)
 proc fixRecordDef*(n: var PNode)
-proc parseRoutine(p: var TParser; noBody: bool = false): PNode
+proc parseRoutine(p: var TParser; noBody: bool): PNode
 
   # XXX: move these two to an auxiliary module
 
@@ -98,9 +100,9 @@ proc openParser(p: var TParser, filename: string,
                 inputStream: PLLStream, flags: set[TParserFlag] = {}) = 
   openLexer(p.lex, filename, inputStream)
   initIdTable(p.repl)
-  for i in countup(low(stdReplacements), high(stdReplacements)): 
-    idTablePut(p.repl, getIdent(p.lex.cache, stdReplacements[i][0]), 
-               getIdent(p.lex.cache, stdReplacements[i][1]))
+  for r in stdReplacements: 
+    idTablePut(p.repl, getIdent(p.lex.cache, r[0]), 
+               getIdent(p.lex.cache, r[1]))
   if pfMoreReplacements in flags: 
     for i in countup(low(nimReplacements), high(nimReplacements)): 
       idTablePut(p.repl, getIdent(p.lex.cache, nimReplacements[i][0]), 
@@ -170,6 +172,10 @@ proc newStrNodeP(kind: TNodeKind, strVal: string, p: TParser): PNode =
 proc newIdentNodeP(ident: PIdent, p: TParser): PNode = 
   result = newNodeP(nkIdent, p)
   result.ident = ident
+
+proc newIdentNameNodeP(name: string, p: TParser): PNode = 
+  result = newNodeP(nkIdent, p)
+  result.ident = getIdent(p.lex.cache, name)
 
 proc createIdentNodeP(ident: PIdent, p: TParser): PNode = 
   result = newNodeP(nkIdent, p)
@@ -1279,19 +1285,28 @@ proc parseRecordBody(p: var TParser, result, definition: PNode) =
 
 proc parseRecordOrObject(p: var TParser, kind: TNodeKind, 
                          definition: PNode): PNode = 
+  var record: PNode
   result = newNodeP(kind, p)
+  if kind == nkRefTy:
+    record = newNodeP(nkObjectTy, p)
+    result.addSon(record)
+  else:
+    record = result
   getTok(p)
-  echo "here"
-  addSon(result, ast.emptyNode)
+  addSon(record, ast.emptyNode)
   if p.tok.xkind == pxParLe: 
     var a = newNodeP(nkOfInherit, p)
     getTok(p)
     addSon(a, parseTypeDesc(p))
-    addSon(result, a)
+    addSon(record, a)
     eat(p, pxParRi)
+  elif kind == nkRefTy:
+    var a = newNodeP(nkOfInherit, p)
+    a.addSon(newIdentNameNodeP("RootRef", p))
+    record.addSon(a)
   else: 
-    addSon(result, ast.emptyNode)
-  parseRecordBody(p, result, definition)
+    addSon(record, ast.emptyNode)
+  parseRecordBody(p, record, definition)
 
 proc parseTypeDesc(p: var TParser, definition: PNode = nil): PNode = 
   var oldcontext = p.context
@@ -1322,6 +1337,7 @@ proc parseTypeDesc(p: var TParser, definition: PNode = nil): PNode =
       else: 
         internalError(result.info, "anonymous record is not supported")
   of pxObject: result = parseRecordOrObject(p, nkObjectTy, definition)
+  of pxClass: result = parseRecordOrObject(p, nkRefTy, definition)
   of pxParLe: result = parseEnum(p)
   of pxArray: 
     result = newNodeP(nkBracketExpr, p)
@@ -1462,7 +1478,7 @@ proc parseRoutine(p: var TParser; noBody: bool): PNode =
       of pxType: addSon(stmts, parseTypeSection(p))
       of pxComment: skipCom(p, result)
       of pxBegin: break 
-      of pxProcedure, pxFunction: addSon(stmts, parseRoutine(p))
+      of pxProcedure, pxFunction: addSon(stmts, parseRoutine(p, false))
       else: 
         parMessage(p, errTokenExpected, "begin")
         break 
@@ -1545,7 +1561,9 @@ proc parseStmt(p: var TParser): PNode =
   of pxRepeat: result = parseRepeat(p)
   of pxCase: result = parseCase(p)
   of pxTry: result = parseTry(p)
-  of pxProcedure, pxFunction: result = parseRoutine(p)
+  of pxProcedure, pxFunction: 
+    result = parseRoutine(p, false)
+    # echo treeRepr(result)
   of pxType: result = parseTypeSection(p)
   of pxConst: result = parseConstSection(p)
   of pxVar: result = parseVar(p)
