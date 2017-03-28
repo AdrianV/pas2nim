@@ -1495,7 +1495,7 @@ proc parseRecordOrObject(p: var TParser, kind: TNodeKind,
   addSon(record, ast.emptyNode)
   var defIdent = getIdentOfType(definition)
   if p.tok.xkind == pxParLe: 
-    p.classes[defIdent.id] = TObjectInfo(isRefTy: false)
+    p.classes[defIdent.id] = TObjectInfo(isRefTy: kind == nkRefTy)
     var a = newNodeP(nkOfInherit, p)
     getTok(p)
     var ty = parseTypeDesc(p)
@@ -1643,9 +1643,23 @@ proc parseVar(p: var TParser): PNode =
     addSon(result, parseIdentColonEquals(p, identVis))
   p.lastVarSection = result
 
+proc fixConstructor(p: var TParser, n: var PNode) =
+  n.sons[3].sons[0] = newIdentNodeP(p.selfClass, p)
+  if n.sons.len >= 7 and n.sons[6].kind == nkStmtList:
+    var stm = newNodeP(nkStmtList, p).add(
+      newNodeP(nkAsgn, p).add(
+        newIdentNameNodeP("result", p),
+        newIdentNameNodeP("self", p)
+      )
+    )
+    for s in n.sons[6].sons:
+      stm.addSon(s)
+    n.sons[6] = stm
+
 proc parseRoutine(p: var TParser; noBody: bool): PNode = 
   var noBody = noBody
   var isVirtual: bool
+  let kind = p.tok.xkind
   result = newNodeP(nkProcDef, p)
   getTok(p)
   skipCom(p, result)
@@ -1691,6 +1705,9 @@ proc parseRoutine(p: var TParser; noBody: bool): PNode =
     var a = parseStmt(p)
     for i in countup(0, sonsLen(a) - 1): addSon(stmts, a.sons[i])
     addSon(result, stmts)
+  if kind == pxConstructor and p.selfClass != nil:
+    p.fixConstructor(result)
+    # echo treeRepr(result)
   p.selfClass = oldSelfClass
 
 proc fixExit(p: var TParser, n: PNode): bool = 
@@ -1750,7 +1767,7 @@ proc parseBegin(p: var TParser, result: PNode) =
       var a = parseStmt(p)
       if a.kind != nkEmpty: addSon(result, a)
   if sonsLen(result) == 0: addSon(result, newNodeP(nkNilLit, p))
-  
+
 proc parseStmt(p: var TParser): PNode = 
   var oldcontext = p.context
   p.context = conStmt
@@ -1769,7 +1786,6 @@ proc parseStmt(p: var TParser): PNode =
   of pxTry: result = parseTry(p)
   of pxProcedure, pxFunction, pxConstructor, pxDestructor: 
     result = parseRoutine(p, false)
-    # echo treeRepr(result)
   of pxType: result = parseTypeSection(p)
   of pxConst: result = parseConstSection(p)
   of pxVar: result = parseVar(p)
