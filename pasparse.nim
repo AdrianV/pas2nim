@@ -13,7 +13,7 @@
 
 import 
   os, llstream, paslex, idents, strutils, ast, astalgo, msgs, options, 
-  deques, parsetools
+  deques, tables, renderer, parsetools
 
 type 
   TSection = enum 
@@ -21,11 +21,18 @@ type
   TContext = enum 
     conExpr, conStmt, conTypeDesc
   TVisibilty = enum
-    visPrivate, visProtected, visPublic, visPublished
+    visPublic, visPrivate, visProtected, visPublished
   TParserFlag* = enum
     pfRefs,             ## use "ref" instead of "ptr" for Pascal's ^typ
     pfMoreReplacements, ## use more than the default replacements
     pfImportBlackList   ## use import blacklist
+  TExtraInfo = enum
+    eiConstructor, eiDestructor, eiPublic
+  TExtraStmt = ref object
+    node: PNode
+    flags: set[TExtraInfo]
+  TObjectInfo = ref object
+    isRefTy: bool
   TParser*{.final.} = object
     section: TSection
     inParamList: bool
@@ -38,6 +45,8 @@ type
     ahead: Deque[TToken]
     selfClass: PIdent
     visibility: TVisibilty
+    extra: seq[TExtraStmt]
+    classes: Table[int, TObjectInfo]
 
   TReplaceTuple* = array[0..1, string]
 
@@ -96,6 +105,15 @@ proc idTableGet(t: TIdTable, key: PIdent): RootRef =
   # echo res.repr
   res
 
+proc add(father, child: PNode): PNode =
+  result = father
+  result.addSon(child)
+
+proc add(father: PNode; childs: varargs[PNode]): PNode =
+  result = father
+  for child in childs:
+    result.addSon(child)
+  
 proc openParser(p: var TParser, filename: string, 
                 inputStream: PLLStream, flags: set[TParserFlag] = {}) = 
   openLexer(p.lex, filename, inputStream)
@@ -109,6 +127,7 @@ proc openParser(p: var TParser, filename: string,
                  getIdent(p.lex.cache, nimReplacements[i][1]))
   p.flags = flags
   p.ahead = initDeque[TToken]()
+  p.classes = initTable[int, TObjectInfo]()
 
 proc closeParser(p: var TParser) = closeLexer(p.lex)
 proc getTok(p: var TParser) = 
@@ -182,6 +201,21 @@ proc createIdentNodeP(ident: PIdent, p: TParser): PNode =
   var x = PIdent(idTableGet(p.repl, ident))
   if x != nil: result.ident = x
   else: result.ident = ident
+
+proc getIdentOfType(n: PNode): PIdent =
+  if n.kind == nkTypeDef :
+    if n.sons[0].kind == nkIdent: return n.sons[0].ident
+    elif n.sons[0].kind == nkPostfix and n.sons[0].len >= 2 and
+      n.sons[0][1].kind == nkIdent: return n.sons[0][1].ident
+
+proc pushExtraStmt(p: var TParser, s: TExtraStmt) =
+  if p.extra == nil: 
+    p.extra = @[]
+    var n = newNodeP(nkPragma, p).add(newNodeP(nkExprColonExpr, p).add(
+      newIdentNameNodeP("this", p),
+      newIdentNameNodeP("self", p)))
+    p.extra.add(TExtraStmt(node: n, flags: {}))
+  p.extra.add(s)
   
 proc parseExpr(p: var TParser): PNode
 proc parseStmt(p: var TParser): PNode
@@ -919,15 +953,19 @@ proc parseParam(p: var TParser): PNode =
   else: 
     addSon(result, ast.emptyNode)
 
+proc genSelfType(p: var TParser): PNode =
+  result = createIdentNodeP(p.selfClass, p)
+  var info = p.classes.getOrDefault(p.selfClass.id)
+  if info == nil:
+    echo "warning not found ", p.selfClass.s
+  if info != nil and not info.isRefTy:
+    result = newNodeP(nkVarTy, p).add(result)
+  
 proc genSelfParam(p: var TParser): PNode =
-  var a: PNode
-  result = newNodeP(nkIdentDefs, p)
-  var name = newNodeP(nkIdent, p)
-  name.ident = getIdent(p.lex.cache, "self")
-  result.addSon(name)
-  a = createIdentNodeP(p.selfClass, p)
-  result.addSon(a)
-  result.addSon(ast.emptyNode)
+  result = newNodeP(nkIdentDefs, p).add(
+    newIdentNameNodeP("self", p),
+    genSelfType(p),
+    ast.emptyNode)
 
 proc parseParamList(p: var TParser): PNode = 
   var a: PNode
@@ -1101,7 +1139,7 @@ proc parseEnum(p: var TParser): PNode =
 proc identVis(p: var TParser): PNode = 
   # identifier with visability
   var a = createIdentNodeP(p.tok.ident, p)
-  if p.section == seInterface: 
+  if p.visibility != visPrivate: # section == seInterface: 
     result = newNodeP(nkPostfix, p)
     addSon(result, newIdentNodeP(getIdent(p.lex.cache, "*"), p))
     addSon(result, a)
@@ -1191,6 +1229,125 @@ proc parseRecordCase(p: var TParser): PNode =
     addSon(result, b)
     if b.kind == nkElse: break 
   
+proc genPropertyReader(p: var TParser, propName: PIdent, propTy: PNode, readerId: PIdent): PNode =
+  result =  newNodeP(nkTemplateDef, p).add(
+    newIdentNodeP(propName, p),
+    ast.emptyNode,
+    ast.emptyNode,
+    newNodeP(nkFormalParams, p).add(
+      propTy,
+      newNodeP(nkIdentDefs, p).add(
+        newIdentNameNodeP("self", p),
+        newIdentNodeP(p.selfClass, p),
+        ast.emptyNode
+      )
+    ),
+    ast.emptyNode,
+    ast.emptyNode,
+    newNodeP(nkStmtList, p).add(
+      newNodeP(nkDotExpr, p).add(
+        newIdentNameNodeP("self", p),
+        newIdentNodeP(readerId, p)
+      )
+    )
+  ) 
+  if p.visibility != visPrivate:
+    exSymbol(result.sons[0])
+
+proc genPropertyWriter(p: var TParser, propName: PIdent, propTy: PNode, writerId: PIdent): PNode =
+  let value = newIdentNameNodeP("v", p)
+  let asgn = newNodeP(nkAsgn, p).add(
+      newNodeP(nkDotExpr, p).add(
+        newIdentNameNodeP("self", p),
+        newIdentNodeP(writerId, p)
+      ),
+      value
+    )
+  let call = newNodeP(nkCall, p).add(
+      newIdentNodeP(writerId, p),
+      newIdentNameNodeP("self", p),
+      value
+  )
+  # identfiers starting with F are treated as variables, starting with set as setter calls
+  # all other the nim compiler should decide
+  var setter = if writerId.s[0..0].toLower == "f":
+      asgn
+    elif writerId.s[0..2].toLower == "set":
+      call
+    else:
+      newNodeP(nkWhenStmt, p).add(
+        newNodeP(nkElifBranch, p).add(
+          newNodeP(nkCall, p).add(
+            newIdentNameNodeP("compiles", p),
+            call
+          ),
+          newNodeP(nkStmtList, p).add(call)
+        ),
+        newNodeP(nkElse, p).add(
+          newNodeP(nkStmtList, p).add(asgn)
+        )
+      )
+      
+  result =  newNodeP(nkTemplateDef, p).add(
+    newNodeP(nkAccQuoted, p).add(
+      newIdentNodeP(propName, p),
+      newIdentNameNodeP("=", p)
+    ),
+    ast.emptyNode,
+    ast.emptyNode,
+    newNodeP(nkFormalParams, p).add(
+      ast.emptyNode,
+      genSelfParam(p),
+      newNodeP(nkIdentDefs, p).add(
+        value,
+        propTy,
+        ast.emptyNode
+      ) ),
+    ast.emptyNode,
+    ast.emptyNode,
+    newNodeP(nkStmtList, p).add(
+      setter
+    )
+  )
+
+proc parseProperty(p: var TParser): PNode =
+  result = ast.emptyNode
+  template nextIdent(): PIdent =
+    getTok(p)
+    if p.tok.xkind != pxSymbol: parMessage(p, errIdentifierExpected, $p.tok)
+    var res = p.tok.ident
+    getTok(p)
+    res
+
+  var propName = nextIdent()
+  var readId, writeId: PIdent
+  p.eat(pxColon)
+  var propTy = parseTypeDesc(p)
+  while (p.tok.xkind != pxEof) and (p.tok.xkind != pxSemicolon):
+    case p.tok.xkind
+    of pxSymbol:
+      if p.tok.ident.id == getIdent(p.lex.cache, "read").id: 
+        readId = nextIdent()
+      elif p.tok.ident.id == getIdent(p.lex.cache, "write").id: 
+        writeId = nextIdent()
+      elif p.tok.ident.id == getIdent(p.lex.cache, "default").id: 
+        discard nextIdent()
+      else:
+        parMessage(p, errIdentifierExpected, $p.tok)
+    else:
+      parMessage(p, errIdentifierExpected, $p.tok)
+  # echo "property ", propName.s, ": ", propTy.treeRepr, " for class ", p.selfClass.s
+  var flags: set[TExtraInfo]
+  if p.visibility != visPrivate:
+    incl(flags, eiPublic)
+  if readId != nil:
+    var a = genPropertyReader(p, propName, propTy, readId)
+    p.pushExtraStmt(TExtraStmt(node: a, flags: flags))
+  if writeId != nil :
+    var a = genPropertyWriter(p, propName, propTy, writeId)
+    p.pushExtraStmt(TExtraStmt(node: a, flags: flags))    
+  opt(p, pxSemiColon)
+
 proc parseRecordPart(p: var TParser): PNode = 
   result = ast.emptyNode
   while (p.tok.xkind != pxEof) and (p.tok.xkind != pxEnd): 
@@ -1218,9 +1375,20 @@ proc parseRecordPart(p: var TParser): PNode =
       p.visibility = visPublished
       getTok(p)
     of pxComment: 
-      skipCom(p, lastSon(result))
-    of pxFunction, pxProcedure:
-      discard parseRoutine(p, true) # TODO: forward all methods defs and mark virtual methods as "method" and keep the calling conventions
+      if result.sons.len > 0:
+        skipCom(p, lastSon(result))
+      else:
+        skipCom(p, result)
+    of pxFunction, pxProcedure, pxConstructor, pxDestructor:
+      var xkind = p.tok.xkind
+      var a = parseRoutine(p, true) # TODO: forward all methods defs and mark virtual methods as "method" and keep the calling conventions
+      var flags: set[TExtraInfo]
+      if xkind == pxConstructor: incl(flags, eiConstructor)
+      elif xkind == pxDestructor: incl(flags, eiDestructor)
+      if p.visibility != visPrivate: incl(flags, eiPublic)
+      p.pushExtraStmt(TExtraStmt(node: a, flags: flags)) 
+    of pxProperty:
+      var a = parseProperty(p)
     else: 
       parMessage(p, errIdentifierExpected, $p.tok)
       break
@@ -1267,6 +1435,9 @@ proc addPragmaToIdent(ident: var PNode, pragma: PNode) =
   addSon(pragmasNode, pragma)
 
 proc parseRecordBody(p: var TParser, result, definition: PNode) =
+  let oldSelfClass =  p.selfClass
+  let oldVisibilty = p.visibility
+  p.selfClass = getIdentOfType(definition)
   skipCom(p, result)
   p.visibility = if result.kind != nkTupleTy: visPublic else: visPrivate
   var a = parseRecordPart(p)
@@ -1290,6 +1461,26 @@ proc parseRecordBody(p: var TParser, result, definition: PNode) =
     discard
   opt(p, pxSemicolon)
   skipCom(p, result)
+  p.visibility = oldVisibilty
+  p.selfClass = oldSelfClass
+
+proc genInherited(p: var TParser; child, root: PIdent): PNode =
+  return newNodeP(nkTemplateDef, p).add(
+      newIdentNameNodeP("inherited", p),
+      ast.emptyNode,
+      ast.emptyNode,
+      newNodeP(nkFormalParams, p).add(
+        newIdentNodeP(root, p),
+        newNodeP(nkIdentDefs, p).add(
+          newIdentNameNodeP("self", p),
+          newIdentNodeP(child, p),
+          ast.emptyNode)),
+      ast.emptyNode,
+      ast.emptyNode,
+      newNodeP(nkStmtList, p).add(
+        newNodeP(nkCall, p).add(
+          newIdentNodeP(root, p),
+          newIdentNameNodeP("self", p))))
 
 proc parseRecordOrObject(p: var TParser, kind: TNodeKind, 
                          definition: PNode): PNode = 
@@ -1302,13 +1493,19 @@ proc parseRecordOrObject(p: var TParser, kind: TNodeKind,
     record = result
   getTok(p)
   addSon(record, ast.emptyNode)
+  var defIdent = getIdentOfType(definition)
   if p.tok.xkind == pxParLe: 
+    p.classes[defIdent.id] = TObjectInfo(isRefTy: false)
     var a = newNodeP(nkOfInherit, p)
     getTok(p)
-    addSon(a, parseTypeDesc(p))
+    var ty = parseTypeDesc(p)
+    addSon(a, ty)
+    # echo defIdent.s, " of ", ty.ident.s
+    p.pushExtraStmt(TExtraStmt(node: genInherited(p, ty.ident, defIdent), flags: {}))
     addSon(record, a)
     eat(p, pxParRi)
   elif kind == nkRefTy:
+    p.classes[defIdent.id] = TObjectInfo(isRefTy: true)
     var a = newNodeP(nkOfInherit, p)
     a.addSon(newIdentNameNodeP("RootRef", p))
     record.addSon(a)
@@ -1462,7 +1659,8 @@ proc parseRoutine(p: var TParser; noBody: bool): PNode =
     skipCom(p, result)
     expectIdent(p)
   else:
-    p.selfClass = nil
+    # p.selfClass = nil
+    discard
   addSon(result, identVis(p))
   # patterns, generic parameters:
   addSon(result, ast.emptyNode)
@@ -1569,7 +1767,7 @@ proc parseStmt(p: var TParser): PNode =
   of pxRepeat: result = parseRepeat(p)
   of pxCase: result = parseCase(p)
   of pxTry: result = parseTry(p)
-  of pxProcedure, pxFunction: 
+  of pxProcedure, pxFunction, pxConstructor, pxDestructor: 
     result = parseRoutine(p, false)
     # echo treeRepr(result)
   of pxType: result = parseTypeSection(p)
@@ -1587,11 +1785,13 @@ proc parseStmt(p: var TParser): PNode =
   of pxInitialization: getTok(p) # just skip the token
   of pxImplementation: 
     p.section = seImplementation
+    p.visibility = visPrivate
     result = newNodeP(nkCommentStmt, p)
     result.comment = "# implementation"
     getTok(p)
   of pxInterface: 
     p.section = seInterface
+    p.visibility = visPublic
     getTok(p)
   of pxComment: 
     result = newNodeP(nkCommentStmt, p)
@@ -1621,6 +1821,18 @@ proc parseStmt(p: var TParser): PNode =
   if result.kind != nkEmpty: skipCom(p, result)
   p.context = oldcontext
 
+proc handleExtra(p: var TParser, node: var PNode) =
+  var later: seq[TExtraStmt] 
+  if p.extra != nil:     
+    for e in p.extra:
+      if (p.section == seInterface and eiPublic in e.flags) or p.section == seImplementation:
+        node.addSon(e.node)
+        # echo e.node.treeRepr
+      else: 
+        if later == nil: later = @[]
+        later.add(e)
+  p.extra = later
+
 proc parseUnit(p: var TParser): PNode = 
   result = newNodeP(nkStmtList, p)
   getTok(p)                   # read first token
@@ -1631,7 +1843,9 @@ proc parseUnit(p: var TParser): PNode =
     of pxCurlyDirLe, pxStarDirLe: 
       if isHandledDirective(p): addSon(result, parseDirective(p))
       else: parMessage(p, errXNotAllowedHere, p.tok.ident.s)
-    else: addSon(result, parseStmt(p))
+    else: 
+      addSon(result, parseStmt(p))
+      handleExtra(p, result)
   opt(p, pxEnd)
   opt(p, pxDot)
   if p.tok.xkind != pxEof: 
