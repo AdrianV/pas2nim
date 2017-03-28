@@ -47,6 +47,7 @@ type
     visibility: TVisibilty
     extra: seq[TExtraStmt]
     classes: Table[int, TObjectInfo]
+    outerProc: PNode
 
   TReplaceTuple* = array[0..1, string]
 
@@ -59,7 +60,7 @@ const
     ["longint", "int32"], ["byte", "int8"], ["word", "int16"], 
     ["single", "float32"], ["double", "float64"], ["real", "float"], 
     ["length", "len"], ["len", "length"], ["setlength", "setlen"],
-    ["TObject", "RootRef"]]
+    ["TObject", "RootRef"], ["true", "true"], ["false", "false"]]
   nimReplacements*: array[1..35, TReplaceTuple] = [["nimread", "read"], 
     ["nimwrite", "write"], ["nimclosefile", "close"], ["closefile", "close"], 
     ["openfile", "open"], ["nsystem", "system"], ["ntime", "times"], 
@@ -1380,7 +1381,7 @@ proc parseRecordPart(p: var TParser): PNode =
       else:
         skipCom(p, result)
     of pxFunction, pxProcedure, pxConstructor, pxDestructor:
-      var xkind = p.tok.xkind
+      let xkind = p.tok.xkind
       var a = parseRoutine(p, true) # TODO: forward all methods defs and mark virtual methods as "method" and keep the calling conventions
       var flags: set[TExtraInfo]
       if xkind == pxConstructor: incl(flags, eiConstructor)
@@ -1465,6 +1466,7 @@ proc parseRecordBody(p: var TParser, result, definition: PNode) =
   p.selfClass = oldSelfClass
 
 proc genInherited(p: var TParser; child, root: PIdent): PNode =
+  # echo "child ", child.s, " root ", root.s
   return newNodeP(nkTemplateDef, p).add(
       newIdentNameNodeP("inherited", p),
       ast.emptyNode,
@@ -1501,7 +1503,7 @@ proc parseRecordOrObject(p: var TParser, kind: TNodeKind,
     var ty = parseTypeDesc(p)
     addSon(a, ty)
     # echo defIdent.s, " of ", ty.ident.s
-    p.pushExtraStmt(TExtraStmt(node: genInherited(p, ty.ident, defIdent), flags: {}))
+    p.pushExtraStmt(TExtraStmt(node: genInherited(p, defIdent, ty.ident), flags: {}))
     addSon(record, a)
     eat(p, pxParRi)
   elif kind == nkRefTy:
@@ -1509,6 +1511,8 @@ proc parseRecordOrObject(p: var TParser, kind: TNodeKind,
     var a = newNodeP(nkOfInherit, p)
     a.addSon(newIdentNameNodeP("RootRef", p))
     record.addSon(a)
+  elif kind == nkObjectTy: 
+    addSon(record, newNodeP(nkPragma, p).add(newIdentNameNodeP("inheritable", p)) )
   else: 
     addSon(record, ast.emptyNode)
   parseRecordBody(p, record, definition)
@@ -1643,23 +1647,18 @@ proc parseVar(p: var TParser): PNode =
     addSon(result, parseIdentColonEquals(p, identVis))
   p.lastVarSection = result
 
-proc fixConstructor(p: var TParser, n: var PNode) =
+proc fixConstructorReturnTy(p: var TParser, n: var PNode, isHeader: bool) =
   n.sons[3].sons[0] = newIdentNodeP(p.selfClass, p)
-  if n.sons.len >= 7 and n.sons[6].kind == nkStmtList:
-    var stm = newNodeP(nkStmtList, p).add(
-      newNodeP(nkAsgn, p).add(
-        newIdentNameNodeP("result", p),
-        newIdentNameNodeP("self", p)
-      )
-    )
-    for s in n.sons[6].sons:
-      stm.addSon(s)
-    n.sons[6] = stm
+  if isHeader:
+    var pragma = if n.sons[4].kind == nkPragma: n.sons[4] else: newNodeP(nkPragma, p)
+    pragma.addSon(newIdentNameNodeP("discardable", p))
+    n.sons[4] = pragma
 
 proc parseRoutine(p: var TParser; noBody: bool): PNode = 
   var noBody = noBody
   var isVirtual: bool
   let kind = p.tok.xkind
+  let oldOuter = p.outerProc
   result = newNodeP(nkProcDef, p)
   getTok(p)
   skipCom(p, result)
@@ -1687,10 +1686,22 @@ proc parseRoutine(p: var TParser; noBody: bool): PNode =
     resMethod.sons = result.sons
     result = resMethod
   addSon(result, ast.emptyNode)
-  if (p.section == seInterface) or noBody: 
+  var onlyHeader = (p.section == seInterface) or noBody
+  if kind == pxConstructor and p.selfClass != nil:
+    p.fixConstructorReturnTy(result, onlyHeader)
+  if onlyHeader: 
     addSon(result, ast.emptyNode)
   else: 
+    if oldOuter == nil:
+      p.outerProc = result
     var stmts = newNodeP(nkStmtList, p)
+    if kind == pxConstructor and p.selfClass != nil:
+      var info = p.classes.getOrDefault(p.selfClass.id)
+      if info == nil or info.isRefTy : # class constructor should return its type
+        stmts.addSon(
+          newNodeP(nkAsgn, p).add(
+            newIdentNameNodeP("result", p),
+            newIdentNameNodeP("self", p) ) )
     while true: 
       case p.tok.xkind
       of pxVar: addSon(stmts, parseVar(p))
@@ -1705,10 +1716,8 @@ proc parseRoutine(p: var TParser; noBody: bool): PNode =
     var a = parseStmt(p)
     for i in countup(0, sonsLen(a) - 1): addSon(stmts, a.sons[i])
     addSon(result, stmts)
-  if kind == pxConstructor and p.selfClass != nil:
-    p.fixConstructor(result)
-    # echo treeRepr(result)
   p.selfClass = oldSelfClass
+  p.outerProc = oldOuter
 
 proc fixExit(p: var TParser, n: PNode): bool = 
   if (p.tok.ident.id == getIdent(p.lex.cache, "exit").id): 
@@ -1768,6 +1777,34 @@ proc parseBegin(p: var TParser, result: PNode) =
       if a.kind != nkEmpty: addSon(result, a)
   if sonsLen(result) == 0: addSon(result, newNodeP(nkNilLit, p))
 
+proc parseInherited(p: var TParser): PNode =
+  # if p.outerProc != nil: echo p.outerProc.sons[0].ident.s, " ", p.outerProc.sons[3].treeRepr
+  eat(p, pxInherited)
+  var parent = newNodeP(nkCall, p).add(
+      newIdentNameNodeP("inherited", p),
+      newIdentNameNodeP("self", p)
+    )
+  if p.tok.xkind == pxSemiColon:
+    result = newNodeP(nkCall, p).add(
+        newNodeP(nkDotExpr, p).add(
+          parent,
+          newIdentNodeP(p.outerProc.sons[0].ident, p)
+        )
+      )
+    let params = p.outerProc.sons[3]
+    for i in 2..< params.len: # skip ReturnTy and self
+      echo params[i].treeRepr
+      if params[i].kind == nkIdentDefs: 
+        result.addSon(params[i][0])
+  else:
+    var call = parseStmt(p)
+    result = newNodeP(nkCall, p).add(
+      call[0],
+      parent,
+    )
+    for i in 1..< call.len:
+      result.addSon(call[i])
+  
 proc parseStmt(p: var TParser): PNode = 
   var oldcontext = p.context
   p.context = conStmt
@@ -1832,10 +1869,45 @@ proc parseStmt(p: var TParser): PNode =
     else: 
       result = parseExprStmt(p)
   of pxDot: getTok(p) # BUGFIX for ``end.`` in main program
+  of pxInherited: result = parseInherited(p)
   else: result = parseExprStmt(p)
   opt(p, pxSemicolon)
   if result.kind != nkEmpty: skipCom(p, result)
   p.context = oldcontext
+
+proc genConstructorTemplate(p: var TParser, n: PNode): PNode =
+  var params = newNodeP(nkFormalParams, p).add(
+      n[3][0],
+      newNodeP(nkIdentDefs, p).add(
+        newIdentNameNodeP("T", p),
+        newNodeP(nkBracketExpr, p).add(
+          newIdentNameNodeP("typedesc", p),
+          n[3][0]
+        ),
+        ast.emptyNode
+      )
+    )
+  var call = newNodeP(nkCall, p).add(
+      n[0],
+      newNodeP(nkCall, p).add(
+        newIdentNameNodeP("new", p),
+        newIdentNameNodeP("T", p)
+      )
+    )
+  for i in 2..< n[3].len :
+    params.addSon(n[3][i])
+    call.addSon(newIdentNodeP(n[3][i][0].ident, p))
+  result = newNodeP(nkTemplateDef, p).add(
+      n[0],
+      n[1],
+      n[2],
+      params,
+      ast.emptyNode,
+      ast.emptyNode,
+      newNodeP(nkStmtList, p).add(
+        call
+      )
+    )
 
 proc handleExtra(p: var TParser, node: var PNode) =
   var later: seq[TExtraStmt] 
@@ -1843,6 +1915,8 @@ proc handleExtra(p: var TParser, node: var PNode) =
     for e in p.extra:
       if (p.section == seInterface and eiPublic in e.flags) or p.section == seImplementation:
         node.addSon(e.node)
+        if eiConstructor in e.flags:
+          node.addSon(genConstructorTemplate(p, e.node))
         # echo e.node.treeRepr
       else: 
         if later == nil: later = @[]
