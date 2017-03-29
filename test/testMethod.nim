@@ -19,6 +19,7 @@ type
     fd2: bool
 
 
+proc init*(self: var MyObject)
 template data*(self: MyClass): string =
   self.FData
 
@@ -69,6 +70,9 @@ var aisPrivate: int
 proc write(x: string) =
   echo(x)
 
+proc init(self: var MyObject) =
+  FData = 23
+
 proc doSomething(self: MyClass; Sender: RootRef) =
   var j: int
   write("blah")
@@ -113,4 +117,6 @@ sec.data2 = "Hallo Nim"
 write(sec.data)
 sec.doIt
 my = MyClass.create(321)
+my.doIt
+my = sec
 my.doIt

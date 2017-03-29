@@ -8,6 +8,7 @@ type
   end;
   MyObject = object
     FData: Integer;
+    procedure init;
   end;
   MySeconObject = object(MyObject)
     fd2: string;
@@ -44,6 +45,11 @@ var
 procedure write(x: string); 
 begin
   echo(x);
+end;
+
+procedure MyObject.init;
+begin
+  FData:= 23;
 end;
 
 procedure MyClass.doSomething(Sender: TObject); 
@@ -108,5 +114,7 @@ begin
   write(sec.data);
   sec.doIt;
   my:= MyClass.create(321);
+  my.doIt;
+  my:= sec;
   my.doIt;
 end.

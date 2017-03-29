@@ -1529,6 +1529,7 @@ proc parseRecordOrObject(p: var TParser, kind: TNodeKind,
     a.addSon(newIdentNameNodeP("RootRef", p))
     record.addSon(a)
   elif kind == nkObjectTy: 
+    p.classes[defIdent.id] = TObjectInfo(isRefTy: false)
     addSon(record, newNodeP(nkPragma, p).add(newIdentNameNodeP("inheritable", p)) )
   else: 
     addSon(record, ast.emptyNode)
