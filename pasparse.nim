@@ -48,6 +48,8 @@ type
     extra: seq[TExtraStmt]
     classes: Table[int, TObjectInfo]
     outerProc: PNode
+    methods: Table[int, bool]
+    keepOverride: bool
 
   TReplaceTuple* = array[0..1, string]
 
@@ -60,7 +62,8 @@ const
     ["longint", "int32"], ["byte", "int8"], ["word", "int16"], 
     ["single", "float32"], ["double", "float64"], ["real", "float"], 
     ["length", "len"], ["len", "length"], ["setlength", "setlen"],
-    ["TObject", "RootRef"], ["true", "true"], ["false", "false"]]
+    ["TObject", "RootRef"], ["true", "true"], ["false", "false"], ["string", "string"],
+    ["result", "result"]]
   nimReplacements*: array[1..35, TReplaceTuple] = [["nimread", "read"], 
     ["nimwrite", "write"], ["nimclosefile", "close"], ["closefile", "close"], 
     ["openfile", "open"], ["nsystem", "system"], ["ntime", "times"], 
@@ -129,6 +132,7 @@ proc openParser(p: var TParser, filename: string,
   p.flags = flags
   p.ahead = initDeque[TToken]()
   p.classes = initTable[int, TObjectInfo]()
+  p.methods = initTable[int, bool]()
 
 proc closeParser(p: var TParser) = closeLexer(p.lex)
 proc getTok(p: var TParser) = 
@@ -203,11 +207,23 @@ proc createIdentNodeP(ident: PIdent, p: TParser): PNode =
   if x != nil: result.ident = x
   else: result.ident = ident
 
-proc getIdentOfType(n: PNode): PIdent =
-  if n.kind == nkTypeDef :
+proc getIdentOfNode(n: PNode): PIdent =
+  if n.kind in {nkTypeDef,nkTemplateDef,nkProcDef,nkMethodDef} :
     if n.sons[0].kind == nkIdent: return n.sons[0].ident
     elif n.sons[0].kind == nkPostfix and n.sons[0].len >= 2 and
       n.sons[0][1].kind == nkIdent: return n.sons[0][1].ident
+  elif n.kind == nkIdent: return n.ident
+
+proc genSignature(n: PNode): int = 
+  if n.kind in {nkMethodDef, nkProcDef, nkTemplateDef}:
+    let ident = getIdentOfNode(n)
+    result = ident.id
+    let params = n[3]
+    for p in params.sons:
+      if p.kind == nkIdentDefs:
+        let ty = p[1]
+        if ty.kind == nkIdent:
+          result = result * 223 + ty.ident.id
 
 proc pushExtraStmt(p: var TParser, s: TExtraStmt) =
   if p.extra == nil: 
@@ -972,7 +988,7 @@ proc parseParamList(p: var TParser): PNode =
   var a: PNode
   result = newNodeP(nkFormalParams, p)
   addSon(result, ast.emptyNode)         # return type
-  if not isNil(p.selfClass):
+  if isNil(p.outerProc) and not isNil(p.selfClass):
     addSon(result, genSelfParam(p))
   if p.tok.xkind == pxParLe: 
     p.inParamList = true
@@ -1089,8 +1105,9 @@ proc parseRoutineSpecifiers(p: var TParser, noBody: var bool, isVirtual: var boo
       opt(p, pxSemicolon)
     of "override":
       isVirtual = true
-      if result.kind == nkEmpty: result = newNodeP(nkPragma, p)
-      addSon(result, newIdentNodeP(getIdent(p.lex.cache, "override"), p))
+      if p.keepOverride:
+        if result.kind == nkEmpty: result = newNodeP(nkPragma, p)
+        addSon(result, newIdentNodeP(getIdent(p.lex.cache, "override"), p))
       getTok(p)
       opt(p, pxSemicolon)
         
@@ -1438,7 +1455,7 @@ proc addPragmaToIdent(ident: var PNode, pragma: PNode) =
 proc parseRecordBody(p: var TParser, result, definition: PNode) =
   let oldSelfClass =  p.selfClass
   let oldVisibilty = p.visibility
-  p.selfClass = getIdentOfType(definition)
+  p.selfClass = getIdentOfNode(definition)
   skipCom(p, result)
   p.visibility = if result.kind != nkTupleTy: visPublic else: visPrivate
   var a = parseRecordPart(p)
@@ -1495,7 +1512,7 @@ proc parseRecordOrObject(p: var TParser, kind: TNodeKind,
     record = result
   getTok(p)
   addSon(record, ast.emptyNode)
-  var defIdent = getIdentOfType(definition)
+  var defIdent = getIdentOfNode(definition)
   if p.tok.xkind == pxParLe: 
     p.classes[defIdent.id] = TObjectInfo(isRefTy: kind == nkRefTy)
     var a = newNodeP(nkOfInherit, p)
@@ -1681,15 +1698,12 @@ proc parseRoutine(p: var TParser; noBody: bool): PNode =
   addSon(result, parseParamList(p))
   opt(p, pxSemicolon)
   addSon(result, parseRoutineSpecifiers(p, noBody, isVirtual))
-  if isVirtual :
-    var resMethod = newNodeP(nkMethodDef, p)
-    resMethod.sons = result.sons
-    result = resMethod
   addSon(result, ast.emptyNode)
   var onlyHeader = (p.section == seInterface) or noBody
   if kind == pxConstructor and p.selfClass != nil:
     p.fixConstructorReturnTy(result, onlyHeader)
   if onlyHeader: 
+    if isVirtual: p.methods[genSignature(result)] = true
     addSon(result, ast.emptyNode)
   else: 
     if oldOuter == nil:
@@ -1716,6 +1730,10 @@ proc parseRoutine(p: var TParser; noBody: bool): PNode =
     var a = parseStmt(p)
     for i in countup(0, sonsLen(a) - 1): addSon(stmts, a.sons[i])
     addSon(result, stmts)
+  if isVirtual or p.methods.hasKey(genSignature(result)) :
+    var resMethod = newNodeP(nkMethodDef, p)
+    resMethod.sons = result.sons
+    result = resMethod
   p.selfClass = oldSelfClass
   p.outerProc = oldOuter
 
@@ -1793,7 +1811,7 @@ proc parseInherited(p: var TParser): PNode =
       )
     let params = p.outerProc.sons[3]
     for i in 2..< params.len: # skip ReturnTy and self
-      echo params[i].treeRepr
+      # echo params[i].treeRepr
       if params[i].kind == nkIdentDefs: 
         result.addSon(params[i][0])
   else:
@@ -1888,7 +1906,7 @@ proc genConstructorTemplate(p: var TParser, n: PNode): PNode =
       )
     )
   var call = newNodeP(nkCall, p).add(
-      n[0],
+      newIdentNodeP(getIdentOfNode(n), p),
       newNodeP(nkCall, p).add(
         newIdentNameNodeP("new", p),
         newIdentNameNodeP("T", p)
