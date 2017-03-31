@@ -236,7 +236,14 @@ proc pushExtraStmt(p: var TParser, s: TExtraStmt) =
   
 proc parseExpr(p: var TParser): PNode
 proc parseStmt(p: var TParser): PNode
-proc parseTypeDesc(p: var TParser, definition: PNode = nil): PNode
+proc parseTypeDesc(p: var TParser, definition: var PNode): PNode
+proc parseTypeDesc(p: var TParser): PNode =
+  var empty: PNode = nil
+  return parseTypeDesc(p, empty)
+proc parseTypeDesc(p: var TParser, definition: PNode): PNode =
+  var definition = definition
+  return parseTypeDesc(p, definition)
+  
 
 proc parseEmit(p: var TParser, definition: PNode): PNode = 
   getTok(p)                   # skip 'emit'
@@ -1535,7 +1542,7 @@ proc parseRecordOrObject(p: var TParser, kind: TNodeKind,
     addSon(record, ast.emptyNode)
   parseRecordBody(p, record, definition)
 
-proc parseTypeDesc(p: var TParser, definition: PNode = nil): PNode = 
+proc parseTypeDesc(p: var TParser, definition: var PNode): PNode = 
   var oldcontext = p.context
   p.context = conTypeDesc
   if p.tok.xkind == pxPacked: getTok(p)
@@ -1564,7 +1571,18 @@ proc parseTypeDesc(p: var TParser, definition: PNode = nil): PNode =
       else: 
         internalError(result.info, "anonymous record is not supported")
   of pxObject: result = parseRecordOrObject(p, nkObjectTy, definition)
-  of pxClass: result = parseRecordOrObject(p, nkRefTy, definition)
+  of pxClass: 
+    let next = peekTok(p)
+    if next.xkind == pxSemiColon:
+      var n = newNodeP(nkCommentStmt, p)
+      n.comment = definition.renderTree & " = class;"
+      definition = n
+      result = ast.emptyNode
+      p.eat(pxClass)
+      p.eat(pxSemiColon)
+      skipCom(p, result)
+    else:
+      result = parseRecordOrObject(p, nkRefTy, definition)
   of pxParLe: result = parseEnum(p)
   of pxArray: 
     result = newNodeP(nkBracketExpr, p)
@@ -1799,6 +1817,7 @@ proc parseBegin(p: var TParser, result: PNode) =
 proc parseInherited(p: var TParser): PNode =
   # if p.outerProc != nil: echo p.outerProc.sons[0].ident.s, " ", p.outerProc.sons[3].treeRepr
   eat(p, pxInherited)
+  var isMethod = p.methods.hasKey(genSignature(p.outerProc))
   var parent = newNodeP(nkCall, p).add(
       newIdentNameNodeP("inherited", p),
       newIdentNameNodeP("self", p)
@@ -1823,7 +1842,12 @@ proc parseInherited(p: var TParser): PNode =
     )
     for i in 1..< call.len:
       result.addSon(call[i])
-  
+  if isMethod :
+    result = newNodeP(nkCommand, p).add(
+      newIdentNameNodeP("procCall", p),
+      result
+    )
+
 proc parseStmt(p: var TParser): PNode = 
   var oldcontext = p.context
   p.context = conStmt
@@ -1896,7 +1920,7 @@ proc parseStmt(p: var TParser): PNode =
 
 proc genConstructorTemplate(p: var TParser, n: PNode): PNode =
   var params = newNodeP(nkFormalParams, p).add(
-      n[3][0],
+      newIdentNameNodeP("untyped", p),
       newNodeP(nkIdentDefs, p).add(
         newIdentNameNodeP("T", p),
         newNodeP(nkBracketExpr, p).add(
@@ -1924,7 +1948,13 @@ proc genConstructorTemplate(p: var TParser, n: PNode): PNode =
       ast.emptyNode,
       ast.emptyNode,
       newNodeP(nkStmtList, p).add(
-        call
+        newNodeP(nkCast, p).add(
+          newNodeP(nkDotExpr, p).add(
+            newIdentNameNodeP("T", p),
+            newIdentNameNodeP("type", p)
+          ),
+          call
+        )
       )
     )
 

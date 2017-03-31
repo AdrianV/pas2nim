@@ -1,5 +1,6 @@
 
 type
+  ## MyClass* = class;
   MyArray* = seq[string]
   TNotifyEvent* = proc (Sender: RootRef) {.closure.}
   MyRecord* {.final.} = object
@@ -18,6 +19,8 @@ type
   Second* = ref object of MyClass
     fd2: bool
 
+  Third* = ref object of Second
+  
 
 proc init*(self: var MyObject)
 template data*(self: MyClass): string =
@@ -42,12 +45,13 @@ template `myHello =`(self: MyClass; v: int) =
     self.Hello = v
 
 proc create*(self: MyClass; v: int): MyClass {.discardable.}
-template create*(T: typedesc[MyClass]; v: int): MyClass =
-  create(new(T), v)
+template create*(T: typedesc[MyClass]; v: int): untyped =
+  cast[T.type](create(new(T), v))
 
 method doIt*(self: MyClass)
 proc calc*(self: MyClass; a, b: float64): float64
 method doIt*(self: Second)
+method doIt*(self: Third)
 var aisPublic*: int
 
 ## # implementation
@@ -62,8 +66,11 @@ template inherited(self: Second): MyClass =
   MyClass(self)
 
 proc create(self: Second; a: bool; v: int): Second {.discardable.}
-template create(T: typedesc[Second]; a: bool; v: int): Second =
-  create(new(T), a, v)
+template create(T: typedesc[Second]; a: bool; v: int): untyped =
+  cast[T.type](create(new(T), a, v))
+
+template inherited(self: Third): Second =
+  Second(self)
 
 var aisPrivate: int
 
@@ -108,9 +115,14 @@ when false:
   ## #begin
   ## #  
   ## #end;
+method doIt(self: Third) =
+  write("hello from Third")
+  procCall inherited(self).doIt()
+
 var
   sec: Second
   my: MyClass
+  thd: Third
 
 sec = Second.create(true, 145)
 sec.data2 = "Hallo Nim"
@@ -120,3 +132,5 @@ my = MyClass.create(321)
 my.doIt
 my = sec
 my.doIt
+thd = Third.create(false, 17)
+thd.doIt

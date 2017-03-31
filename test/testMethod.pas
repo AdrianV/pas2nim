@@ -1,6 +1,7 @@
 interface
 
 type
+  MyClass = class;
   MyArray = array of string;
   TNotifyEvent = procedure(Sender: TObject) of object;
   MyRecord = record
@@ -31,10 +32,15 @@ type
   Second = class(MyClass)
   private
     fd2: Boolean;
-    constructor create(a: Boolean; v: Integer);
+    constructor create(const a: Boolean; v: Integer);
   public
     procedure doIt; virtual; override;
   end;
+  Third = class(Second)
+  public
+    procedure doIt; virtual; override;
+  end;
+  
 
 var 
   aisPublic: Integer;
@@ -81,7 +87,7 @@ begin
   write('MyClass doIt');
 end;
 
-constructor Second.create(a: Boolean; v: Integer);
+constructor Second.create(const a: Boolean; v: Integer);
 begin
   fd2:= a;
   inherited create(v);
@@ -105,9 +111,16 @@ end;
 
 {$endif}
 
+procedure Third.doIt; 
+begin
+  write('hello from Third');
+  inherited;
+end;
+
 var 
   sec: Second;
   my: MyClass;
+  thd: Third;
 begin
   sec:= Second.create(True, 145);
   sec.data2:= 'Hallo Nim';
@@ -117,4 +130,7 @@ begin
   my.doIt;
   my:= sec;
   my.doIt;
+  thd:= Third.create(False, 17);
+  thd.doIt;
+
 end.
