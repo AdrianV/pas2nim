@@ -44,6 +44,18 @@ template `myHello =`(self: MyClass; v: int) =
   else:
     self.Hello = v
 
+type
+  `MyClass*myArray` = distinct MyClass
+
+template myArray*(self: MyClass): `MyClass*myArray` =
+  self.`MyClass*myArray`
+
+template `[]`*(self: `MyClass*myArray`; index: int): string =
+  getMyArray(self.MyClass, index)
+
+template `[]=`*(self: `MyClass*myArray`; index: int; v: string) =
+  setMyArray(self.MyClass, index, v)
+
 proc create*(self: MyClass; v: int): MyClass {.discardable.}
 template create*(T: typedesc[MyClass]; v: int): untyped =
   cast[T.type](create(new(T), v))
@@ -62,6 +74,8 @@ template inherited(self: MySeconObject): MyObject =
 
 proc doSomething(self: MyClass; Sender: RootRef)
 proc setData(self: MyClass; value: string)
+proc getMyArray(self: MyClass; index: int): string
+proc setMyArray(self: MyClass; index: int; value: string)
 template inherited(self: Second): MyClass =
   MyClass(self)
 
@@ -71,6 +85,9 @@ template create(T: typedesc[Second]; a: bool; v: int): untyped =
 
 template inherited(self: Third): Second =
   Second(self)
+
+import
+  strutils
 
 var aisPrivate: int
 
@@ -91,6 +108,12 @@ proc create(self: MyClass; v: int): MyClass =
 
 proc calc(self: MyClass; a, b: float64): float64 =
   result = a + b * float64(Hallo)
+
+proc getMyArray(self: MyClass; index: int): string =
+  result = intToStr(index)
+
+proc setMyArray(self: MyClass; index: int; value: string) =
+  write("set myArray[]=" & value)
 
 proc setData(self: MyClass; value: string) =
   FData = value
@@ -134,3 +157,5 @@ my = sec
 my.doIt
 thd = Third.create(false, 17)
 thd.doIt
+write(my.myArray[11])
+my.myArray[11] = "Hallo Nim"

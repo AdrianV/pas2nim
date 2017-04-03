@@ -20,12 +20,15 @@ type
     property data: string read FData write FData;
     property data2: string read FData write setData;
     property myHello: Integer read Hello write Hello;
+    property myArray[index: Integer]: string read getMyArray write setMyArray;
     constructor create(v: Integer);
     procedure doIt; virtual;
   private
     FData: string;
     procedure doSomething(Sender: TObject);  
     procedure setData(value: string);
+    function getMyArray(const index: Integer): String;
+    procedure setMyArray(const index: Integer; value: String);
   published
     function calc(a,b: Double): Double;
   end;
@@ -45,6 +48,8 @@ type
 var 
   aisPublic: Integer;
 implementation
+uses strutils;
+
 var 
   aisPrivate: Integer;
 
@@ -74,6 +79,16 @@ end;
 function MyClass.calc(a,b: Double): Double;
 begin
   result:= a + b * Double(Hallo);
+end;
+
+function MyClass.getMyArray(const index: Integer): String;
+begin
+  Result:= intToStr(index);
+end;
+
+procedure MyClass.setMyArray(const index: Integer; value: String);
+begin
+  write('set myArray[]=' + value);
 end;
 
 procedure MyClass.setData(value: string);
@@ -132,5 +147,6 @@ begin
   my.doIt;
   thd:= Third.create(False, 17);
   thd.doIt;
-
+  write(my.myArray[11]);
+  my.myArray[11]:= 'Hallo Nim';
 end.

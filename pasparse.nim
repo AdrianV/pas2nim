@@ -932,7 +932,7 @@ proc parseFor(p: var TParser): PNode =
   addSon(result, c)
   addSon(result, parseStmt(p))
 
-proc parseParam(p: var TParser): PNode = 
+template parseParamImpl(p: var TParser; right: TTokKind; result): typed = 
   var a: PNode
   result = newNodeP(nkIdentDefs, p)
   var v = ast.emptyNode
@@ -950,7 +950,7 @@ proc parseParam(p: var TParser): PNode =
   while true: 
     case p.tok.xkind
     of pxSymbol: a = createIdentNodeP(p.tok.ident, p)
-    of pxColon, pxEof, pxParRi, pxEquals: break 
+    of pxColon, pxEof, right, pxEquals: break 
     else: 
       parMessage(p, errIdentifierExpected, $p.tok)
       return 
@@ -991,36 +991,45 @@ proc genSelfParam(p: var TParser): PNode =
     genSelfType(p),
     ast.emptyNode)
 
-proc parseParamList(p: var TParser): PNode = 
+template parseParamListImpl(p: var TParser; right: TTokKind): typed = 
+  proc parseParam(px: var TParser): PNode = 
+    parseParamImpl(px, right, result)
   var a: PNode
   result = newNodeP(nkFormalParams, p)
   addSon(result, ast.emptyNode)         # return type
   if isNil(p.outerProc) and not isNil(p.selfClass):
     addSon(result, genSelfParam(p))
-  if p.tok.xkind == pxParLe: 
-    p.inParamList = true
-    getTok(p)
-    skipCom(p, result)
-    while true: 
-      case p.tok.xkind
-      of pxSymbol, pxConst, pxVar, pxOut: 
-        a = parseParam(p)
-      of pxParRi: 
-        getTok(p)
-        break 
-      else: 
-        parMessage(p, errTokenExpected, ")")
-        break 
-      skipCom(p, a)
-      if p.tok.xkind == pxSemicolon: 
-        getTok(p)
+  if (right == pxParRi and p.tok.xkind == pxParLe) or 
+    (right == pxBracketRi and p.tok.xkind == pxBracketLe): 
+      p.inParamList = true
+      getTok(p)
+      skipCom(p, result)
+      while true: 
+        case p.tok.xkind
+        of pxSymbol, pxConst, pxVar, pxOut: 
+          a = parseParam(p)
+        of right: 
+          getTok(p)
+          break 
+        else: 
+          parMessage(p, errTokenExpected, $right)
+          break 
         skipCom(p, a)
-      addSon(result, a)
-    p.inParamList = false
+        if p.tok.xkind == pxSemicolon: 
+          getTok(p)
+          skipCom(p, a)
+        addSon(result, a)
+      p.inParamList = false
   if p.tok.xkind == pxColon: 
     getTok(p)
     skipCom(p, result)
     result.sons[0] = parseTypeDesc(p)
+
+proc parseParamList(p: var TParser): PNode = 
+  parseParamListImpl(p, pxParRi)
+
+proc parseArrayPropParams(p: var TParser): PNode = 
+  parseParamListImpl(p, pxBracketRi)
 
 proc parseCallingConvention(p: var TParser): PNode = 
   result = ast.emptyNode
@@ -1253,7 +1262,58 @@ proc parseRecordCase(p: var TParser): PNode =
     addSon(b, c)
     addSon(result, b)
     if b.kind == nkElse: break 
-  
+
+proc genArrayPropertyType(p: var TParser; propName: PIdent): PNode =
+  result = newNodeP(nkTypeSection, p).add(
+    newNodeP(nkTypeDef, p).add(
+      newIdentNameNodeP("`" & p.selfClass.s & "*" & propName.s & "`", p),
+      ast.emptyNode,
+      newNodeP(nkDistinctTy, p).add(
+        newIdentNodeP(p.selfClass, p)
+      )
+    )
+  )  
+
+proc genArrayProperty(p: var TParser; arrPropTy, propTy: PNode; asReader: bool; 
+                    callId: PIdent, params: PNode): PNode = 
+  var name = if asReader: newIdentNameNodeP("`[]`", p) else: newIdentNameNodeP("`[]=`", p)
+  result =  newNodeP(nkTemplateDef, p).add(
+    name,
+    ast.emptyNode,
+    ast.emptyNode,
+    newNodeP(nkFormalParams, p).add(
+      if asReader: propTy else: ast.emptyNode,
+      newNodeP(nkIdentDefs, p).add(
+        newIdentNameNodeP("self", p),
+        arrPropTy[0][0],
+        ast.emptyNode
+      )
+    ),
+    ast.emptyNode,
+    ast.emptyNode,
+    newNodeP(nkStmtList, p).add(
+      newNodeP(nkCall, p).add(
+        newIdentNodeP(callId, p),
+        newNodeP(nkDotExpr, p).add(
+          newIdentNameNodeP("self", p),
+          newIdentNodeP(p.selfClass, p)
+        )
+      )
+    )
+  ) 
+  if p.visibility != visPrivate:
+    exSymbol(result.sons[0])
+  for i in 2..< params.sons.len:
+    result.sons[3].addSon(params.sons[i])
+    result.sons[6].sons[0].addSon(params.sons[i][0])
+  if not asReader:
+    result.sons[3].addSon(newNodeP(nkIdentDefs, p).add(
+      newIdentNameNodeP("v", p),
+      propTy,
+      ast.emptyNode
+    ))
+    result.sons[6].sons[0].addSon(newIdentNameNodeP("v", p))
+
 proc genPropertyReader(p: var TParser, propName: PIdent, propTy: PNode, readerId: PIdent): PNode =
   result =  newNodeP(nkTemplateDef, p).add(
     newIdentNodeP(propName, p),
@@ -1345,9 +1405,15 @@ proc parseProperty(p: var TParser): PNode =
     res
 
   var propName = nextIdent()
+  var propTy: PNode
+  var params: PNode
+  if p.tok.xkind == pxBracketLe: # array property ?
+    params = parseArrayPropParams(p)
+    propTy = params.sons[0]
+  else:
+    p.eat(pxColon)
+    propTy = parseTypeDesc(p)
   var readId, writeId: PIdent
-  p.eat(pxColon)
-  var propTy = parseTypeDesc(p)
   while (p.tok.xkind != pxEof) and (p.tok.xkind != pxSemicolon):
     case p.tok.xkind
     of pxSymbol:
@@ -1365,12 +1431,27 @@ proc parseProperty(p: var TParser): PNode =
   var flags: set[TExtraInfo]
   if p.visibility != visPrivate:
     incl(flags, eiPublic)
-  if readId != nil:
-    var a = genPropertyReader(p, propName, propTy, readId)
+  var arrPropTy: PNode
+  if params != nil:
+    arrPropTy = genArrayPropertyType(p, propName)
+    p.pushExtraStmt(TExtraStmt(node: arrPropTy, flags: flags))
+    var a = genPropertyReader(p, propName, arrPropTy[0][0], arrPropTy[0][0].ident)
     p.pushExtraStmt(TExtraStmt(node: a, flags: flags))
+  if readId != nil:
+    if params == nil:
+      var a = genPropertyReader(p, propName, propTy, readId)
+      p.pushExtraStmt(TExtraStmt(node: a, flags: flags))
+    else:
+      var a = genArrayProperty(p, arrPropTy, propTy, true, readId, params)
+      p.pushExtraStmt(TExtraStmt(node: a, flags: flags))
   if writeId != nil :
-    var a = genPropertyWriter(p, propName, propTy, writeId)
-    p.pushExtraStmt(TExtraStmt(node: a, flags: flags))    
+    if params == nil:
+      var a = genPropertyWriter(p, propName, propTy, writeId)
+      p.pushExtraStmt(TExtraStmt(node: a, flags: flags))    
+    else :
+      var a = genArrayProperty(p, arrPropTy, propTy, false, writeId, params)
+      p.pushExtraStmt(TExtraStmt(node: a, flags: flags))
+      
   opt(p, pxSemiColon)
 
 proc parseRecordPart(p: var TParser): PNode = 
