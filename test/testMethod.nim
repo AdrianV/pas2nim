@@ -53,7 +53,13 @@ template myArray*(self: MyClass): `MyClass*myArray` =
 template `[]`*(self: `MyClass*myArray`; index: int): string =
   getMyArray(self.MyClass, index)
 
+template `[]`*(self: MyClass; index: int): string =
+  getMyArray(self.MyClass, index)
+
 template `[]=`*(self: `MyClass*myArray`; index: int; v: string) =
+  setMyArray(self.MyClass, index, v)
+
+template `[]=`*(self: MyClass; index: int; v: string) =
   setMyArray(self.MyClass, index, v)
 
 proc create*(self: MyClass; v: int): MyClass {.discardable.}
@@ -159,3 +165,4 @@ thd = Third.create(false, 17)
 thd.doIt
 write(my.myArray[11])
 my.myArray[11] = "Hallo Nim"
+my[1] = "works as well"

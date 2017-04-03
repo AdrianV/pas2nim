@@ -20,7 +20,7 @@ type
     property data: string read FData write FData;
     property data2: string read FData write setData;
     property myHello: Integer read Hello write Hello;
-    property myArray[index: Integer]: string read getMyArray write setMyArray;
+    property myArray[index: Integer]: string read getMyArray write setMyArray; default;
     constructor create(v: Integer);
     procedure doIt; virtual;
   private
@@ -149,4 +149,5 @@ begin
   thd.doIt;
   write(my.myArray[11]);
   my.myArray[11]:= 'Hallo Nim';
+  my[1]:= 'works as well';
 end.

@@ -1030,7 +1030,7 @@ proc parseParamList(p: var TParser): PNode =
 
 proc parseArrayPropParams(p: var TParser): PNode = 
   parseParamListImpl(p, pxBracketRi)
-
+  
 proc parseCallingConvention(p: var TParser): PNode = 
   result = ast.emptyNode
   case p.tok.xkind 
@@ -1059,7 +1059,7 @@ proc parseCallingConvention(p: var TParser): PNode =
 proc parseRoutineSpecifiers(p: var TParser, noBody: var bool, isVirtual: var bool): PNode = 
   var e: PNode
   result = parseCallingConvention(p)
-  while p.tok.xkind == pxSymbol: 
+  while p.tok.xkind in {pxSymbol, pxInline}: 
     case toLower(p.tok.ident.s)
     of "assembler", "overload", "far": 
       getTok(p)
@@ -1285,7 +1285,7 @@ proc genArrayProperty(p: var TParser; arrPropTy, propTy: PNode; asReader: bool;
       if asReader: propTy else: ast.emptyNode,
       newNodeP(nkIdentDefs, p).add(
         newIdentNameNodeP("self", p),
-        arrPropTy[0][0],
+        arrPropTy,
         ast.emptyNode
       )
     ),
@@ -1428,6 +1428,13 @@ proc parseProperty(p: var TParser): PNode =
     else:
       parMessage(p, errIdentifierExpected, $p.tok)
   # echo "property ", propName.s, ": ", propTy.treeRepr, " for class ", p.selfClass.s
+  opt(p, pxSemiColon)
+  var isDefault = false
+  if params != nil:
+    if p.tok.xkind == pxSymbol and p.tok.ident.id == getIdent(p.lex.cache, "default").id:
+      isDefault = true;
+      eat(p, pxSymbol)
+      opt(p, pxSemiColon)
   var flags: set[TExtraInfo]
   if p.visibility != visPrivate:
     incl(flags, eiPublic)
@@ -1442,17 +1449,22 @@ proc parseProperty(p: var TParser): PNode =
       var a = genPropertyReader(p, propName, propTy, readId)
       p.pushExtraStmt(TExtraStmt(node: a, flags: flags))
     else:
-      var a = genArrayProperty(p, arrPropTy, propTy, true, readId, params)
+      var a = genArrayProperty(p, arrPropTy[0][0], propTy, true, readId, params)
       p.pushExtraStmt(TExtraStmt(node: a, flags: flags))
+      if  isDefault:
+        a = genArrayProperty(p, newIdentNodeP(p.selfClass, p), propTy, true, readId, params)
+        p.pushExtraStmt(TExtraStmt(node: a, flags: flags))
   if writeId != nil :
     if params == nil:
       var a = genPropertyWriter(p, propName, propTy, writeId)
       p.pushExtraStmt(TExtraStmt(node: a, flags: flags))    
     else :
-      var a = genArrayProperty(p, arrPropTy, propTy, false, writeId, params)
+      var a = genArrayProperty(p, arrPropTy[0][0], propTy, false, writeId, params)
       p.pushExtraStmt(TExtraStmt(node: a, flags: flags))
+      if  isDefault:
+        a = genArrayProperty(p, newIdentNodeP(p.selfClass, p), propTy, false, writeId, params)
+        p.pushExtraStmt(TExtraStmt(node: a, flags: flags))
       
-  opt(p, pxSemiColon)
 
 proc parseRecordPart(p: var TParser): PNode = 
   result = ast.emptyNode
@@ -1918,11 +1930,12 @@ proc parseInherited(p: var TParser): PNode =
   else:
     var call = parseStmt(p)
     result = newNodeP(nkCall, p).add(
-      call[0],
+      if call.kind == nkCall: call[0] else: call,
       parent,
     )
-    for i in 1..< call.len:
-      result.addSon(call[i])
+    if call.kind == nkCall:
+      for i in 1..< call.len:
+        result.addSon(call[i])
   if isMethod :
     result = newNodeP(nkCommand, p).add(
       newIdentNameNodeP("procCall", p),
