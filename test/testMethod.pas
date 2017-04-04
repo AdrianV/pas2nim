@@ -119,10 +119,10 @@ end;
 
 {$if false}
 
-//procedure test(data: array of const);
-//begin
-//  
-//end;
+procedure test(const data: array of const);
+begin
+  
+end;
 
 {$endif}
 

@@ -1680,16 +1680,25 @@ proc parseTypeDesc(p: var TParser, definition: var PNode): PNode =
   of pxArray: 
     result = newNodeP(nkBracketExpr, p)
     getTok(p)
+    var isArrayOfConst = false
     if p.tok.xkind == pxBracketLe: 
       addSon(result, newIdentNodeP(getIdent(p.lex.cache, "array"), p))
       getTok(p)
       addSon(result, rangeExpr(p))
       eat(p, pxBracketRi)
     else: 
-      if p.inParamList: addSon(result, newIdentNodeP(getIdent(p.lex.cache, "openarray"), p))
+      if p.inParamList: 
+        if p.peekTok.xkind != pxConst:
+          addSon(result, newIdentNodeP(getIdent(p.lex.cache, "openarray"), p))
+        else:
+          isArrayOfConst = true
+          result = newIdentNameNodeP("TArrayOfConst", p)
       else: addSon(result, newIdentNodeP(getIdent(p.lex.cache, "seq"), p))
     eat(p, pxOf)
-    addSon(result, parseTypeDesc(p))
+    if not isArrayOfConst:
+      addSon(result, parseTypeDesc(p))
+    else:
+      eat(p, pxConst)
   of pxSet: 
     result = newNodeP(nkBracketExpr, p)
     getTok(p)

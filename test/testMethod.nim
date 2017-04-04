@@ -140,10 +140,9 @@ method doIt(self: Second) =
   write(innerDoIt())
 
 when false:
-  ## #procedure test(data: array of const);
-  ## #begin
-  ## #  
-  ## #end;
+  proc test(data: TArrayOfConst) =
+    nil
+
 method doIt(self: Third) =
   write("hello from Third")
   procCall inherited(self).doIt()
