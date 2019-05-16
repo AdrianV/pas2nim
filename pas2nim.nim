@@ -9,10 +9,10 @@
 
 import
   strutils, os, parseopt, llstream, ast, renderer, options, msgs,
-  paslex, pasparse
+  paslex, pasparse, pathutils, lineinfos
 
 const
-  Version = "0.8"
+  Version = "0.9"
   Usage = """
 pas2nim - Pascal to Nim source converter
   (c) 2012 Andreas Rumpf
@@ -26,13 +26,13 @@ Options:
 """
 
 proc main(infile, outfile: string, flags: set[TParserFlag]) =
-  var stream = llStreamOpen(infile, fmRead)
-  if stream == nil: rawMessage(errCannotOpenFile, infile)
+  var stream = llStreamOpen(AbsoluteFile infile, fmRead)
+  if stream == nil: rawMessage(gConfig, errGenerated, "cannot open file" & infile)
   var p: TParser
   openParser(p, infile, stream, flags)
   var module = parseUnit(p)
   closeParser(p)
-  renderModule(module, outfile)
+  renderModule(module, infile, outfile)
 
 var
   infile = ""
@@ -52,7 +52,7 @@ for kind, key, val in getopt():
     of "o", "out": outfile = val
     of "ref": incl(flags, pfRefs)
     of "boot": flags = flags + {pfRefs, pfMoreReplacements, pfImportBlackList}
-    else: stdout.writeln("[Error] unknown option: " & key)
+    else: stdout.writeLine("[Error] unknown option: " & key)
   of cmdEnd: assert(false)
 if infile.len == 0:
   # no filename has been given, so we show the help:

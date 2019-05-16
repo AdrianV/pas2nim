@@ -11,7 +11,7 @@
 # the scanner module.
 
 import
-  hashes, options, msgs, strutils, platform, idents, nimlexbase, llstream
+  hashes, options, msgs, strutils, platform, idents, nimlexbase, llstream, lineinfos, pathutils, algorithm
 
 const
   MaxLineLength* = 80         # lines longer than this lead to a warning
@@ -76,8 +76,8 @@ type
     literal*: string          # the parsed (string) literal
 
   TLexer* = object of TBaseLexer
-    filename*: string
-    cache*: IdentCache
+    fileIdx*: (when declared(FileIndex): FileIndex else: int32)
+    # cache*: IdentCache
 
 proc getTok*(L: var TLexer, tok: var TToken)
 proc printTok*(tok: TToken)
@@ -96,10 +96,15 @@ proc fillToken(L: var TToken) =
   L.base = base10
   L.ident = dummyIdent        # this prevents many bugs!
 
+var gConfig* = newConfigRef() # XXX make this part of the lexer
+var identCache* = newIdentCache()
+
+template toFilename*(idx: FileIndex): string = toFilename(gConfig, idx)
+
 proc openLexer*(lex: var TLexer, filename: string, inputstream: PLLStream) =
   openBaseLexer(lex, inputstream)
-  lex.filename = filename
-  lex.cache = newIdentCache()
+  lex.fileIdx = fileInfoIdx(gConfig, AbsoluteFile filename)
+  # lex.cache = newIdentCache()
 
 proc closeLexer*(lex: var TLexer) =
   inc(gLinesCompiled, lex.lineNumber)
@@ -109,14 +114,14 @@ proc getColumn(L: TLexer): int =
   result = getColNumber(L, L.bufPos)
 
 proc getLineInfo*(L: TLexer): TLineInfo =
-  result = newLineInfo(L.filename, L.lineNumber, getColNumber(L, L.bufpos))
+  result = newLineInfo(L.fileIdx, L.lineNumber, getColNumber(L, L.bufpos))
 
 proc lexMessage*(L: TLexer, msg: TMsgKind, arg = "") =
-  msgs.globalError(getLineInfo(L), msg, arg)
+  msgs.globalError(gConfig, getLineInfo(L), msg, arg)
 
 proc lexMessagePos(L: var TLexer, msg: TMsgKind, pos: int, arg = "") =
-  var info = newLineInfo(L.filename, L.lineNumber, pos - L.lineStart)
-  msgs.globalError(info, msg, arg)
+  var info = newLineInfo(L.fileIdx, L.lineNumber, pos - L.lineStart)
+  msgs.globalError(gConfig, info, msg, arg)
 
 proc tokKindToStr*(k: TTokKind): string =
   case k
@@ -166,10 +171,10 @@ proc `$`(tok: TToken): string =
   else: result = tokKindToStr(tok.xkind)
 
 proc printTok(tok: TToken) =
-  writeln(stdout, $tok)
+  writeLine(stdout, $tok)
 
 proc setKeyword(L: var TLexer, tok: var TToken) =
-  var x = binaryStrSearch(Keywords, toLower(tok.ident.s))
+  var x = binarySearch(Keywords, toLower(tok.ident.s))
   if x < 0: tok.xkind = pxSymbol
   else: tok.xKind = TTokKind(x + ord(firstKeyword))
 
@@ -207,7 +212,7 @@ proc getNumber2(L: var TLexer, tok: var TToken) =
   while true:
     case L.buf[pos]
     of 'A'..'Z', 'a'..'z', '2'..'9', '.':
-      lexMessage(L, errInvalidNumber)
+      lexMessage(L, errGenerated, "invalid number")
       inc(pos)
     of '_':
       inc(pos)
@@ -229,7 +234,7 @@ proc getNumber16(L: var TLexer, tok: var TToken) =
   while true:
     case L.buf[pos]
     of 'G'..'Z', 'g'..'z', '.':
-      lexMessage(L, errInvalidNumber)
+      lexMessage(L, errGenerated, "invalid number")
       inc(pos)
     of '_': inc(pos)
     of '0'..'9':
@@ -270,9 +275,9 @@ proc getNumber10(L: var TLexer, tok: var TToken) =
       else:
         tok.xkind = pxIntLit
   except ValueError:
-    lexMessage(L, errInvalidNumber, tok.literal)
+    lexMessage(L, errGenerated, "invalid number: " & tok.literal)
   except OverflowError:
-    lexMessage(L, errNumberOutOfRange, tok.literal)
+    lexMessage(L, errGenerated, "invalid number: " & tok.literal)
 
 proc handleCRLF(L: var TLexer, pos: int): int =
   case L.buf[pos]
@@ -290,7 +295,7 @@ proc getString(L: var TLexer, tok: var TToken) =
       while true:
         case buf[pos]
         of CR, LF, nimlexbase.EndOfFile:
-          lexMessage(L, errClosingQuoteExpected)
+          lexMessagePos(L, errGenerated, L.lineStart, "closing quote expected, but end of file reached")
           break
         of '\'':
           inc(pos)
@@ -321,9 +326,9 @@ proc getString(L: var TLexer, tok: var TToken) =
         while buf[pos] in {'0'..'9'}:
           xi = (xi * 10) + (ord(buf[pos]) - ord('0'))
           inc(pos)
-      else: lexMessage(L, errInvalidCharacterConstant)
+      else: lexMessage(L, errGenerated, "invalid character constant")
       if (xi <= 255): add(tok.literal, chr(xi))
-      else: lexMessage(L, errInvalidCharacterConstant)
+      else: lexMessage(L, errGenerated, "invalid character constant")
     else:
       break
   tok.xkind = pxStrLit
@@ -349,7 +354,7 @@ when false:
 
 when true:
   proc getSymbol(L: var TLexer, tok: var TToken) =
-    var h: THash = 0
+    var h: Hash = 0
     var pos = L.bufpos
     var buf = L.buf
     while true:
@@ -370,7 +375,7 @@ when true:
     h = h +% h shl 3
     h = h xor (h shr 11)
     h = h +% h shl 15
-    tok.ident = getIdent(L.cache, addr(L.buf[L.bufpos]), pos - L.bufpos, h)
+    tok.ident = getIdent(identCache, addr(L.buf[L.bufpos]), pos - L.bufpos, h)
     L.bufpos = pos
     setKeyword(L, tok)
 
@@ -413,7 +418,7 @@ proc scanCurlyComment(L: var TLexer, tok: var TToken) =
     of '}':
       inc(pos)
       break
-    of nimlexbase.EndOfFile: lexMessage(L, errTokenExpected, "}")
+    of nimlexbase.EndOfFile: lexMessage(L, errXExpected, "}")
     else:
       add(tok.literal, buf[pos])
       inc(pos)
@@ -438,7 +443,7 @@ proc scanStarComment(L: var TLexer, tok: var TToken) =
       else:
         add(tok.literal, '*')
     of nimlexbase.EndOfFile:
-      lexMessage(L, errTokenExpected, "*)")
+      lexMessage(L, errXExpected, "*)")
     else:
       add(tok.literal, buf[pos])
       inc(pos)
@@ -588,5 +593,5 @@ proc getTok(L: var TLexer, tok: var TToken) =
     else:
       tok.literal = c & ""
       tok.xkind = pxInvalid
-      lexMessage(L, errInvalidToken, c & " (\\" & $(ord(c)) & ')')
+      lexMessage(L, errGenerated, "invalid token " & c & " (\\" & $(ord(c)) & ')')
       inc(L.bufpos)

@@ -13,7 +13,10 @@
 
 import 
   os, llstream, paslex, idents, strutils, ast, astalgo, msgs, options, 
-  deques, tables, renderer, parsetools
+  deques, tables, renderer, parsetools, lineinfos
+
+proc getIdent(s: string): PIdent = getIdent(identCache, s)
+template emptyNode: untyped = newNode(nkEmpty)
 
 type 
   TSection = enum 
@@ -123,12 +126,12 @@ proc openParser(p: var TParser, filename: string,
   openLexer(p.lex, filename, inputStream)
   initIdTable(p.repl)
   for r in stdReplacements: 
-    idTablePut(p.repl, getIdent(p.lex.cache, r[0]), 
-               getIdent(p.lex.cache, r[1]))
+    idTablePut(p.repl, getIdent(identCache, r[0]), 
+               getIdent(identCache, r[1]))
   if pfMoreReplacements in flags: 
     for i in countup(low(nimReplacements), high(nimReplacements)): 
-      idTablePut(p.repl, getIdent(p.lex.cache, nimReplacements[i][0]), 
-                 getIdent(p.lex.cache, nimReplacements[i][1]))
+      idTablePut(p.repl, getIdent(identCache, nimReplacements[i][0]), 
+                 getIdent(identCache, nimReplacements[i][1]))
   p.flags = flags
   p.ahead = initDeque[TToken]()
   p.classes = initTable[int, TObjectInfo]()
@@ -160,7 +163,7 @@ proc parLineInfo(p: TParser): TLineInfo =
 proc skipCom(p: var TParser, n: PNode) = 
   while p.tok.xkind == pxComment: 
     if (n != nil): 
-      if n.comment == nil: n.comment = p.tok.literal
+      if n.comment == "": n.comment = p.tok.literal
       else: add(n.comment, "\n" & p.tok.literal)
     else: 
       parMessage(p, warnCommentXIgnored, p.tok.literal)
@@ -168,11 +171,11 @@ proc skipCom(p: var TParser, n: PNode) =
 
 proc expectIdent(p: TParser) = 
   if p.tok.xkind != pxSymbol: 
-    lexMessage(p.lex, errIdentifierExpected, $(p.tok))
+    lexMessage(p.lex, errXExpected, $(p.tok))
   
 proc eat(p: var TParser, xkind: TTokKind) = 
   if p.tok.xkind == xkind: getTok(p)
-  else: lexMessage(p.lex, errTokenExpected, tokKindToStr(xkind))
+  else: lexMessage(p.lex, errXExpected, tokKindToStr(xkind))
   
 proc opt(p: var TParser, xkind: TTokKind) = 
   if p.tok.xkind == xkind: getTok(p)
@@ -199,7 +202,7 @@ proc newIdentNodeP(ident: PIdent, p: TParser): PNode =
 
 proc newIdentNameNodeP(name: string, p: TParser): PNode = 
   result = newNodeP(nkIdent, p)
-  result.ident = getIdent(p.lex.cache, name)
+  result.ident = getIdent(identCache, name)
 
 proc createIdentNodeP(ident: PIdent, p: TParser): PNode = 
   result = newNodeP(nkIdent, p)
@@ -226,8 +229,8 @@ proc genSignature(n: PNode): int =
           result = result * 223 + ty.ident.id
 
 proc pushExtraStmt(p: var TParser, s: TExtraStmt) =
-  if p.extra == nil: 
-    p.extra = @[]
+  if p.extra.len == 0: 
+    # p.extra = @[]
     var n = newNodeP(nkPragma, p).add(newNodeP(nkExprColonExpr, p).add(
       newIdentNameNodeP("this", p),
       newIdentNameNodeP("self", p)))
@@ -247,7 +250,7 @@ proc parseTypeDesc(p: var TParser, definition: PNode): PNode =
 
 proc parseEmit(p: var TParser, definition: PNode): PNode = 
   getTok(p)                   # skip 'emit'
-  result = ast.emptyNode
+  result = emptyNode
   if p.tok.xkind != pxCurlyDirRi: 
     case p.context
     of conExpr: 
@@ -265,20 +268,20 @@ proc parseEmit(p: var TParser, definition: PNode): PNode =
   eat(p, pxCurlyDirRi)
 
 proc parseCommand(p: var TParser, definition: PNode = nil): PNode = 
-  result = ast.emptyNode
+  result = emptyNode
   getTok(p)
-  if p.tok.ident.id == getIdent(p.lex.cache, "discard").id: 
+  if p.tok.ident.id == getIdent(identCache, "discard").id: 
     result = newNodeP(nkDiscardStmt, p)
     getTok(p)
     eat(p, pxCurlyDirRi)
     addSon(result, parseExpr(p))
-  elif p.tok.ident.id == getIdent(p.lex.cache, "set").id: 
+  elif p.tok.ident.id == getIdent(identCache, "set").id: 
     getTok(p)
     eat(p, pxCurlyDirRi)
     result = parseExpr(p)
-    if result.kind == nkEmpty: internalError("emptyNode modified")
+    if result.kind == nkEmpty: internalError(gConfig, "emptyNode modified")
     result.kind = nkCurly
-  elif p.tok.ident.id == getIdent(p.lex.cache, "cast").id: 
+  elif p.tok.ident.id == getIdent(identCache, "cast").id: 
     getTok(p)
     eat(p, pxCurlyDirRi)
     var a = parseExpr(p)
@@ -289,18 +292,18 @@ proc parseCommand(p: var TParser, definition: PNode = nil): PNode =
     else: 
       parMessage(p, errInvalidDirectiveX, $p.tok)
       result = a
-  elif p.tok.ident.id == getIdent(p.lex.cache, "emit").id: 
+  elif p.tok.ident.id == getIdent(identCache, "emit").id: 
     result = parseEmit(p, definition)
-  elif p.tok.ident.id == getIdent(p.lex.cache, "ignore").id: 
+  elif p.tok.ident.id == getIdent(identCache, "ignore").id: 
     getTok(p)
     eat(p, pxCurlyDirRi)
     while true: 
       case p.tok.xkind
       of pxEof: 
-        parMessage(p, errTokenExpected, "{@emit}")
+        parMessage(p, errXExpected, "{@emit}")
       of pxCommand: 
         getTok(p)
-        if p.tok.ident.id == getIdent(p.lex.cache, "emit").id: 
+        if p.tok.ident.id == getIdent(identCache, "emit").id: 
           result = parseEmit(p, definition)
           break 
         else: 
@@ -309,15 +312,15 @@ proc parseCommand(p: var TParser, definition: PNode = nil): PNode =
           eat(p, pxCurlyDirRi)
       else: 
         getTok(p)             # skip token
-  elif p.tok.ident.id == getIdent(p.lex.cache, "ptr").id: 
+  elif p.tok.ident.id == getIdent(identCache, "ptr").id: 
     result = newNodeP(nkPtrTy, p)
     getTok(p)
     eat(p, pxCurlyDirRi)
-  elif p.tok.ident.id == getIdent(p.lex.cache, "tuple").id: 
+  elif p.tok.ident.id == getIdent(identCache, "tuple").id: 
     result = newNodeP(nkTupleTy, p)
     getTok(p)
     eat(p, pxCurlyDirRi)
-  elif p.tok.ident.id == getIdent(p.lex.cache, "acyclic").id: 
+  elif p.tok.ident.id == getIdent(identCache, "acyclic").id: 
     result = newIdentNodeP(p.tok.ident, p)
     getTok(p)
     eat(p, pxCurlyDirRi)
@@ -327,7 +330,7 @@ proc parseCommand(p: var TParser, definition: PNode = nil): PNode =
       getTok(p)
       if p.tok.xkind == pxCurlyDirRi or p.tok.xkind == pxEof: break 
     eat(p, pxCurlyDirRi)
-    result = ast.emptyNode
+    result = emptyNode
 
 proc getPrecedence(kind: TTokKind): int = 
   case kind
@@ -357,7 +360,7 @@ proc bracketExprList(p: var TParser, first: PNode): PNode =
       getTok(p)
       break 
     if p.tok.xkind == pxEof: 
-      parMessage(p, errTokenExpected, tokKindToStr(pxBracketRi))
+      parMessage(p, errXExpected, "token " & tokKindToStr(pxBracketRi))
       break 
     var a = rangeExpr(p)
     skipCom(p, a)
@@ -387,7 +390,7 @@ proc exprListAux(p: var TParser, elemKind: TNodeKind,
       getTok(p)
       break 
     if p.tok.xkind == pxEof: 
-      parMessage(p, errTokenExpected, tokKindToStr(endTok))
+      parMessage(p, errXExpected, "token " & tokKindToStr(endTok))
       break 
     var a = exprColonEqExpr(p, elemKind, sepTok)
     skipCom(p, a)
@@ -400,8 +403,8 @@ proc qualifiedIdent(p: var TParser): PNode =
   if p.tok.xkind == pxSymbol: 
     result = createIdentNodeP(p.tok.ident, p)
   else: 
-    parMessage(p, errIdentifierExpected, $p.tok)
-    return ast.emptyNode
+    parMessage(p, errXExpected, $p.tok)
+    return emptyNode
   getTok(p)
   skipCom(p, result)
   if p.tok.xkind == pxDot: 
@@ -414,7 +417,7 @@ proc qualifiedIdent(p: var TParser): PNode =
       addSon(result, createIdentNodeP(p.tok.ident, p))
       getTok(p)
     else: 
-      parMessage(p, errIdentifierExpected, $p.tok)
+      parMessage(p, errXExpected, "identifier " & $p.tok)
   
 proc qualifiedIdentListAux(p: var TParser, endTok: TTokKind, 
                            result: PNode) = 
@@ -425,7 +428,7 @@ proc qualifiedIdentListAux(p: var TParser, endTok: TTokKind,
       getTok(p)
       break 
     if p.tok.xkind == pxEof: 
-      parMessage(p, errTokenExpected, tokKindToStr(endTok))
+      parMessage(p, errXExpected, "token " & tokKindToStr(endTok))
       break 
     var a = qualifiedIdent(p)
     skipCom(p, a)
@@ -494,9 +497,9 @@ proc identOrLiteral(p: var TParser): PNode =
   of pxCommand: 
     result = parseCommand(p)
   else: 
-    parMessage(p, errExprExpected, $(p.tok))
+    parMessage(p, errXExpected, "expression " & $(p.tok))
     getTok(p) # we must consume a token here to prevend endless loops!
-    result = ast.emptyNode
+    result = emptyNode
   if result.kind != nkEmpty: skipCom(p, result)
   
 proc primary(p: var TParser): PNode = 
@@ -504,7 +507,7 @@ proc primary(p: var TParser): PNode =
   if (p.tok.xkind == pxNot) or (p.tok.xkind == pxMinus) or
       (p.tok.xkind == pxPlus): 
     result = newNodeP(nkPrefix, p)
-    var a = newIdentNodeP(getIdent(p.lex.cache, $p.tok), p)
+    var a = newIdentNodeP(getIdent(identCache, $p.tok), p)
     addSon(result, a)
     getTok(p)
     skipCom(p, a)
@@ -512,7 +515,7 @@ proc primary(p: var TParser): PNode =
     return 
   elif p.tok.xkind == pxAt: 
     result = newNodeP(nkAddr, p)
-    var a = newIdentNodeP(getIdent(p.lex.cache, $p.tok), p)
+    var a = newIdentNodeP(getIdent(identCache, $p.tok), p)
     getTok(p)
     if p.tok.xkind == pxBracketLe: 
       result = newNodeP(nkPrefix, p)
@@ -539,7 +542,7 @@ proc primary(p: var TParser): PNode =
         addSon(result, createIdentNodeP(p.tok.ident, p))
         getTok(p)
       else: 
-        parMessage(p, errIdentifierExpected, $p.tok)
+        parMessage(p, errXExpected, "identifier " & $p.tok)
     of pxHat: 
       var a = result
       result = newNodeP(nkBracketExpr, p)
@@ -558,7 +561,7 @@ proc lowestExprAux(p: var TParser, v: var PNode, limit: int): TTokKind =
   var opPred = getPrecedence(op)
   while (opPred > limit): 
     node = newNodeP(nkInfix, p)
-    opNode = newIdentNodeP(getIdent(p.lex.cache, $(p.tok)), p) # skip operator:
+    opNode = newIdentNodeP(getIdent(identCache, $(p.tok)), p) # skip operator:
     getTok(p)
     case op
     of pxPlus: 
@@ -566,22 +569,22 @@ proc lowestExprAux(p: var TParser, v: var PNode, limit: int): TTokKind =
       of pxPer: 
         getTok(p)
         eat(p, pxCurlyDirRi)
-        opNode.ident = getIdent(p.lex.cache, "+%")
+        opNode.ident = getIdent(identCache, "+%")
       of pxAmp: 
         getTok(p)
         eat(p, pxCurlyDirRi)
-        opNode.ident = getIdent(p.lex.cache, "&")
+        opNode.ident = getIdent(identCache, "&")
       else: 
         discard
     of pxMinus: 
       if p.tok.xkind == pxPer: 
         getTok(p)
         eat(p, pxCurlyDirRi)
-        opNode.ident = getIdent(p.lex.cache, "-%")
+        opNode.ident = getIdent(identCache, "-%")
     of pxEquals: 
-      opNode.ident = getIdent(p.lex.cache, "==")
+      opNode.ident = getIdent(identCache, "==")
     of pxNeq: 
-      opNode.ident = getIdent(p.lex.cache, "!=")
+      opNode.ident = getIdent(identCache, "!=")
     else: 
       discard
     skipCom(p, opNode)        # read sub-expression with higher priority
@@ -653,18 +656,18 @@ proc parseUsesStmt(p: var TParser): PNode =
     of pxEof: break 
     of pxSymbol: a = newIdentNodeP(p.tok.ident, p)
     else: 
-      parMessage(p, errIdentifierExpected, $(p.tok))
+      parMessage(p, errXExpected, "identifier " & $(p.tok))
       break 
     getTok(p)                 # skip identifier, string
     skipCom(p, a)
-    if pfImportBlackList notin p.flags or not inImportBlackList(p.lex.cache, a.ident): 
+    if pfImportBlackList notin p.flags or not inImportBlackList(identCache, a.ident): 
       addSon(result, createIdentNodeP(a.ident, p))
     if p.tok.xkind == pxComma: 
       getTok(p)
       skipCom(p, a)
     else: 
       break 
-  if sonsLen(result) == 0: result = ast.emptyNode
+  if sonsLen(result) == 0: result = emptyNode
   
 proc parseIncludeDir(p: var TParser): PNode = 
   result = newNodeP(nkIncludeStmt, p)
@@ -682,14 +685,14 @@ proc parseIncludeDir(p: var TParser): PNode =
     of pxCurlyDirRi: 
       break 
     else: 
-      parMessage(p, errIdentifierExpected, $p.tok)
+      parMessage(p, errXExpected, "identifier " & $p.tok)
       break 
   addSon(result, newStrNodeP(nkStrLit, changeFileExt(filename, "nim"), p))
-  if filename == "config.inc": result = ast.emptyNode
+  if filename == "config.inc": result = emptyNode
   
 proc definedExprAux(p: var TParser): PNode = 
   result = newNodeP(nkCall, p)
-  addSon(result, newIdentNodeP(getIdent(p.lex.cache, "defined"), p))
+  addSon(result, newIdentNodeP(getIdent(identCache, "defined"), p))
   expectIdent(p)
   addSon(result, createIdentNodeP(p.tok.ident, p))
   getTok(p)
@@ -746,7 +749,7 @@ proc parseIfndefDir(p: var TParser, endMarker: TTokKind): PNode =
   addSon(result, newNodeP(nkElifBranch, p))
   getTok(p)
   var e = newNodeP(nkCall, p)
-  addSon(e, newIdentNodeP(getIdent(p.lex.cache, "not"), p))
+  addSon(e, newIdentNodeP(getIdent(identCache, "not"), p))
   addSon(e, definedExprAux(p))
   eat(p, endMarker)
   addSon(result.sons[0], e)
@@ -761,7 +764,7 @@ proc parseIfDir(p: var TParser, endMarker: TTokKind): PNode =
   parseIfDirAux(p, result)
 
 proc parseDirective(p: var TParser): PNode = 
-  result = ast.emptyNode
+  result = emptyNode
   if not (p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}): return 
   var endMarker = succ(p.tok.xkind)
   if p.tok.ident != nil: 
@@ -784,7 +787,7 @@ proc parseRaise(p: var TParser): PNode =
   getTok(p)
   skipCom(p, result)
   if p.tok.xkind != pxSemicolon: addSon(result, parseExpr(p))
-  else: addSon(result, ast.emptyNode)
+  else: addSon(result, emptyNode)
   
 proc parseIf(p: var TParser): PNode = 
   result = newNodeP(nkIfStmt, p)
@@ -823,7 +826,7 @@ proc parseRepeat(p: var TParser): PNode =
   result = newNodeP(nkWhileStmt, p)
   getTok(p)
   skipCom(p, result)
-  addSon(result, newIdentNodeP(getIdent(p.lex.cache, "true"), p))
+  addSon(result, newIdentNodeP(getIdent(identCache, "true"), p))
   var s = newNodeP(nkStmtList, p)
   while p.tok.xkind != pxEof and p.tok.xkind != pxUntil: 
     addSon(s, parseStmt(p))
@@ -832,12 +835,12 @@ proc parseRepeat(p: var TParser): PNode =
   skipCom(p, a)
   var b = newNodeP(nkElifBranch, p)
   var c = newNodeP(nkBreakStmt, p)
-  addSon(c, ast.emptyNode)
+  addSon(c, emptyNode)
   addSon(b, parseExpr(p))
   skipCom(p, a)
   addSon(b, c)
   addSon(a, b)
-  if b.sons[0].kind == nkIdent and b.sons[0].ident.id == getIdent(p.lex.cache, "false").id: 
+  if b.sons[0].kind == nkIdent and b.sons[0].ident.id == getIdent(identCache, "false").id: 
     discard
   else: 
     addSon(s, a)
@@ -877,7 +880,7 @@ proc parseTry(p: var TParser): PNode =
   addSon(result, b)
   if p.tok.xkind == pxExcept: 
     getTok(p)
-    while p.tok.ident.id == getIdent(p.lex.cache, "on").id: 
+    while p.tok.ident.id == getIdent(identCache, "on").id: 
       b = newNodeP(nkExceptBranch, p)
       getTok(p)
       var e = qualifiedIdent(p)
@@ -913,18 +916,18 @@ proc parseFor(p: var TParser): PNode =
   getTok(p)
   eat(p, pxAsgn)
   var a = parseExpr(p)
-  var b = ast.emptyNode
+  var b = emptyNode
   var c = newNodeP(nkCall, p)
   if p.tok.xkind == pxTo: 
-    addSon(c, newIdentNodeP(getIdent(p.lex.cache, "countup"), p))
+    addSon(c, newIdentNodeP(getIdent(identCache, "countup"), p))
     getTok(p)
     b = parseExpr(p)
   elif p.tok.xkind == pxDownto: 
-    addSon(c, newIdentNodeP(getIdent(p.lex.cache, "countdown"), p))
+    addSon(c, newIdentNodeP(getIdent(identCache, "countdown"), p))
     getTok(p)
     b = parseExpr(p)
   else: 
-    parMessage(p, errTokenExpected, tokKindToStr(pxTo))
+    parMessage(p, errXExpected, "token " & tokKindToStr(pxTo))
   addSon(c, a)
   addSon(c, b)
   eat(p, pxDo)
@@ -935,7 +938,7 @@ proc parseFor(p: var TParser): PNode =
 template parseParamImpl(p: var TParser; right: TTokKind; result): typed = 
   var a: PNode
   result = newNodeP(nkIdentDefs, p)
-  var v = ast.emptyNode
+  var v = emptyNode
   case p.tok.xkind
   of pxConst: 
     getTok(p)
@@ -952,7 +955,7 @@ template parseParamImpl(p: var TParser; right: TTokKind; result): typed =
     of pxSymbol: a = createIdentNodeP(p.tok.ident, p)
     of pxColon, pxEof, right, pxEquals: break 
     else: 
-      parMessage(p, errIdentifierExpected, $p.tok)
+      parMessage(p, errXExpected, "Identifier " & $p.tok)
       return 
     getTok(p)                 # skip identifier
     skipCom(p, a)
@@ -967,15 +970,15 @@ template parseParamImpl(p: var TParser; right: TTokKind; result): typed =
     else: v = parseTypeDesc(p)
     addSon(result, v)
   else: 
-    addSon(result, ast.emptyNode)
+    addSon(result, emptyNode())
     if p.tok.xkind != pxEquals: 
-      parMessage(p, errColonOrEqualsExpected, $p.tok)
+      parMessage(p, errXExpected, $p.tok)
   if p.tok.xkind == pxEquals: 
     getTok(p)
     skipCom(p, result)
     addSon(result, parseExpr(p))
   else: 
-    addSon(result, ast.emptyNode)
+    addSon(result, emptyNode())
 
 proc genSelfType(p: var TParser): PNode =
   result = createIdentNodeP(p.selfClass, p)
@@ -989,14 +992,14 @@ proc genSelfParam(p: var TParser): PNode =
   result = newNodeP(nkIdentDefs, p).add(
     newIdentNameNodeP("self", p),
     genSelfType(p),
-    ast.emptyNode)
+    emptyNode)
 
 template parseParamListImpl(p: var TParser; right: TTokKind): typed = 
   proc parseParam(px: var TParser): PNode = 
     parseParamImpl(px, right, result)
   var a: PNode
   result = newNodeP(nkFormalParams, p)
-  addSon(result, ast.emptyNode)         # return type
+  addSon(result, emptyNode())         # return type
   if isNil(p.outerProc) and not isNil(p.selfClass):
     addSon(result, genSelfParam(p))
   if (right == pxParRi and p.tok.xkind == pxParLe) or 
@@ -1012,7 +1015,7 @@ template parseParamListImpl(p: var TParser; right: TTokKind): typed =
           getTok(p)
           break 
         else: 
-          parMessage(p, errTokenExpected, $right)
+          parMessage(p, errXExpected, "token " & $right)
           break 
         skipCom(p, a)
         if p.tok.xkind == pxSemicolon: 
@@ -1032,7 +1035,7 @@ proc parseArrayPropParams(p: var TParser): PNode =
   parseParamListImpl(p, pxBracketRi)
   
 proc parseCallingConvention(p: var TParser): PNode = 
-  result = ast.emptyNode
+  result = emptyNode
   case p.tok.xkind 
   of pxSymbol, pxInline: 
     case toLower(p.tok.ident.s)
@@ -1072,7 +1075,7 @@ proc parseRoutineSpecifiers(p: var TParser, noBody: var bool, isVirtual: var boo
       # This is a fake for platform module. There is no ``importc``
       # directive in Pascal.
       if result.kind == nkEmpty: result = newNodeP(nkPragma, p)
-      addSon(result, newIdentNodeP(getIdent(p.lex.cache, "importc"), p))
+      addSon(result, newIdentNodeP(getIdent(identCache, "importc"), p))
       noBody = true
       getTok(p)
       opt(p, pxSemicolon)
@@ -1080,7 +1083,7 @@ proc parseRoutineSpecifiers(p: var TParser, noBody: var bool, isVirtual: var boo
       # This is a fake for platform module. There is no ``noconv``
       # directive in Pascal.
       if result.kind == nkEmpty: result = newNodeP(nkPragma, p)
-      addSon(result, newIdentNodeP(getIdent(p.lex.cache, "noconv"), p))
+      addSon(result, newIdentNodeP(getIdent(identCache, "noconv"), p))
       noBody = true
       getTok(p)
       opt(p, pxSemicolon)
@@ -1088,12 +1091,12 @@ proc parseRoutineSpecifiers(p: var TParser, noBody: var bool, isVirtual: var boo
       # This is a fake for the Nim compiler. There is no ``procvar``
       # directive in Pascal.
       if result.kind == nkEmpty: result = newNodeP(nkPragma, p)
-      addSon(result, newIdentNodeP(getIdent(p.lex.cache, "procvar"), p))
+      addSon(result, newIdentNodeP(getIdent(identCache, "procvar"), p))
       getTok(p)
       opt(p, pxSemicolon)
     of "varargs": 
       if result.kind == nkEmpty: result = newNodeP(nkPragma, p)
-      addSon(result, newIdentNodeP(getIdent(p.lex.cache, "varargs"), p))
+      addSon(result, newIdentNodeP(getIdent(identCache, "varargs"), p))
       getTok(p)
       opt(p, pxSemicolon)
     of "external": 
@@ -1101,19 +1104,19 @@ proc parseRoutineSpecifiers(p: var TParser, noBody: var bool, isVirtual: var boo
       getTok(p)
       noBody = true
       e = newNodeP(nkExprColonExpr, p)
-      addSon(e, newIdentNodeP(getIdent(p.lex.cache, "dynlib"), p))
+      addSon(e, newIdentNodeP(getIdent(identCache, "dynlib"), p))
       addSon(e, parseExpr(p))
       addSon(result, e)
       opt(p, pxSemicolon)
       if (p.tok.xkind == pxSymbol) and
-          (p.tok.ident.id == getIdent(p.lex.cache, "name").id): 
+          (p.tok.ident.id == getIdent(identCache, "name").id): 
         e = newNodeP(nkExprColonExpr, p)
         getTok(p)
-        addSon(e, newIdentNodeP(getIdent(p.lex.cache, "importc"), p))
+        addSon(e, newIdentNodeP(getIdent(identCache, "importc"), p))
         addSon(e, parseExpr(p))
         addSon(result, e)
       else: 
-        addSon(result, newIdentNodeP(getIdent(p.lex.cache, "importc"), p))
+        addSon(result, newIdentNodeP(getIdent(identCache, "importc"), p))
       opt(p, pxSemicolon)
     of "virtual":
       isVirtual = true
@@ -1123,7 +1126,7 @@ proc parseRoutineSpecifiers(p: var TParser, noBody: var bool, isVirtual: var boo
       isVirtual = true
       if p.keepOverride:
         if result.kind == nkEmpty: result = newNodeP(nkPragma, p)
-        addSon(result, newIdentNodeP(getIdent(p.lex.cache, "override"), p))
+        addSon(result, newIdentNodeP(getIdent(identCache, "override"), p))
       getTok(p)
       opt(p, pxSemicolon)
         
@@ -1147,13 +1150,13 @@ proc parseEnum(p: var TParser): PNode =
   result = newNodeP(nkEnumTy, p)
   getTok(p)
   skipCom(p, result)
-  addSon(result, ast.emptyNode) # it does not inherit from any enumeration
+  addSon(result, emptyNode) # it does not inherit from any enumeration
   while true: 
     case p.tok.xkind
     of pxEof, pxParRi: break 
     of pxSymbol: a = newIdentNodeP(p.tok.ident, p)
     else: 
-      parMessage(p, errIdentifierExpected, $(p.tok))
+      parMessage(p, errXExpected, "Identifier " & $(p.tok))
       break 
     getTok(p)                 # skip identifier
     skipCom(p, a)
@@ -1175,7 +1178,7 @@ proc identVis(p: var TParser): PNode =
   var a = createIdentNodeP(p.tok.ident, p)
   if p.visibility != visPrivate: # section == seInterface: 
     result = newNodeP(nkPostfix, p)
-    addSon(result, newIdentNodeP(getIdent(p.lex.cache, "*"), p))
+    addSon(result, newIdentNodeP(getIdent(identCache, "*"), p))
     addSon(result, a)
   else: 
     result = a
@@ -1197,7 +1200,7 @@ proc parseIdentColonEquals(p: var TParser,
     of pxSymbol: a = identParser(p)
     of pxColon, pxEof, pxParRi, pxEquals: break 
     else: 
-      parMessage(p, errIdentifierExpected, $(p.tok))
+      parMessage(p, errXExpected, "Identifier " & $(p.tok))
       return 
     skipCom(p, a)
     if p.tok.xkind == pxComma: 
@@ -1209,15 +1212,15 @@ proc parseIdentColonEquals(p: var TParser,
     skipCom(p, result)
     addSon(result, parseTypeDesc(p))
   else: 
-    addSon(result, ast.emptyNode)
+    addSon(result, emptyNode)
     if p.tok.xkind != pxEquals: 
-      parMessage(p, errColonOrEqualsExpected, $(p.tok))
+      parMessage(p, errXExpected, $(p.tok))
   if p.tok.xkind == pxEquals: 
     getTok(p)
     skipCom(p, result)
     addSon(result, parseExpr(p))
   else: 
-    addSon(result, ast.emptyNode)
+    addSon(result, emptyNode)
   if p.tok.xkind == pxSemicolon: 
     getTok(p)
     skipCom(p, result)
@@ -1230,7 +1233,7 @@ proc parseRecordCase(p: var TParser): PNode =
   addSon(a, rawIdent(p))
   eat(p, pxColon)
   addSon(a, parseTypeDesc(p))
-  addSon(a, ast.emptyNode)
+  addSon(a, emptyNode)
   addSon(result, a)
   eat(p, pxOf)
   skipCom(p, result)
@@ -1267,7 +1270,7 @@ proc genArrayPropertyType(p: var TParser; propName: PIdent): PNode =
   result = newNodeP(nkTypeSection, p).add(
     newNodeP(nkTypeDef, p).add(
       newIdentNameNodeP("`" & p.selfClass.s & "*" & propName.s & "`", p),
-      ast.emptyNode,
+      emptyNode,
       newNodeP(nkDistinctTy, p).add(
         newIdentNodeP(p.selfClass, p)
       )
@@ -1279,18 +1282,18 @@ proc genArrayProperty(p: var TParser; arrPropTy, propTy: PNode; asReader: bool;
   var name = if asReader: newIdentNameNodeP("`[]`", p) else: newIdentNameNodeP("`[]=`", p)
   result =  newNodeP(nkTemplateDef, p).add(
     name,
-    ast.emptyNode,
-    ast.emptyNode,
+    emptyNode,
+    emptyNode,
     newNodeP(nkFormalParams, p).add(
-      if asReader: propTy else: ast.emptyNode,
+      if asReader: propTy else: emptyNode,
       newNodeP(nkIdentDefs, p).add(
         newIdentNameNodeP("self", p),
         arrPropTy,
-        ast.emptyNode
+        emptyNode
       )
     ),
-    ast.emptyNode,
-    ast.emptyNode,
+    emptyNode,
+    emptyNode,
     newNodeP(nkStmtList, p).add(
       newNodeP(nkCall, p).add(
         newIdentNodeP(callId, p),
@@ -1310,25 +1313,25 @@ proc genArrayProperty(p: var TParser; arrPropTy, propTy: PNode; asReader: bool;
     result.sons[3].addSon(newNodeP(nkIdentDefs, p).add(
       newIdentNameNodeP("v", p),
       propTy,
-      ast.emptyNode
+      emptyNode
     ))
     result.sons[6].sons[0].addSon(newIdentNameNodeP("v", p))
 
 proc genPropertyReader(p: var TParser, propName: PIdent, propTy: PNode, readerId: PIdent): PNode =
   result =  newNodeP(nkTemplateDef, p).add(
     newIdentNodeP(propName, p),
-    ast.emptyNode,
-    ast.emptyNode,
+    emptyNode,
+    emptyNode,
     newNodeP(nkFormalParams, p).add(
       propTy,
       newNodeP(nkIdentDefs, p).add(
         newIdentNameNodeP("self", p),
         newIdentNodeP(p.selfClass, p),
-        ast.emptyNode
+        emptyNode
       )
     ),
-    ast.emptyNode,
-    ast.emptyNode,
+    emptyNode,
+    emptyNode,
     newNodeP(nkStmtList, p).add(
       newNodeP(nkDotExpr, p).add(
         newIdentNameNodeP("self", p),
@@ -1378,28 +1381,28 @@ proc genPropertyWriter(p: var TParser, propName: PIdent, propTy: PNode, writerId
       newIdentNodeP(propName, p),
       newIdentNameNodeP("=", p)
     ),
-    ast.emptyNode,
-    ast.emptyNode,
+    emptyNode,
+    emptyNode,
     newNodeP(nkFormalParams, p).add(
-      ast.emptyNode,
+      emptyNode,
       genSelfParam(p),
       newNodeP(nkIdentDefs, p).add(
         value,
         propTy,
-        ast.emptyNode
+        emptyNode
       ) ),
-    ast.emptyNode,
-    ast.emptyNode,
+    emptyNode,
+    emptyNode,
     newNodeP(nkStmtList, p).add(
       setter
     )
   )
 
 proc parseProperty(p: var TParser): PNode =
-  result = ast.emptyNode
+  result = emptyNode
   template nextIdent(): PIdent =
     getTok(p)
-    if p.tok.xkind != pxSymbol: parMessage(p, errIdentifierExpected, $p.tok)
+    if p.tok.xkind != pxSymbol: parMessage(p, errXExpected, "Identifier " & $p.tok)
     var res = p.tok.ident
     getTok(p)
     res
@@ -1417,21 +1420,21 @@ proc parseProperty(p: var TParser): PNode =
   while (p.tok.xkind != pxEof) and (p.tok.xkind != pxSemicolon):
     case p.tok.xkind
     of pxSymbol:
-      if p.tok.ident.id == getIdent(p.lex.cache, "read").id: 
+      if p.tok.ident.id == getIdent(identCache, "read").id: 
         readId = nextIdent()
-      elif p.tok.ident.id == getIdent(p.lex.cache, "write").id: 
+      elif p.tok.ident.id == getIdent(identCache, "write").id: 
         writeId = nextIdent()
-      elif p.tok.ident.id == getIdent(p.lex.cache, "default").id: 
+      elif p.tok.ident.id == getIdent(identCache, "default").id: 
         discard nextIdent()
       else:
-        parMessage(p, errIdentifierExpected, $p.tok)
+        parMessage(p, errXExpected, "Identifier " & $p.tok)
     else:
-      parMessage(p, errIdentifierExpected, $p.tok)
+      parMessage(p, errXExpected, "Identifier " & $p.tok)
   # echo "property ", propName.s, ": ", propTy.treeRepr, " for class ", p.selfClass.s
   opt(p, pxSemiColon)
   var isDefault = false
   if params != nil:
-    if p.tok.xkind == pxSymbol and p.tok.ident.id == getIdent(p.lex.cache, "default").id:
+    if p.tok.xkind == pxSymbol and p.tok.ident.id == getIdent(identCache, "default").id:
       isDefault = true;
       eat(p, pxSymbol)
       opt(p, pxSemiColon)
@@ -1467,7 +1470,7 @@ proc parseProperty(p: var TParser): PNode =
       
 
 proc parseRecordPart(p: var TParser): PNode = 
-  result = ast.emptyNode
+  result = emptyNode
   while (p.tok.xkind != pxEof) and (p.tok.xkind != pxEnd): 
     if result.kind == nkEmpty: result = newNodeP(nkRecList, p)
     case p.tok.xkind
@@ -1508,7 +1511,7 @@ proc parseRecordPart(p: var TParser): PNode =
     of pxProperty:
       var a = parseProperty(p)
     else: 
-      parMessage(p, errIdentifierExpected, $p.tok)
+      parMessage(p, errXExpected, "Identifier " & $p.tok)
       break
 
 proc exSymbol(n: var PNode) = 
@@ -1522,7 +1525,7 @@ proc exSymbol(n: var PNode) =
     addSon(a, newIdentNode(getIdent("*"), n.info))
     addSon(a, n)
     n = a
-  else: internalError(n.info, "exSymbol(): " & $n.kind)
+  else: internalError(gConfig, n.info, "exSymbol(): " & $n.kind)
   
 proc fixRecordDef(n: var PNode) = 
   case n.kind
@@ -1536,7 +1539,7 @@ proc fixRecordDef(n: var PNode) =
   of nkIdentDefs: 
     for i in countup(0, sonsLen(n) - 3): exSymbol(n.sons[i])
   of nkNilLit, nkEmpty: discard
-  else: internalError(n.info, "fixRecordDef(): " & $n.kind)
+  else: internalError(gConfig, n.info, "fixRecordDef(): " & $n.kind)
   
 proc addPragmaToIdent(ident: var PNode, pragma: PNode) = 
   var pragmasNode: PNode
@@ -1549,7 +1552,7 @@ proc addPragmaToIdent(ident: var PNode, pragma: PNode) =
   else: 
     pragmasNode = ident.sons[1]
     if pragmasNode.kind != nkPragma: 
-      internalError(ident.info, "addPragmaToIdent")
+      internalError(gConfig, ident.info, "addPragmaToIdent")
   addSon(pragmasNode, pragma)
 
 proc parseRecordBody(p: var TParser, result, definition: PNode) =
@@ -1564,17 +1567,17 @@ proc parseRecordBody(p: var TParser, result, definition: PNode) =
   eat(p, pxEnd)
   case p.tok.xkind
   of pxSymbol: 
-    if p.tok.ident.id == getIdent(p.lex.cache, "acyclic").id: 
+    if p.tok.ident.id == getIdent(identCache, "acyclic").id: 
       if definition != nil: 
         addPragmaToIdent(definition.sons[0], newIdentNodeP(p.tok.ident, p))
       else: 
-        internalError(result.info, "anonymous record is not supported")
+        internalError(gConfig, result.info, "anonymous record is not supported")
       getTok(p)
     else: 
-      internalError(result.info, "parseRecordBody")
+      internalError(gConfig, result.info, "parseRecordBody")
   of pxCommand: 
     if definition != nil: addPragmaToIdent(definition.sons[0], parseCommand(p))
-    else: internalError(result.info, "anonymous record is not supported")
+    else: internalError(gConfig, result.info, "anonymous record is not supported")
   else: 
     discard
   opt(p, pxSemicolon)
@@ -1586,16 +1589,16 @@ proc genInherited(p: var TParser; child, root: PIdent): PNode =
   # echo "child ", child.s, " root ", root.s
   return newNodeP(nkTemplateDef, p).add(
       newIdentNameNodeP("inherited", p),
-      ast.emptyNode,
-      ast.emptyNode,
+      emptyNode,
+      emptyNode,
       newNodeP(nkFormalParams, p).add(
         newIdentNodeP(root, p),
         newNodeP(nkIdentDefs, p).add(
           newIdentNameNodeP("self", p),
           newIdentNodeP(child, p),
-          ast.emptyNode)),
-      ast.emptyNode,
-      ast.emptyNode,
+          emptyNode)),
+      emptyNode,
+      emptyNode,
       newNodeP(nkStmtList, p).add(
         newNodeP(nkCall, p).add(
           newIdentNodeP(root, p),
@@ -1611,7 +1614,7 @@ proc parseRecordOrObject(p: var TParser, kind: TNodeKind,
   else:
     record = result
   getTok(p)
-  addSon(record, ast.emptyNode)
+  addSon(record, emptyNode)
   var defIdent = getIdentOfNode(definition)
   if p.tok.xkind == pxParLe: 
     p.classes[defIdent.id] = TObjectInfo(isRefTy: kind == nkRefTy)
@@ -1632,7 +1635,7 @@ proc parseRecordOrObject(p: var TParser, kind: TNodeKind,
     p.classes[defIdent.id] = TObjectInfo(isRefTy: false)
     addSon(record, newNodeP(nkPragma, p).add(newIdentNameNodeP("inheritable", p)) )
   else: 
-    addSon(record, ast.emptyNode)
+    addSon(record, emptyNode)
   parseRecordBody(p, record, definition)
 
 proc parseTypeDesc(p: var TParser, definition: var PNode): PNode = 
@@ -1648,7 +1651,7 @@ proc parseTypeDesc(p: var TParser, definition: var PNode): PNode =
     getTok(p)
     if p.tok.xkind == pxCommand: 
       result = parseCommand(p)
-      if result.kind != nkTupleTy: internalError(result.info, "parseTypeDesc")
+      if result.kind != nkTupleTy: internalError(gConfig, result.info, "parseTypeDesc")
       parseRecordBody(p, result, definition)
       var a = lastSon(result)     # embed nkRecList directly into nkTupleTy
       for i in countup(0, sonsLen(a) - 1): 
@@ -1656,13 +1659,13 @@ proc parseTypeDesc(p: var TParser, definition: var PNode): PNode =
         else: addSon(result, a.sons[i])
     else: 
       result = newNodeP(nkObjectTy, p)
-      addSon(result, ast.emptyNode)
-      addSon(result, ast.emptyNode)
+      addSon(result, emptyNode)
+      addSon(result, emptyNode)
       parseRecordBody(p, result, definition)
       if definition != nil: 
-        addPragmaToIdent(definition.sons[0], newIdentNodeP(getIdent(p.lex.cache, "final"), p))
+        addPragmaToIdent(definition.sons[0], newIdentNodeP(getIdent(identCache, "final"), p))
       else: 
-        internalError(result.info, "anonymous record is not supported")
+        internalError(gConfig, result.info, "anonymous record is not supported")
   of pxObject: result = parseRecordOrObject(p, nkObjectTy, definition)
   of pxClass: 
     let next = peekTok(p)
@@ -1670,7 +1673,7 @@ proc parseTypeDesc(p: var TParser, definition: var PNode): PNode =
       var n = newNodeP(nkCommentStmt, p)
       n.comment = definition.renderTree & " = class;"
       definition = n
-      result = ast.emptyNode
+      result = emptyNode
       p.eat(pxClass)
       p.eat(pxSemiColon)
       skipCom(p, result)
@@ -1682,18 +1685,18 @@ proc parseTypeDesc(p: var TParser, definition: var PNode): PNode =
     getTok(p)
     var isArrayOfConst = false
     if p.tok.xkind == pxBracketLe: 
-      addSon(result, newIdentNodeP(getIdent(p.lex.cache, "array"), p))
+      addSon(result, newIdentNodeP(getIdent(identCache, "array"), p))
       getTok(p)
       addSon(result, rangeExpr(p))
       eat(p, pxBracketRi)
     else: 
       if p.inParamList: 
         if p.peekTok.xkind != pxConst:
-          addSon(result, newIdentNodeP(getIdent(p.lex.cache, "openarray"), p))
+          addSon(result, newIdentNodeP(getIdent(identCache, "openarray"), p))
         else:
           isArrayOfConst = true
           result = newIdentNameNodeP("TArrayOfConst", p)
-      else: addSon(result, newIdentNodeP(getIdent(p.lex.cache, "seq"), p))
+      else: addSon(result, newIdentNodeP(getIdent(identCache, "seq"), p))
     eat(p, pxOf)
     if not isArrayOfConst:
       addSon(result, parseTypeDesc(p))
@@ -1703,7 +1706,7 @@ proc parseTypeDesc(p: var TParser, definition: var PNode): PNode =
     result = newNodeP(nkBracketExpr, p)
     getTok(p)
     eat(p, pxOf)
-    addSon(result, newIdentNodeP(getIdent(p.lex.cache, "set"), p))
+    addSon(result, newIdentNodeP(getIdent(identCache, "set"), p))
     addSon(result, parseTypeDesc(p))
   of pxHat: 
     getTok(p)
@@ -1719,7 +1722,7 @@ proc parseTypeDesc(p: var TParser, definition: var PNode): PNode =
     if p.tok.xkind == pxDotDot: 
       result = newNodeP(nkBracketExpr, p)
       var r = newNodeP(nkRange, p)
-      addSon(result, newIdentNodeP(getIdent(p.lex.cache, "range"), p))
+      addSon(result, newIdentNodeP(getIdent(identCache, "range"), p))
       getTok(p)
       addSon(r, a)
       addSon(r, parseExpr(p))
@@ -1731,13 +1734,13 @@ proc parseTypeDesc(p: var TParser, definition: var PNode): PNode =
 proc parseTypeDef(p: var TParser): PNode = 
   result = newNodeP(nkTypeDef, p)
   addSon(result, identVis(p))
-  addSon(result, ast.emptyNode)         # generic params
+  addSon(result, emptyNode)         # generic params
   if p.tok.xkind == pxEquals: 
     getTok(p)
     skipCom(p, result)
     addSon(result, parseTypeDesc(p, result))
   else: 
-    addSon(result, ast.emptyNode)
+    addSon(result, emptyNode)
   if p.tok.xkind == pxSemicolon: 
     getTok(p)
     skipCom(p, result)
@@ -1757,15 +1760,15 @@ proc parseConstant(p: var TParser): PNode =
     skipCom(p, result)
     addSon(result, parseTypeDesc(p))
   else: 
-    addSon(result, ast.emptyNode)
+    addSon(result, emptyNode)
     if p.tok.xkind != pxEquals: 
-      parMessage(p, errColonOrEqualsExpected, $(p.tok))
+      parMessage(p, errXExpected, $(p.tok))
   if p.tok.xkind == pxEquals: 
     getTok(p)
     skipCom(p, result)
     addSon(result, parseExpr(p))
   else: 
-    addSon(result, ast.emptyNode)
+    addSon(result, emptyNode)
   if p.tok.xkind == pxSemicolon: 
     getTok(p)
     skipCom(p, result)
@@ -1797,6 +1800,8 @@ proc parseRoutine(p: var TParser; noBody: bool): PNode =
   var isVirtual: bool
   let kind = p.tok.xkind
   let oldOuter = p.outerProc
+  let oldVisibilty = p.visibility
+  p.visibility = visPrivate
   result = newNodeP(nkProcDef, p)
   getTok(p)
   skipCom(p, result)
@@ -1814,18 +1819,18 @@ proc parseRoutine(p: var TParser; noBody: bool): PNode =
     discard
   addSon(result, identVis(p))
   # patterns, generic parameters:
-  addSon(result, ast.emptyNode)
-  addSon(result, ast.emptyNode)   
+  addSon(result, emptyNode)
+  addSon(result, emptyNode)   
   addSon(result, parseParamList(p))
   opt(p, pxSemicolon)
   addSon(result, parseRoutineSpecifiers(p, noBody, isVirtual))
-  addSon(result, ast.emptyNode)
+  addSon(result, emptyNode)
   var onlyHeader = (p.section == seInterface) or noBody
   if kind == pxConstructor and p.selfClass != nil:
     p.fixConstructorReturnTy(result, onlyHeader)
   if onlyHeader: 
     if isVirtual: p.methods[genSignature(result)] = true
-    addSon(result, ast.emptyNode)
+    addSon(result, emptyNode)
   else: 
     if oldOuter == nil:
       p.outerProc = result
@@ -1846,7 +1851,7 @@ proc parseRoutine(p: var TParser; noBody: bool): PNode =
       of pxBegin: break 
       of pxProcedure, pxFunction: addSon(stmts, parseRoutine(p, false))
       else: 
-        parMessage(p, errTokenExpected, "begin")
+        parMessage(p, errXExpected, "begin")
         break 
     var a = parseStmt(p)
     for i in countup(0, sonsLen(a) - 1): addSon(stmts, a.sons[i])
@@ -1857,14 +1862,15 @@ proc parseRoutine(p: var TParser; noBody: bool): PNode =
     result = resMethod
   p.selfClass = oldSelfClass
   p.outerProc = oldOuter
+  p.visibility = oldVisibilty
 
 proc fixExit(p: var TParser, n: PNode): bool = 
-  if (p.tok.ident.id == getIdent(p.lex.cache, "exit").id): 
+  if (p.tok.ident.id == getIdent(identCache, "exit").id): 
     var length = sonsLen(n)
     if (length <= 0): return 
     var a = n.sons[length-1]
     if (a.kind == nkAsgn) and (a.sons[0].kind == nkIdent) and
-        (a.sons[0].ident.id == getIdent(p.lex.cache, "result").id): 
+        (a.sons[0].ident.id == getIdent(identCache, "result").id): 
       delSon(a, 0)
       a.kind = nkReturnStmt
       result = true
@@ -1910,7 +1916,7 @@ proc parseBegin(p: var TParser, result: PNode) =
       getTok(p)
       break 
     of pxSemicolon: getTok(p)
-    of pxEof: parMessage(p, errExprExpected)
+    of pxEof: parMessage(p, errXExpected, "expression")
     else: 
       var a = parseStmt(p)
       if a.kind != nkEmpty: addSon(result, a)
@@ -1954,7 +1960,7 @@ proc parseInherited(p: var TParser): PNode =
 proc parseStmt(p: var TParser): PNode = 
   var oldcontext = p.context
   p.context = conStmt
-  result = ast.emptyNode
+  result = emptyNode
   case p.tok.xkind
   of pxBegin: 
     result = newNodeP(nkStmtList, p)
@@ -1997,21 +2003,21 @@ proc parseStmt(p: var TParser): PNode =
     skipCom(p, result)
   of pxSemicolon: getTok(p)
   of pxSymbol: 
-    if p.tok.ident.id == getIdent(p.lex.cache, "break").id: 
+    if p.tok.ident.id == getIdent(identCache, "break").id: 
       result = newNodeP(nkBreakStmt, p)
       getTok(p)
       skipCom(p, result)
-      addSon(result, ast.emptyNode)
-    elif p.tok.ident.id == getIdent(p.lex.cache, "continue").id: 
+      addSon(result, emptyNode)
+    elif p.tok.ident.id == getIdent(identCache, "continue").id: 
       result = newNodeP(nkContinueStmt, p)
       getTok(p)
       skipCom(p, result)
-      addSon(result, ast.emptyNode)
-    elif p.tok.ident.id == getIdent(p.lex.cache, "exit").id: 
+      addSon(result, emptyNode)
+    elif p.tok.ident.id == getIdent(identCache, "exit").id: 
       result = newNodeP(nkReturnStmt, p)
       getTok(p)
       skipCom(p, result)
-      addSon(result, ast.emptyNode)
+      addSon(result, emptyNode)
     else: 
       result = parseExprStmt(p)
   of pxDot: getTok(p) # BUGFIX for ``end.`` in main program
@@ -2030,7 +2036,7 @@ proc genConstructorTemplate(p: var TParser, n: PNode): PNode =
           newIdentNameNodeP("typedesc", p),
           n[3][0]
         ),
-        ast.emptyNode
+        emptyNode
       )
     )
   var call = newNodeP(nkCall, p).add(
@@ -2048,8 +2054,8 @@ proc genConstructorTemplate(p: var TParser, n: PNode): PNode =
       n[1],
       n[2],
       params,
-      ast.emptyNode,
-      ast.emptyNode,
+      emptyNode,
+      emptyNode,
       newNodeP(nkStmtList, p).add(
         newNodeP(nkCast, p).add(
           newNodeP(nkDotExpr, p).add(
@@ -2063,16 +2069,14 @@ proc genConstructorTemplate(p: var TParser, n: PNode): PNode =
 
 proc handleExtra(p: var TParser, node: var PNode) =
   var later: seq[TExtraStmt] 
-  if p.extra != nil:     
-    for e in p.extra:
-      if (p.section == seInterface and eiPublic in e.flags) or p.section == seImplementation:
-        node.addSon(e.node)
-        if eiConstructor in e.flags:
-          node.addSon(genConstructorTemplate(p, e.node))
-        # echo e.node.treeRepr
-      else: 
-        if later == nil: later = @[]
-        later.add(e)
+  for e in p.extra:
+    if (p.section == seInterface and eiPublic in e.flags) or p.section == seImplementation:
+      node.addSon(e.node)
+      if eiConstructor in e.flags:
+        node.addSon(genConstructorTemplate(p, e.node))
+      # echo e.node.treeRepr
+    else: 
+      later.add(e)
   p.extra = later
 
 proc parseUnit(p: var TParser): PNode = 
@@ -2084,7 +2088,7 @@ proc parseUnit(p: var TParser): PNode =
     of pxBegin: parseBegin(p, result)
     of pxCurlyDirLe, pxStarDirLe: 
       if isHandledDirective(p): addSon(result, parseDirective(p))
-      else: parMessage(p, errXNotAllowedHere, p.tok.ident.s)
+      else: parMessage(p, errGenerated, p.tok.ident.s & " not allowed here")
     else: 
       addSon(result, parseStmt(p))
       handleExtra(p, result)

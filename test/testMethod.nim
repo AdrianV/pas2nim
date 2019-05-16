@@ -22,7 +22,7 @@ type
   Third* = ref object of Second
   
 
-proc init*(self: var MyObject)
+proc init(self: var MyObject)
 template data*(self: MyClass): string =
   self.FData
 
@@ -62,14 +62,14 @@ template `[]=`*(self: `MyClass*myArray`; index: int; v: string) =
 template `[]=`*(self: MyClass; index: int; v: string) =
   setMyArray(self.MyClass, index, v)
 
-proc create*(self: MyClass; v: int): MyClass {.discardable.}
-template create*(T: typedesc[MyClass]; v: int): untyped =
+proc create(self: MyClass; v: int): MyClass {.discardable.}
+template create(T: typedesc[MyClass]; v: int): untyped =
   cast[T.type](create(new(T), v))
 
-method doIt*(self: MyClass)
-proc calc*(self: MyClass; a, b: float64): float64
-method doIt*(self: Second)
-method doIt*(self: Third)
+method doIt(self: MyClass)
+proc calc(self: MyClass; a, b: float64): float64
+method doIt(self: Second)
+method doIt(self: Third)
 var aisPublic*: int
 
 ## # implementation
