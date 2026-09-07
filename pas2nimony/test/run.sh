@@ -106,6 +106,18 @@ if [ $# -eq 0 ] && [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/twounit" ]; then
       echo "   PASLER EVENTS FAILED"; fail=1
     fi
   fi
+  if [ -f "$HERE/with.pas" ]; then
+    echo "== pasler-with"
+    mkdir -p "$TMP/pasler-with"
+    cp "$HERE/with.pas" "$TMP/pasler-with/"
+    if (cd "$TMP/pasler-with" &&
+        "$ROOT/bin/pasler" --nimony:"$NIMONY" --run with.pas 2>&1 |
+        grep -v nifmake || true); then
+      echo "-- ok"
+    else
+      echo "   PASLER WITH FAILED"; fail=1
+    fi
+  fi
 fi
 
 # keep the generated artifacts for inspection, but drop the build cache

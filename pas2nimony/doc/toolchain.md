@@ -232,3 +232,9 @@ translator itself — keep current:
     cross-module overload resolution): a subclass's own `create`
     hides the prelude's constructor even for `inherited` calls —
     give prelude routines non-colliding names (`pasExcCreate`).
+38. **nimony's build cache can silently no-op**: `nimony c -o:bin/x
+    src/x.nim` may exit 0 without rebuilding when a same-minute
+    artifact exists, so `./build.sh` "succeeds" while the binary keeps
+    the old parser — a "mysterious" persisted error right after editing
+    the source means a stale binary; `rm -rf nimcache bin/pas2nimony`
+    and rebuild before debugging parser changes.

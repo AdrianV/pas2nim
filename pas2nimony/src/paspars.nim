@@ -61,6 +61,11 @@ type
     paramTypes*: Table[string, string] ## current routine's param name -> mapped type
     fieldTypes*: Table[string, string] ## "class.field" (lowercase) -> mapped type
     paramClassTypes*: Table[string, string]
+    classFieldTypes*: Table[string, string]  ## "cls.field" -> class spelling
+    withTemps*: seq[string]     ## hidden per-with temporaries by depth
+    withClasses*: seq[string]   ## class spelling per with depth
+    withDepth*: int             ## active with-scope count
+    withCounter*: int           ## unique temp-name source
     methodPtrTypes*: Table[string, Node] ## method-ptr type name -> its formal params
     methodPtrVars*: Table[string, Node] ## var/field/param/prop name -> its formal params
     thunkCounter*: int                 ## synthesized event-thunk serial
@@ -526,7 +531,7 @@ proc primary(p: var TParser): Node =
     getTokP(p)
     result.add(primary(p))
     return
-  result = identOrLiteral(p)
+  result = p.withQualify(identOrLiteral(p))
   while true:
     case p.tok.xkind
     of pxParLe:
@@ -1055,6 +1060,10 @@ proc parseRecordBody(p: var TParser, result: Node, definition: Node) =
             if mty.len > 0:
               p.fieldTypes[p.selfClass.toLowerAscii & "." &
                            defs[i].strVal.toLowerAscii] = mty
+            let fcls = p.syms.classSpelling(defs[1].strVal)
+            if fcls.len > 0:
+              p.classFieldTypes[p.selfClass.toLowerAscii & "." &
+                                defs[i].strVal.toLowerAscii] = fcls
         if defs[1].kind == nkIdent and
             p.methodPtrTypes.hasKey(defs[1].strVal.toLowerAscii):
           for i in 0 ..< defs.len - 2:
@@ -2181,6 +2190,131 @@ proc mapBuiltinCall*(p: var TParser, n: Node): Node =
   else:
     return n
 
+proc withExprClass(p: var TParser, e: Node): string =
+  ## class spelling of a with-expression ("" when unresolvable);
+  ## v1 supports class-typed vars/params, `self`, ctor calls and
+  ## member chains of class-typed fields
+  if e.kind == nkIdent:
+    if e.strVal.toLowerAscii == "self" and p.selfClass.len > 0:
+      return p.selfClass
+    # a hidden with-temp: its class is the scope's class
+    for i in 0 ..< p.withDepth:
+      if p.withTemps[i] == e.strVal:
+        return p.withClasses[i]
+    let vt = p.varTypes.getOrDefault(e.strVal.toLowerAscii)
+    if vt.startsWith("class:"):
+      let sp = p.syms.classSpelling(vt[6..^1])
+      if sp.len > 0:
+        let ci = p.syms.classes.getOrDefault(sp.toLowerAscii)
+        if not ci.isRef:
+          return ""   # value objects copy: v1 gap (needs ptr lowering)
+      return sp
+    let pc = p.paramClassTypes.getOrDefault(e.strVal.toLowerAscii)
+    if pc.len > 0: return pc
+    # inside another with-scope the expression is evaluated there
+    # (`with S, FOrigin do` — Delphi semantics)
+    let k = e.strVal.toLowerAscii
+    var i = p.withDepth - 1
+    while i >= 0:
+      var c = p.withClasses[i].toLowerAscii
+      var guard = 0
+      while c.len > 0 and guard < 100:
+        let ci = p.syms.classes.getOrDefault(c)
+        if ci.spelling.len == 0: break
+        if ci.fieldSet.hasKey(k):
+          let ft = p.classFieldTypes.getOrDefault(c & "." & k)
+          if ft.len > 0: return ft
+        c = ci.parent
+        inc guard
+      dec i
+  elif e.kind == nkCall and e.len >= 1 and e[0].kind == nkDotExpr and
+      e[0][0].kind == nkIdent and e[0][1].kind == nkIdent and
+      e[0][1].strVal.toLowerAscii == "create":
+    # `TSome.Create(...)` evaluates to a TSome instance
+    return p.syms.classSpelling(e[0][0].strVal)
+  elif e.kind == nkDotExpr and e.len == 2:
+    let baseCls = p.withExprClass(e[0])
+    if baseCls.len > 0 and e[1].kind == nkIdent:
+      return p.classFieldTypes.getOrDefault(
+          baseCls.toLowerAscii & "." & e[1].strVal.toLowerAscii)
+  return ""
+
+proc withQualify(p: var TParser, n: Node): Node =
+  ## qualify a bare identifier against the active with-scopes
+  ## (innermost first, Delphi shadowing semantics)
+  if n.kind != nkIdent or p.withDepth == 0: return n
+  let k = n.strVal.toLowerAscii
+  if k in ["self", "result", "true", "false", "nil"]: return n
+  var i = p.withDepth - 1
+  while i >= 0:
+    var c = p.withClasses[i].toLowerAscii
+    var guard = 0
+    while c.len > 0 and guard < 100:
+      let ci = p.syms.classes.getOrDefault(c)
+      if ci.spelling.len == 0: break
+      if ci.fieldSet.hasKey(k) or ci.routineSet.hasKey(k) or
+          ci.ctorSet.hasKey(k):
+        return newDotP(newIdentNode(p.withTemps[i], n.info), n.strVal)
+      # properties of the class qualify too
+      for pr in p.props:
+        if pr.params == nil and pr.cls.toLowerAscii == c and
+            pr.name.toLowerAscii == k:
+          return newDotP(newIdentNode(p.withTemps[i], n.info), n.strVal)
+      c = ci.parent
+      inc guard
+    dec i
+  return n
+
+proc parseWith(p: var TParser): Node =
+  ## `with E1, E2 do stmt` -> nested statement list holding one hidden
+  ## temp per expression; body idents that are members of a with-class
+  ## are qualified against the innermost match. (Planned extension:
+  ## Oxygene-style `with E as X do` names the temp explicitly.)
+  result = newNodeP(nkStmtList, p)
+  getTokP(p)                       # skip `with`
+  skipCom(p)
+  var pushed = 0
+  while true:
+    let e = parseExpr(p)
+    let cls = p.withExprClass(e)
+    if cls.len == 0:
+      parError(p, "cannot determine the class of a with expression; " &
+        "assign it to a variable first (v1 supports class-typed " &
+        "variables, self and constructor calls)")
+    inc p.withCounter
+    let temp = "pasW" & $p.withCounter
+    let info = p.tok.info
+    let vd = newNode(nkVarSection, info)
+    let d = newNode(nkIdentDefs, info)
+    d.add(newIdentNode(temp, info))
+    d.add(newIdentNode(cls, info))
+    d.add(e)
+    vd.add(d)
+    result.add(vd)
+    # push the scope (fixed-size stack: nimony seqs have no pop)
+    if p.withDepth < p.withTemps.len:
+      p.withTemps[p.withDepth] = temp
+      p.withClasses[p.withDepth] = cls
+    else:
+      p.withTemps.add(temp)
+      p.withClasses.add(cls)
+    inc p.withDepth
+    inc pushed
+    skipCom(p)
+    if p.tok.xkind == pxComma:
+      getTokP(p)
+      skipCom(p)
+      continue
+    break
+  p.eat(pxDo)
+  skipCom(p)
+  let body = parseStmt(p)
+  if body.kind == nkStmtList:
+    for s in body.sons: result.add(s)
+  else:
+    result.add(body)
+  dec p.withDepth, pushed
+
 proc checkSetLiteral(p: var TParser, n: Node): Node =
   ## if `n` is an array literal and the context wants a set, convert
   ## (the parser tracks var types for this)
@@ -2299,9 +2433,7 @@ proc parseStmt*(p: var TParser): Node =
   of pxInherited:
     result = parseInherited(p)
   of pxWith:
-    parError(p, "`with` statements are not supported by pas2nimony; " &
-      "qualify the member accesses explicitly in the Pascal source")
-    result = emptyNode(p.tok.info)
+    result = parseWith(p)
   of pxGoto:
     parError(p, "`goto` is not supported by pas2nimony")
     result = emptyNode(p.tok.info)

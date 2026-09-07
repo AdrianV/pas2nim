@@ -178,7 +178,7 @@ semantics · ❌ rejected with a clear error (phase-2 lowerings)
 | `Copy(s, a[, b])` | `substr(s, a-1[, a-1 + (b-1)])` | `substr` is inclusive 0-based and clamps out-of-range like Delphi's `Copy` |
 | `Delete(s, i, n)` / `Insert(src, s, i)` | `strDelete` / `strInsert` | 1-based shims in `systempas` (nimony has no string delete/insert); out-of-range is clamped, not raised |
 | `Inc/Dec` | `inc/dec` | |
-| `with`, `goto`, `asm`, `label` | ❌ rejected | documented phase-2 lowerings |
+| `with E1, E2 do` | hidden temps `var pasW<n>: T = E` + member qualification | **instance-aware (M4)**: bare idents in the body resolve against the with-classes (innermost first, Delphi shadowing — with-members beat locals and `self` fields); later expressions are evaluated in the scope of the earlier ones (`with S, FOrigin do` = `FOrigin` of `S`). v1 heads: class-typed vars/params, `self`, ctor calls, member chains of class-typed fields; value objects/records unsupported (the temp would copy — needs ptr lowering). Planned: Oxygene-style `with E as X do` naming the temp explicitly |
 | `{$ifdef X}` etc. | `when defined(X)` / `when false:` | `{$if …}` conditions limited to `defined()` combinations |
 
 ### Case preservation
