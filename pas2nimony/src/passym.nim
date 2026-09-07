@@ -18,6 +18,7 @@ type
     spelling*: string       ## declared spelling of the class name
     parent*: string         ## lowercase parent name ("" if none)
     isRef*: bool            ## true for `class`, false for `object`
+    isInterface*: bool      ## Delphi `interface` type (M4)
     fields*: seq[string]    ## declared field spellings (in order)
     routines*: seq[string]  ## member routine spellings (methods, ctors, ...)
     fieldSet*: Table[string, bool]   ## lowercase field name -> true

@@ -63,6 +63,7 @@ type
     paramClassTypes*: Table[string, string]
     classFieldTypes*: Table[string, string]  ## "cls.field" -> class spelling
     curLabels*: seq[string]     ## declared labels of the current routine
+    intfSigs*: Table[string, seq[Node]]  ## interface key -> base-method defs
     withTemps*: seq[string]     ## hidden per-with temporaries by depth
     withClasses*: seq[string]   ## class spelling per with depth
     withDepth*: int             ## active with-scope count
@@ -949,6 +950,117 @@ proc parseConstSection*(p: var TParser): Node =
     p.opt(pxSemiColon)
     skipCom(p)
 
+proc parseInterfaceType(p: var TParser, definition: Node): Node =
+  ## `IFoo = interface [(IBase)] ... end` - a Delphi interface lowered
+  ## to an abstract ref class whose methods are nimony `method`s with
+  ## discard bodies (nimony's dynamic dispatch plays the vtable).
+  ## v1: methods only, single inheritance, no properties.
+  let info = definition.info
+  getTokP(p)                    # skip `interface`
+  skipCom(p)
+  var parent = ""
+  var parentTy: Node = emptyNode(info)
+  if p.tok.xkind == pxParLe:
+    getTokP(p)
+    skipCom(p)
+    parentTy = parseTypeDesc(p, emptyNode(p.tok.info))
+    if parentTy.kind == nkIdent:
+      parent = parentTy.strVal
+    p.eat(pxParRi)
+    skipCom(p)
+  let defName = definition.strVal
+  var res = newNode(nkRefTy, info)
+  var record = newNode(nkObjectTy, info)
+  res.add(record)
+  let ofInh = newNode(nkOfInherit, info)
+  if parent.len > 0:
+    ofInh.add(parentTy)
+  else:
+    ofInh.add(newIdentNode("RootRef", info))
+  record.add(ofInh)
+  record.add(newNode(nkRecList, info))
+  p.syms.registerClass(defName, parent, true)
+  var ci = p.syms.classes.getOrDefault(defName.toLowerAscii)
+  ci.isInterface = true
+  p.syms.classes[defName.toLowerAscii] = ci
+  # body: bodiless method declarations (properties rejected below)
+  while p.tok.xkind != pxEnd and p.tok.xkind != pxEof:
+    if p.tok.xkind == pxComment:
+      skipCom(p)
+      continue
+    if p.tok.xkind == pxSymbol:
+      # visibility section words: skip
+      getTokP(p)
+      skipCom(p)
+      p.opt(pxSemiColon)
+      skipCom(p)
+      continue
+    if p.tok.xkind in {pxProcedure, pxFunction}:
+      let kind = p.tok.xkind
+      getTokP(p)
+      skipCom(p)
+      if p.tok.xkind != pxSymbol:
+        parError(p, "routine name expected in interface body")
+      let name = p.tok.ident
+      let nameInfo = p.tok.info
+      getTokP(p)
+      skipCom(p)
+      let fp = parseParamList(p)
+      skipCom(p)
+      if p.tok.xkind == pxColon:
+        getTokP(p)
+        skipCom(p)
+        fp[0] = parseTypeDesc(p, emptyNode(p.tok.info))
+        skipCom(p)
+      if kind == pxFunction:
+        p.syms.returnsValue[name.toLowerAscii] = true
+      p.syms.addRoutine(defName, name)
+      p.syms.addMethod(defName, name)   # makes implementations virtual
+      let dinfo = nameInfo
+      var def = newNode(nkMethodDef, dinfo)
+      def.add(exSymbol(newIdentNode(name, dinfo),
+                       p.visibility != visPrivate))
+      def.add(emptyNode(dinfo))
+      var nfp = newNode(nkFormalParams, dinfo)
+      nfp.add(fp[0])                     # return type slot
+      var sd = newNode(nkIdentDefs, dinfo)
+      sd.add(newIdentNode("self", dinfo))
+      sd.add(newIdentNode(defName, dinfo))
+      sd.add(emptyNode(dinfo))
+      nfp.add(sd)
+      for j in 1 ..< fp.len: nfp.add(fp[j])
+      def.add(nfp)
+      def.add(emptyNode(dinfo))
+      def.add(emptyNode(dinfo))
+      var body = newNode(nkStmtList, dinfo)
+      if fp[0].kind != nkEmpty:
+        # function interface method: nimony's result-init proof
+        # demands an initialized result in the dispatch root
+        var asgn = newNode(nkAsgn, dinfo)
+        asgn.add(newIdentNode("result", dinfo))
+        # `default(T)`: a plain call whose first son is the type
+        var dcall = newNode(nkCall, dinfo)
+        dcall.add(newIdentNode("default", dinfo))
+        dcall.add(fp[0])
+        asgn.add(dcall)
+        body.add(asgn)
+      else:
+        var ds = newNode(nkDiscardStmt, dinfo)
+        ds.add(emptyNode(dinfo))
+        body.add(ds)
+      def.add(body)
+      let key = defName.toLowerAscii
+      var sigs = p.intfSigs.getOrDefault(key)
+      sigs.add(def)
+      p.intfSigs[key] = sigs
+      p.opt(pxSemiColon)
+      skipCom(p)
+      continue
+    parError(p, "unsupported interface member: " & $p.tok &
+        " (v1 supports methods only)")
+  p.eat(pxEnd)
+  result = res
+
 proc parseTypeDesc*(p: var TParser, definition: Node): Node =
   let oldcontext = p.context
   p.context = conTypeDesc
@@ -999,6 +1111,8 @@ proc parseTypeDesc*(p: var TParser, definition: Node): Node =
     result.add(emptyNode(p.tok.info))
   of pxClass:
     result = parseRecordOrObject(p, nkRefTy, definition)
+  of pxInterface:
+    result = parseInterfaceType(p, definition)
   of pxParLe:
     result = parseEnum(p)
   of pxArray:
@@ -1191,8 +1305,28 @@ proc parseRecordOrObject*(p: var TParser, kind: NodeKind,
     let parentTy = parseTypeDesc(p, emptyNode(p.tok.info))
     if parentTy.kind == nkIdent:
       parent = parentTy.strVal
+    # Delphi implements list: (Parent, IIntf1, IInt2)
+    var interfaces: seq[string] = @[]
+    while p.tok.xkind == pxComma:
+      getTokP(p)
+      skipCom(p)
+      let itfTy = parseTypeDesc(p, emptyNode(p.tok.info))
+      if itfTy.kind == nkIdent:
+        interfaces.add(itfTy.strVal)
     let ofInh = newNode(nkOfInherit, parentTy.info)
-    ofInh.add(parentTy)
+    if interfaces.len > 0:
+      # v1: exactly one interface; TInterfacedObject counts as empty
+      # plumbing and dissolves into the interface's generated class
+      if interfaces.len > 1:
+        parError(p, "multiple interfaces on one class not supported (v1)")
+      if parent.toLowerAscii == "tinterfacedobject" or parent.len == 0:
+        parent = interfaces[0]
+        ofInh.add(newIdentNode(parent, parentTy.info))
+      else:
+        parError(p, "a class with a real parent cannot implement an " &
+            "interface yet (v1)")
+    else:
+      ofInh.add(parentTy)
     record.add(ofInh)
     p.eat(pxParRi)
     skipCom(p)
@@ -3253,6 +3387,28 @@ proc parseUnit*(p: var TParser): Node =
     def.add(body)
     p.syms.addCtor(key, "create")
     synthCtors.add(def)
+  # interface dispatch roots: nimony `method`s with discard bodies,
+  # deterministically ordered like the synthesized constructors
+  var intfKeys: seq[string] = @[]
+  for key, ci in p.syms.classes:
+    if ci.isInterface:
+      intfKeys.add(key)
+  var sortedIntf: seq[string] = @[]
+  for key in intfKeys:
+    var pos = sortedIntf.len
+    for i in 0 ..< sortedIntf.len:
+      if key < sortedIntf[i]:
+        pos = i
+        break
+    var rebuilt: seq[string] = @[]
+    for i in 0 ..< sortedIntf.len:
+      if i == pos: rebuilt.add(key)
+      rebuilt.add(sortedIntf[i])
+    if pos == sortedIntf.len: rebuilt.add(key)
+    sortedIntf = rebuilt
+  for key in sortedIntf:
+    for def in p.intfSigs.getOrDefault(key):
+      p.module.add(def)
   genPropertyAccessors(p, p.module)
   selfQualifyAll(p, p.module)
   for i in 0 ..< p.module.len:
