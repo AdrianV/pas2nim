@@ -39,6 +39,7 @@ type
     nkStmtList, nkAsgn, nkIfStmt, nkElifBranch, nkElse, nkWhileStmt,
     nkCaseStmt, nkOfBranch, nkTryStmt, nkExceptBranch, nkFinally,
     nkForStmt, nkRaiseStmt, nkBreakStmt, nkContinueStmt, nkReturnStmt,
+    nkGotoStmt, nkLabeledStmt, nkBlockStmt,
     nkVarSection, nkConstSection, nkTypeSection, nkCommentStmt,
     nkDiscardStmt,
     # declarations

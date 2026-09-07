@@ -62,6 +62,7 @@ type
     fieldTypes*: Table[string, string] ## "class.field" (lowercase) -> mapped type
     paramClassTypes*: Table[string, string]
     classFieldTypes*: Table[string, string]  ## "cls.field" -> class spelling
+    curLabels*: seq[string]     ## declared labels of the current routine
     withTemps*: seq[string]     ## hidden per-with temporaries by depth
     withClasses*: seq[string]   ## class spelling per with depth
     withDepth*: int             ## active with-scope count
@@ -1555,6 +1556,8 @@ proc parseRoutineBody(p: var TParser, result: Node) =
   ## local decls + begin/end of a routine with a body
   var stmts = newNodeP(nkStmtList, p)
   p.nestedProcs = @[]
+  let savedLabels = p.curLabels
+  p.curLabels = @[]
   p.opt(pxSemiColon)
   while true:
     case p.tok.xkind
@@ -1571,13 +1574,16 @@ proc parseRoutineBody(p: var TParser, result: Node) =
       p.opt(pxSemiColon)
       skipCom(p)
     of pxLabel:
-      parError(p, "labels/goto are not supported by pas2nimony")
+      parseLabelSection(p)
     of pxComment:
       skipCom(p)
     of pxBegin:
       break
     of pxProcedure, pxFunction:
+      let savedLabels = p.curLabels
+      p.curLabels = @[]
       let nested = parseRoutine(p, false)
+      p.curLabels = savedLabels
       if nested.kind in {nkProcDef, nkFuncDef, nkMethodDef} and
           nested[0].kind == nkIdent:
         p.nestedProcs.add(nested[0].strVal)
@@ -1591,6 +1597,8 @@ proc parseRoutineBody(p: var TParser, result: Node) =
     for s in body.sons: stmts.add(s)
   else:
     stmts.add(body)
+  p.lowerGotos(stmts)
+  p.curLabels = savedLabels
   result.add(stmts)
 
 proc parseRoutine*(p: var TParser; noBody: bool): Node =
@@ -2190,6 +2198,181 @@ proc mapBuiltinCall*(p: var TParser, n: Node): Node =
   else:
     return n
 
+proc isRoutineDefKind(k: NodeKind): bool {.inline.} =
+  k in {nkProcDef, nkFuncDef, nkMethodDef}
+
+proc parseLabelSection(p: var TParser) =
+  ## `label L1, L2, 10;` — declared goto targets of the enclosing routine
+  getTokP(p)                   # skip `label`
+  skipCom(p)
+  while true:
+    if p.tok.xkind == pxSymbol:
+      p.curLabels.add(p.tok.ident.toLowerAscii)
+      getTokP(p)
+    elif p.tok.xkind in {pxIntLit, pxInt64Lit}:
+      p.curLabels.add($p.tok.iNumber)
+      getTokP(p)
+    else:
+      parError(p, "label name expected, got " & $p.tok)
+    skipCom(p)
+    if p.tok.xkind == pxComma:
+      getTokP(p)
+      skipCom(p)
+      continue
+    break
+  p.opt(pxSemiColon)
+  skipCom(p)
+
+proc parseLabeledStmt(p: var TParser): Node =
+  ## `Name: statement` — a label definition; dissolved by lowerGotos
+  let info = p.tok.info
+  let name = if p.tok.xkind == pxSymbol: p.tok.ident
+             else: $p.tok.iNumber
+  getTokP(p)                   # skip the label name
+  p.eat(pxColon)
+  skipCom(p)
+  let stmt = parseStmt(p)
+  result = newNode(nkLabeledStmt, info)
+  result.add(newIdentNode(name, info))
+  result.add(stmt)
+
+proc gotoMatches(n: Node, lab: string): bool {.inline.} =
+  n.kind == nkGotoStmt and n.len > 0 and n[0].kind == nkIdent and
+      n[0].strVal.toLowerAscii == lab
+
+proc isLoopKind(k: NodeKind): bool {.inline.} =
+  k in {nkWhileStmt, nkForStmt}
+
+proc collectGotos(n: Node, lab: string, found: var seq[Node]) =
+  ## every `goto lab` in the subtree, skipping nested routines
+  if isRoutineDefKind(n.kind): return
+  if gotoMatches(n, lab): found.add(n)
+  for s in n.sons: collectGotos(s, lab, found)
+
+proc collectAnyGoto(n: Node, found: var seq[Node]) =
+  if isRoutineDefKind(n.kind): return
+  if n.kind == nkGotoStmt: found.add(n)
+  for s in n.sons: collectAnyGoto(s, found)
+
+proc subtreeHas(n: Node, target: Node): bool =
+  if n == target: return true
+  for s in n.sons:
+    if subtreeHas(s, target): return true
+  return false
+
+proc topLevelIndex(list: Node, g: Node): int =
+  ## index of the direct son of `list` whose subtree contains `g`
+  result = -1
+  for i in 0 ..< list.len:
+    if subtreeHas(list[i], g): return i
+
+proc backwardBelowLoop(n: Node, lab: string, inLoop: bool): bool =
+  ## true if a backward goto sits below a loop (continue would bind to
+  ## the wrong loop)
+  if isRoutineDefKind(n.kind): return false
+  if gotoMatches(n, lab) and inLoop: return true
+  let deeper = inLoop or isLoopKind(n.kind)
+  for s in n.sons:
+    if backwardBelowLoop(s, lab, deeper): return true
+  return false
+
+proc rewriteGotosTo(n: Node, lab, blockName: string, toBreak: bool) =
+  ## replace `goto lab` with `break pasGotoX` / `continue` in-place
+  if isRoutineDefKind(n.kind): return
+  for i in 0 ..< n.len:
+    if gotoMatches(n[i], lab):
+      if toBreak:
+        let b = newNode(nkBreakStmt, n[i].info)
+        b.add(newIdentNode(blockName, n[i].info))
+        n[i] = b
+      else:
+        n[i] = newNode(nkContinueStmt, n[i].info)
+    else:
+      rewriteGotosTo(n[i], lab, blockName, toBreak)
+
+proc processLabel(p: var TParser, list: Node, idx: int) =
+  ## restructure one label (list[idx]) and its gotos
+  let labNode = list[idx]
+  let lab = labNode[0].strVal.toLowerAscii
+  var gotos: seq[Node] = @[]
+  collectGotos(list, lab, gotos)
+  if gotos.len == 0:
+    list[idx] = labNode[1]     # declared but unused: dissolve the marker
+    return
+  var fwd = -1                 # earliest forward top-level son index
+  var bwd = -1                 # latest backward top-level son index
+  for g in gotos:
+    let top = topLevelIndex(list, g)
+    if top < idx:
+      if fwd < 0 or top < fwd: fwd = top
+    elif top >= idx:
+      if top > bwd: bwd = top
+  let info = labNode.info
+  if fwd >= 0 and bwd >= 0:
+    parError(p, "label '" & labNode[0].strVal &
+        "' is targeted both forward and backward; not supported (v1)")
+  # hidden block name is routine-local, so the label spelling suffices
+  let blockName = "pasGoto" & labNode[0].strVal
+  var rebuilt: seq[Node] = @[]
+  if fwd >= 0:
+    # forward: block pasGotoX: <region>; goto -> break pasGotoX
+    var inner = newNode(nkStmtList, info)
+    for j in fwd ..< idx: inner.add(list[j])
+    rewriteGotosTo(inner, lab, blockName, true)
+    var blk = newNode(nkBlockStmt, info)
+    blk.add(newIdentNode(blockName, info))
+    blk.add(inner)
+    for j in 0 ..< fwd: rebuilt.add(list[j])
+    rebuilt.add(blk)
+    rebuilt.add(labNode[1])
+  else:
+    # backward: while true: <region>; goto -> continue
+    if backwardBelowLoop(list, lab, false):
+      parError(p, "backward goto to '" & labNode[0].strVal &
+          "' crosses a loop boundary; not supported (v1)")
+    var inner = newNode(nkStmtList, info)
+    for j in idx .. bwd: inner.add(list[j])
+    rewriteGotosTo(inner, lab, blockName, false)
+    inner.add(newNode(nkBreakStmt, info))   # fall-through exits the loop
+    var wh = newNode(nkWhileStmt, info)
+    wh.add(newIdentNode("true", info))
+    wh.add(inner)
+    for j in 0 ..< idx: rebuilt.add(list[j])
+    rebuilt.add(wh)
+  for j in (if fwd >= 0: idx + 1 else: bwd + 1) ..< list.len:
+    rebuilt.add(list[j])
+  list.sons = rebuilt
+
+proc findLabelDFS(p: var TParser, n: Node, owner: var Node,
+                  idx: var int): bool =
+  ## the first label definition; owner/idx = its enclosing statement list
+  if isRoutineDefKind(n.kind): return false
+  for i in 0 ..< n.len:
+    let c = n[i]
+    if c.kind == nkLabeledStmt:
+      if n.kind != nkStmtList:
+        parError(p, "a label must be defined inside a begin/end block (v1)")
+      owner = n
+      idx = i
+      return true
+    if findLabelDFS(p, c, owner, idx): return true
+  return false
+
+proc lowerGotos(p: var TParser, root: Node) =
+  ## restructure all goto/label pairs under `root` into nimony named
+  ## blocks (forward) and while/continue loops (backward); nested
+  ## routines lower themselves and are skipped here
+  while true:
+    var owner = emptyNode(root.info)
+    var idx = -1
+    if not findLabelDFS(p, root, owner, idx): break
+    processLabel(p, owner, idx)
+  var leftover: seq[Node] = @[]
+  collectAnyGoto(root, leftover)
+  if leftover.len > 0:
+    parError(p, "goto without a matching label in the same statement " &
+        "block, or jumping into a nested block, is not supported (v1)")
+
 proc withExprClass(p: var TParser, e: Node): string =
   ## class spelling of a with-expression ("" when unresolvable);
   ## v1 supports class-typed vars/params, `self`, ctor calls and
@@ -2321,6 +2504,13 @@ proc checkSetLiteral(p: var TParser, n: Node): Node =
   result = n
 
 proc parseStmt*(p: var TParser): Node =
+  # a label definition `Name:` / `10:` (declared in a label section)
+  if (p.tok.xkind == pxSymbol or p.tok.xkind in {pxIntLit, pxInt64Lit}) and
+      p.peekTok.xkind == pxColon:
+    let name = if p.tok.xkind == pxSymbol: p.tok.ident.toLowerAscii
+               else: $p.tok.iNumber
+    if p.tok.xkind in {pxIntLit, pxInt64Lit} or name in p.curLabels:
+      return parseLabeledStmt(p)
   case p.tok.xkind
   of pxEof:
     result = emptyNode(p.tok.info)
@@ -2435,13 +2625,27 @@ proc parseStmt*(p: var TParser): Node =
   of pxWith:
     result = parseWith(p)
   of pxGoto:
-    parError(p, "`goto` is not supported by pas2nimony")
-    result = emptyNode(p.tok.info)
+    getTokP(p)                 # skip `goto`
+    skipCom(p)
+    if p.tok.xkind == pxSymbol:
+      result = newNode(nkGotoStmt, p.tok.info)
+      result.add(newIdentNode(p.tok.ident, p.tok.info))
+      getTokP(p)
+    elif p.tok.xkind in {pxIntLit, pxInt64Lit}:
+      result = newNode(nkGotoStmt, p.tok.info)
+      result.add(newIdentNode($p.tok.iNumber, p.tok.info))
+      getTokP(p)
+    else:
+      parError(p, "label name expected after `goto`")
+      result = emptyNode(p.tok.info)
+    p.opt(pxSemiColon)
   of pxAsm:
     parError(p, "`asm` blocks are not supported by pas2nimony")
     result = emptyNode(p.tok.info)
   of pxLabel:
-    parError(p, "`label` is not supported by pas2nimony")
+    # module level: labels of the program main body
+    parseLabelSection(p)
+    result = emptyNode(p.tok.info)
     result = emptyNode(p.tok.info)
   of pxExports:
     # exports clauses are irrelevant for a single-module translation
@@ -2959,6 +3163,10 @@ proc parseUnit*(p: var TParser): Node =
       p.module.add(s)
     p.opt(pxSemiColon)
     skipCom(p)
+  # a module-level begin block is the program main body
+  for i in 0 ..< p.module.len:
+    if p.module[i].kind == nkStmtList:
+      p.lowerGotos(p.module[i])
   # Delphi's inherited TObject.Create: synthesize a default no-arg
   # constructor for ref classes that declare none (deterministic order)
   var ctorless: seq[string] = @[]

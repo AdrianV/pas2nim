@@ -514,7 +514,13 @@ proc stmt(s: var TRendor, n: Node) =
     else:
       s.line("return " & s.expr(n[0]))
   of nkBreakStmt:
-    s.line("break")
+    if n.len > 0 and n[0].kind == nkIdent:
+      s.line("break " & s.expr(n[0]))
+    else:
+      s.line("break")
+  of nkBlockStmt:
+    s.line("block " & s.expr(n[0]) & ":")
+    emitBranchBody(s, n[1])
   of nkContinueStmt:
     s.line("continue")
   of nkRaiseStmt:

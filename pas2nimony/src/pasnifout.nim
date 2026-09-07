@@ -351,7 +351,14 @@ proc emitStmt(e: var NifEmitter; n: Node) =
                 e.emitStmt(s)
   of nkBreakStmt:
     e.buf.copyInto(globalTags.registerTag("break"), i):
-      e.buf.addDotToken(i)
+      if n.len > 0 and n[0].kind == nkIdent:
+        e.buf.addIdent(n[0].strVal, i)
+      else:
+        e.buf.addDotToken(i)
+  of nkBlockStmt:
+    e.buf.copyInto(globalTags.registerTag("block"), i):
+      e.buf.addIdent(n[0].strVal, e.info(n[0]))
+      e.emitStmts(n[1])
   of nkContinueStmt:
     e.buf.copyInto(globalTags.registerTag("continue"), i):
       e.buf.addDotToken(i)
