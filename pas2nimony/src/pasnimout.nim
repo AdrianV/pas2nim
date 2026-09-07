@@ -171,6 +171,7 @@ proc expr(s: var TRendor, n: Node): string =
     for i in 0 ..< n.len:
       if i > 0: result.add(", ")
       result.add(s.expr(n[i]))
+
     result.add(")")
   of nkBracket:
     result = "["

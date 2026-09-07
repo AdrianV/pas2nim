@@ -1,3 +1,4 @@
+{.feature: "lenientnils".}
 #
 #           systempas - Delphi RTL compatibility shim for pas2nimony output
 #
@@ -153,6 +154,16 @@ type
     Message*: string
 
 var pasCurrentExc*: PasException = PasException(Message: "")
+
+# Delphi `x as T`: nil stays nil, a failed checked cast yields nil.
+# (The raising variant would mark every transitive caller {.raises.};
+# nimony only allows calls to .raises routines inside try - a
+# documented divergence, see doc/nimony-compat.md.)
+proc pasAs*[T](x: RootRef): T =
+  if x of T:
+    cast[T](x)
+  else:
+    nil
 
 # named pasExcCreate (not `create`): a user subclass's own `create`
 # must not shadow the prelude constructor in nimony's name resolution

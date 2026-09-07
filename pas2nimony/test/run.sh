@@ -106,6 +106,18 @@ if [ $# -eq 0 ] && [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/twounit" ]; then
       echo "   PASLER EVENTS FAILED"; fail=1
     fi
   fi
+  if [ -f "$HERE/cast.pas" ]; then
+    echo "== pasler-cast"
+    mkdir -p "$TMP/pasler-cast"
+    cp "$HERE/cast.pas" "$TMP/pasler-cast/"
+    if (cd "$TMP/pasler-cast" &&
+        "$ROOT/bin/pasler" --nimony:"$NIMONY" --run cast.pas 2>&1 |
+        grep -v nifmake || true); then
+      echo "-- ok"
+    else
+      echo "   PASLER CAST FAILED"; fail=1
+    fi
+  fi
   if [ -f "$HERE/goto.pas" ]; then
     echo "== pasler-goto"
     mkdir -p "$TMP/pasler-goto"

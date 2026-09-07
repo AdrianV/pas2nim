@@ -141,6 +141,7 @@ proc emitExpr(e: var NifEmitter; n: Node) =
       e.emitExpr(n[0])
     else:
       e.emitAtom(n)
+
   of nkStmtList:
     # rare wrapper; emit inline
     for son in n.sons:

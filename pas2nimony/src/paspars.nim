@@ -341,6 +341,7 @@ proc getPrecedence(kind: TTokKind): int =
   of pxDiv, pxMod, pxStar, pxSlash, pxShl, pxShr, pxAnd: result = 5
   of pxPlus, pxMinus, pxOr, pxXor: result = 4
   of pxIn, pxEquals, pxLe, pxLt, pxGe, pxGt, pxNeq, pxIs: result = 3
+  of pxAs: result = 5
   else: result = -1
 
 proc exprListAux(p: var TParser, endTok, sepTok: TTokKind, result: Node) =
@@ -583,9 +584,42 @@ proc lowestExprAux(p: var TParser, v: var Node, limit: int): TTokKind =
     skipCom(p)
     var v2 = emptyNode(p.tok.info)
     let nextop = lowestExprAux(p, v2, opPred)
-    node.add(opNode)
-    node.add(v)
-    node.add(v2)
+    if op == pxIs:
+      # Delphi `x is T`: runtime subclass test; nil belongs to no class
+      # (nimony's `of` answers true for nil, hence the guard)
+      let info = node.info
+      node.sons = @[]
+      node.add(newIdentNode("and", info))
+      let neNil = newNode(nkInfix, info)
+      neNil.add(newIdentNode("!=", info))
+      neNil.add(v)
+      neNil.add(newIdentNode("nil", info))
+      let lhs = newNode(nkPar, info)
+      lhs.add(neNil)
+      let ofChk = newNode(nkInfix, info)
+      ofChk.add(newIdentNode("of", info))
+      ofChk.add(v)
+      ofChk.add(v2)
+      let rhs = newNode(nkPar, info)
+      rhs.add(ofChk)
+      node.add(lhs)
+      node.add(rhs)
+    elif op == pxAs:
+      # Delphi `x as T`: checked cast via systempas.pasAs - nil stays
+      # nil, a failed check yields nil (the raising variant would mark
+      # every transitive caller {.raises.}; documented divergence)
+      let info = node.info
+      node.kind = nkCall
+      node.sons = @[]
+      let callee = newNode(nkIndexExpr, info)
+      callee.add(newIdentNode("pasAs", info))
+      callee.add(v2)
+      node.add(callee)
+      node.add(v)
+    else:
+      node.add(opNode)
+      node.add(v)
+      node.add(v2)
     v = p.rewriteMethodPtrNilCmp(node)
     op = nextop
     opPred = getPrecedence(nextop)
@@ -1594,7 +1628,13 @@ proc parseRoutineBody(p: var TParser, result: Node) =
       parError(p, "begin expected in routine body, got " & $p.tok)
   let body = parseStmt(p)
   if body.kind == nkStmtList:
-    for s in body.sons: stmts.add(s)
+    if body.len == 0:
+      # an empty (stmts) crashes nimony's NIF path - emit a discard
+      let d = newNode(nkDiscardStmt, body.info)
+      d.add(emptyNode(body.info))
+      stmts.add(d)
+    else:
+      for s in body.sons: stmts.add(s)
   else:
     stmts.add(body)
   p.lowerGotos(stmts)
