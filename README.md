@@ -9,3 +9,7 @@ features are not supported.
 
 **Note**: This project is essentially not maintained anymore! Help if you are
 interested in keeping it alive!
+
+**New layout**: the historical pas2nim translator now lives in `legacy/`;
+the actively developed Pascal front-end for the nimony compiler chain is
+`pas2nimony/` (see `pas2nimony/doc/`).

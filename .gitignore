@@ -2,8 +2,8 @@ nimcache
 # build artifacts
 pas2nim
 pas2nim.exe
-test/testMethod
-pascal/syspas
+legacy/test/testMethod
+legacy/pascal/syspas
 pas2nimony/nimcache
 pas2nimony/bin
 pas2nimony/test/tmp
