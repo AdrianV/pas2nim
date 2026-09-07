@@ -1,1 +1,18 @@
 nimcache
+# build artifacts
+pas2nim
+pas2nim.exe
+test/testMethod
+pascal/syspas
+pas2nimony/nimcache
+pas2nimony/bin
+pas2nimony/test/tmp
+# scratch
+a/
+b/
+with.nim
+test.txt
+.tmpx/
+# harness / editor state
+.dsh/
+.vscode/

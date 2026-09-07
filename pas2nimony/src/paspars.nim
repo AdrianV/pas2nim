@@ -1,0 +1,2423 @@
+#
+#           pas2nimony - Pascal to Nimony translator
+#
+# Parser for the Delphi/Pascal dialect. Ports the translation decisions of
+# the old pas2nim parser (pasparse.nim) but produces this tool's own AST
+# and keeps identifiers with their declared spelling.
+#
+# Compared to the old parser, this one additionally:
+#  - records every declared name for case canonicalization
+#  - records class members (fields/routines/ctors) for self-qualification
+#  - rewrites `Second.create(args)` into `create(Second(), args)` (nimony
+#    does not accept subtype typedesc constraints in templates)
+#  - defers property accessor generation until all class members are known
+
+import std/[strutils, tables, syncio, os]
+import pasast, paslex, passym
+
+const
+  MaxLineLength = 80
+
+type
+  TContextKind* = enum conExpr, conStmt, conTypeDesc
+
+type
+  TExtraInfo* = enum eiConstructor, eiPublic
+  TExtraStmt* = ref object
+    node*: Node
+    flags*: set[TExtraInfo]
+
+  TPropDecl* = ref object
+    ## a property declaration; accessors are generated in a post-pass
+    cls, name*: string          ## spellings
+    typ*: Node                  ## property type
+    params*: Node               ## array property: param defs (nkIdentDefs)
+    readId, writeId*: string    ## accessor names ("" if absent)
+    isDefault*: bool
+    isPublic*: bool
+
+  UnitSet* = ref object
+    files*: Table[string, bool]   ## unit files already parsed for symbols
+
+  TParser* = object
+    lex*: TLexer
+    tok*: TToken
+    aheadTok*: TToken
+    hasAhead*: bool
+    section*: TSection
+    inParamList*: bool
+    context*: TContextKind
+    visibility*: TVisibility
+    selfClass*: string          ## spelling of the current class ("" if none)
+    flags*: set[TParserFlag]
+    syms*: SymTab
+    extra*: seq[TExtraStmt]
+    props*: seq[TPropDecl]
+    outerProcName*: string      ## enclosing routine (for `inherited`)
+    outerIsMethod*: bool        ## enclosing routine is a virtual method
+    outerParams*: seq[string]   ## param names of the enclosing routine
+    module*: Node               ## the nkStmtList built so far
+    varTypes*: Table[string, string] ## lowercase var name -> "set"|"other"
+    absorbed*: UnitSet               ## shared unit-absorption cycle guard
+    unitFiles*: Table[string, string] ## lowercase unit name -> module file stem
+    classOfProc*: string        ## class the current routine belongs to
+    qualClass*: string          ## class context of the self-qualify pass
+    nestedProcs*: seq[string]   ## nested routine names of the current proc
+
+# ---------------------------------------------------------------------------
+# token plumbing
+
+proc getTokP(p: var TParser) =
+  if p.hasAhead:
+    p.tok = p.aheadTok
+    p.hasAhead = false
+  else:
+    getTok(p.lex, p.tok)
+
+proc peekTok*(p: var TParser): TToken =
+  if not p.hasAhead:
+    getTok(p.lex, p.aheadTok)
+    p.hasAhead = true
+  result = p.aheadTok
+
+proc removeNextTok(p: var TParser) =
+  if p.hasAhead:
+    p.tok = p.aheadTok
+    p.hasAhead = false
+  else:
+    getTokP(p)
+
+proc parLineInfo(p: TParser): TLineInfo = p.tok.info
+
+proc parError*(p: TParser, msg: string) =
+  write(stderr, renderInfo(p.tok.info) & " Error: " & msg & "\n")
+  quit(1)
+
+proc skipCom(p: var TParser) =
+  while p.tok.xkind == pxComment:
+    getTokP(p)
+
+proc eat(p: var TParser, xkind: TTokKind) =
+  if p.tok.xkind == xkind: getTokP(p)
+  else: parError(p, "expected " & tokKindToStr(xkind) & " but got: " & $p.tok)
+
+proc opt(p: var TParser, xkind: TTokKind) =
+  if p.tok.xkind == xkind: getTokP(p)
+
+proc newNodeP(kind: NodeKind, p: TParser): Node =
+  newNode(kind, p.tok.info)
+
+proc newIdentNameNodeP(name: string, p: TParser): Node =
+  newIdentNode(name, p.tok.info)
+
+proc openParser*(p: var TParser, filename: string, flags: set[TParserFlag]) =
+  p.lex = TLexer()
+  p.lex.openLexer(filename)
+  p.flags = flags
+  p.syms = initSymTab()
+  var us = UnitSet()
+  us.files = initTable[string, bool]()
+  p.absorbed = us
+  p.unitFiles = initTable[string, string]()
+  p.module = newNode(nkStmtList, TLineInfo(line: 0, col: 0, file: filename))
+  getTokP(p)
+
+proc closeParser*(p: var TParser) =
+  closeLexer(p.lex)
+
+proc parseExpr*(p: var TParser): Node
+proc parseStmt*(p: var TParser): Node
+proc parseTypeDesc*(p: var TParser, definition: Node): Node
+proc parseRoutine*(p: var TParser; noBody: bool): Node
+proc parseIdentColonEquals*(p: var TParser; withVis: bool): Node
+proc parseTypeSection*(p: var TParser): Node
+proc parseConstSection*(p: var TParser): Node
+proc parseVarSection*(p: var TParser): Node
+proc parseProperty*(p: var TParser): Node
+proc parseRecordOrObject*(p: var TParser, kind: NodeKind,
+                          definition: Node): Node
+proc parseRoutineSpecifiers*(p: var TParser, noBody: var bool,
+                             isVirtual: var bool): Node
+proc genPropertyAccessors*(p: var TParser, module: Node)
+
+proc exSymbol*(n: Node, isPublic: bool): Node =
+  ## mark an ident as exported (rendered as `ident*`)
+  n.exported = isPublic
+  result = n
+
+# ---------------------------------------------------------------------------
+# compiler directives {$...}
+
+proc parseStmtList(p: var TParser): Node
+
+proc isHandledDirective(p: TParser): bool =
+  result = false
+  if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
+    case p.tok.ident.toLowerAscii
+    of "else", "endif": result = false
+    else: result = true
+
+proc definedExpr(p: var TParser): Node =
+  result = newNodeP(nkCall, p)
+  result.add(newIdentNameNodeP("defined", p))
+  if p.tok.xkind == pxSymbol:
+    result.add(newIdentNode(p.tok.ident, p.tok.info))
+    getTokP(p)
+  else:
+    parError(p, "identifier expected in directive")
+
+proc parseIfDirAux(p: var TParser, result: Node) =
+  result[0].add(parseStmtList(p))
+  if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
+    let endMarker = succ(p.tok.xkind)
+    if p.tok.ident.toLowerAscii == "else":
+      let s = newNodeP(nkElse, p)
+      while p.tok.xkind != pxEof and p.tok.xkind != endMarker: getTokP(p)
+      p.eat(endMarker)
+      s.add(parseStmtList(p))
+      result.add(s)
+    if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
+      let endMarker2 = succ(p.tok.xkind)
+      if p.tok.ident.toLowerAscii == "endif":
+        while p.tok.xkind != pxEof and p.tok.xkind != endMarker2: getTokP(p)
+        p.eat(endMarker2)
+      else:
+        parError(p, "{$endif} expected")
+
+proc parseIfdefDir(p: var TParser, endMarker: TTokKind): Node =
+  result = newNodeP(nkWhenExpr, p)
+  let branch = newNodeP(nkElifBranch, p)
+  getTokP(p)                    # skip `{$ifdef`
+  branch.add(definedExpr(p))
+  result.add(branch)
+  p.eat(endMarker)
+  parseIfDirAux(p, result)
+
+proc parseIfndefDir(p: var TParser, endMarker: TTokKind): Node =
+  result = newNodeP(nkWhenExpr, p)
+  let branch = newNodeP(nkElifBranch, p)
+  getTokP(p)                    # skip `{$ifndef`
+  let e = newNodeP(nkCall, p)
+  e.add(newIdentNameNodeP("not", p))
+  e.add(definedExpr(p))
+  branch.add(e)
+  result.add(branch)
+  p.eat(endMarker)
+  parseIfDirAux(p, result)
+
+proc parseIfDir(p: var TParser, endMarker: TTokKind): Node =
+  result = newNodeP(nkWhenExpr, p)
+  let branch = newNodeP(nkElifBranch, p)
+  getTokP(p)                    # skip `{$if`
+  branch.add(parseExpr(p))
+  result.add(branch)
+  p.eat(endMarker)
+  parseIfDirAux(p, result)
+
+proc parseDirective(p: var TParser): Node =
+  result = emptyNode(p.tok.info)
+  if not (p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}): return
+  let endMarker = succ(p.tok.xkind)
+  if p.tok.ident.len > 0:
+    case p.tok.ident.toLowerAscii
+    of "if": result = parseIfDir(p, endMarker)
+    of "ifdef": result = parseIfdefDir(p, endMarker)
+    of "ifndef": result = parseIfndefDir(p, endMarker)
+    else:
+      # skip unknown compiler directive
+      while p.tok.xkind != pxEof and p.tok.xkind != endMarker: getTokP(p)
+      p.eat(endMarker)
+  else:
+    p.eat(endMarker)
+
+# ---------------------------------------------------------------------------
+# uses clause
+
+proc absorbUnit*(p: var TParser, unitName: string) =
+  ## register the used unit's declarations (classes, ctors, routines,
+  ## canonical spellings) by parsing the unit file next to this one
+  # the unit file may be spelled in any of the usual Pascal casings
+  let dir = parentDir(p.lex.filename)
+  var unitFile = ""
+  for cand in [unitName, unitName.toLowerAscii,
+               unitName[0].toUpperAscii & unitName[1..^1].toLowerAscii]:
+    let f = (if dir.len > 0: dir else: ".") / cand & ".pas"
+    if fileExists(f):
+      unitFile = f
+      break
+  if unitFile.len == 0 or p.absorbed.files.hasKey(unitFile):
+    return
+  p.unitFiles[unitName.toLowerAscii] = splitFile(unitFile).name
+  p.absorbed.files[unitFile] = true
+  var up = default(TParser)
+  openParser(up, unitFile, p.flags)
+  up.absorbed = p.absorbed   # shared ref: cycle guard works across units
+  discard parseUnit(up)
+  closeParser(up)
+  for k, ci in up.syms.classes:
+    if not p.syms.classes.hasKey(k):
+      p.syms.classes[k] = ci
+  for k, v in up.syms.names:
+    if not p.syms.names.hasKey(k):
+      p.syms.names[k] = v
+
+
+proc parseUsesStmt*(p: var TParser): Node =
+  result = newNodeP(nkImportStmt, p)
+  getTokP(p)                  # skip `uses`
+  skipCom(p)
+  var any = false
+  while true:
+    if p.tok.xkind == pxEof: break
+    if p.tok.xkind != pxSymbol:
+      parError(p, "identifier expected in uses clause")
+    var unitName = p.tok.ident
+    getTokP(p)
+    skipCom(p)
+    # dotted unit names: keep the last component (System.SysUtils -> sysutils)
+    while p.tok.xkind == pxDot:
+      getTokP(p)
+      skipCom(p)
+      if p.tok.xkind == pxSymbol:
+        unitName = p.tok.ident
+        getTokP(p)
+        skipCom(p)
+      else:
+        parError(p, "identifier expected after '.' in uses clause")
+    case unitName.toLowerAscii
+    of "strutils":
+      result.add(newIdentNode("std / strutils", p.tok.info))
+      any = true
+    of "math":
+      result.add(newIdentNode("std / math", p.tok.info))
+      any = true
+    of "sysutils", "si_strings", "system":
+      # our runtime shim (systempas) provides the Delphi RTL helpers
+      result.add(newIdentNode("systempas", p.tok.info))
+      any = true
+    else:
+      # own unit: absorb its declarations, then import the module
+      absorbUnit(p, unitName)
+      # the import name must match the translated FILE name (Linux is
+      # case-sensitive; Pascal unit/file casing may differ)
+      let canonical = p.unitFiles.getOrDefault(unitName.toLowerAscii,
+          p.syms.canonical(unitName))
+      result.add(newIdentNode(canonical, p.tok.info))
+      any = true
+    p.opt(pxComma)
+    if p.tok.xkind != pxSymbol: break
+  if not any:
+    result = newNode(nkCommentStmt, p.tok.info)
+    result.strVal = "# no imports"
+
+# ---------------------------------------------------------------------------
+# expressions
+
+proc getPrecedence(kind: TTokKind): int =
+  case kind
+  of pxDiv, pxMod, pxStar, pxSlash, pxShl, pxShr, pxAnd: result = 5
+  of pxPlus, pxMinus, pxOr, pxXor: result = 4
+  of pxIn, pxEquals, pxLe, pxLt, pxGe, pxGt, pxNeq, pxIs: result = 3
+  else: result = -1
+
+proc exprListAux(p: var TParser, endTok, sepTok: TTokKind, result: Node) =
+  getTokP(p)
+  skipCom(p)
+  while true:
+    if p.tok.xkind == endTok:
+      getTokP(p)
+      break
+    if p.tok.xkind == pxEof:
+      parError(p, tokKindToStr(endTok) & " expected")
+      break
+    let a = parseExpr(p)
+    skipCom(p)
+    if p.tok.xkind == pxComma or p.tok.xkind == pxSemiColon:
+      getTokP(p)
+      skipCom(p)
+    result.add(a)
+
+proc qualifiedIdent*(p: var TParser): Node =
+  if p.tok.xkind == pxSymbol:
+    result = newIdentNode(p.tok.ident, p.tok.info)
+  else:
+    parError(p, "identifier expected, got " & $p.tok)
+    return emptyNode(p.tok.info)
+  getTokP(p)
+  skipCom(p)
+  if p.tok.xkind == pxDot:
+    getTokP(p)
+    skipCom(p)
+    if p.tok.xkind == pxSymbol:
+      let a = result
+      result = newNode(nkDotExpr, a.info)
+      result.add(a)
+      result.add(newIdentNode(p.tok.ident, p.tok.info))
+      getTokP(p)
+    else:
+      parError(p, "identifier expected after '.'")
+
+proc rangeExpr*(p: var TParser): Node =
+  let a = parseExpr(p)
+  if p.tok.xkind == pxDotDot:
+    result = newNodeP(nkRange, p)
+    result.add(a)
+    getTokP(p)
+    skipCom(p)
+    result.add(parseExpr(p))
+  else:
+    result = a
+
+proc bracketExprList(p: var TParser, first: Node): Node =
+  result = newNode(nkIndexExpr, first.info)
+  result.add(first)
+  getTokP(p)
+  skipCom(p)
+  while true:
+    if p.tok.xkind == pxBracketRi:
+      getTokP(p)
+      break
+    if p.tok.xkind == pxEof:
+      parError(p, "] expected")
+      break
+    let a = rangeExpr(p)
+    skipCom(p)
+    if p.tok.xkind == pxComma:
+      getTokP(p)
+      skipCom(p)
+    result.add(a)
+
+proc identOrLiteral(p: var TParser): Node =
+  case p.tok.xkind
+  of pxSymbol:
+    result = newIdentNode(p.tok.ident, p.tok.info)
+    getTokP(p)
+  of pxIntLit:
+    result = newIntNode(nkIntLit, p.tok.iNumber, p.tok.info)
+    getTokP(p)
+  of pxInt64Lit:
+    result = newIntNode(nkInt64Lit, p.tok.iNumber, p.tok.info)
+    getTokP(p)
+  of pxFloatLit:
+    result = newFloatNode(p.tok.fNumber, p.tok.info)
+    getTokP(p)
+  of pxStrLit:
+    if p.tok.literal.len != 1:
+      result = newStrNode(p.tok.literal, p.tok.info)
+    else:
+      result = newCharNode(p.tok.literal, p.tok.info)
+    getTokP(p)
+  of pxNil:
+    result = newNode(nkNilLit, p.tok.info)
+    getTokP(p)
+  of pxParLe:
+    # () constructor; array constructor if no `key: value` pairs
+    result = newNodeP(nkPar, p)
+    getTokP(p)
+    skipCom(p)
+    var hasColon = false
+    while p.tok.xkind != pxParRi and p.tok.xkind != pxEof:
+      let a = parseExpr(p)
+      skipCom(p)
+      if p.tok.xkind == pxColon:
+        hasColon = true
+        getTokP(p)
+        skipCom(p)
+        let b = parseExpr(p)
+        let pair = newNode(nkCall, a.info)
+        pair.add(newIdentNode("kv", a.info))
+        pair.add(a)
+        pair.add(b)
+        result.add(pair)
+      else:
+        result.add(a)
+      if p.tok.xkind == pxComma:
+        getTokP(p)
+        skipCom(p)
+    p.eat(pxParRi)
+    if not hasColon and result.len > 1:
+      result.kind = nkBracket   # array constructor
+  of pxBracketLe:
+    # [] constructor; a set literal when a range is involved
+    result = newNodeP(nkBracket, p)
+    getTokP(p)
+    skipCom(p)
+    while p.tok.xkind != pxBracketRi and p.tok.xkind != pxEof:
+      let a = rangeExpr(p)
+      if a.kind == nkRange:
+        result.kind = nkCurly   # definitely a set literal
+      p.opt(pxComma)
+      skipCom(p)
+      result.add(a)
+    p.eat(pxBracketRi)
+  else:
+    parError(p, "expression expected, got " & $p.tok)
+    getTokP(p)
+    result = emptyNode(p.tok.info)
+
+proc primary(p: var TParser): Node =
+  # prefix operators
+  if p.tok.xkind in {pxNot, pxMinus, pxPlus}:
+    result = newNodeP(nkPrefix, p)
+    result.add(newIdentNode($p.tok, p.tok.info))
+    getTokP(p)
+    result.add(primary(p))
+    return
+  elif p.tok.xkind == pxAt:
+    result = newNodeP(nkAddr, p)
+    getTokP(p)
+    result.add(primary(p))
+    return
+  result = identOrLiteral(p)
+  while true:
+    case p.tok.xkind
+    of pxParLe:
+      let a = result
+      result = newNode(nkCall, a.info)
+      result.add(a)
+      exprListAux(p, pxParRi, pxEquals, result)
+      if a.kind == nkIdent and a.strVal in p.nestedProcs:
+        # nested routines see `self` implicitly
+        result.add(newIdentNode("self", a.info))
+    of pxDot:
+      let a = result
+      result = newNode(nkDotExpr, a.info)
+      result.add(a)
+      getTokP(p)               # skip '.'
+      skipCom(p)
+      if p.tok.xkind == pxSymbol:
+        result.add(newIdentNode(p.tok.ident, p.tok.info))
+        getTokP(p)
+      else:
+        parError(p, "identifier expected after '.'")
+    of pxHat:
+      let a = result
+      result = newNode(nkDeref, a.info)
+      result.add(a)
+      getTokP(p)
+    of pxBracketLe:
+      result = bracketExprList(p, result)
+    else: break
+
+proc lowestExprAux(p: var TParser, v: var Node, limit: int): TTokKind =
+  v = primary(p)
+  var op = p.tok.xkind
+  var opPred = getPrecedence(op)
+  while opPred > limit:
+    let node = newNodeP(nkInfix, p)
+    let opNode = newIdentNode($p.tok, p.tok.info)
+    getTokP(p)
+    case op
+    of pxEquals:
+      opNode.strVal = "=="
+    of pxNeq:
+      opNode.strVal = "!="
+    else:
+      discard
+    skipCom(p)
+    var v2 = emptyNode(p.tok.info)
+    let nextop = lowestExprAux(p, v2, opPred)
+    node.add(opNode)
+    node.add(v)
+    node.add(v2)
+    v = node
+    op = nextop
+    opPred = getPrecedence(nextop)
+  result = op
+
+proc parseExpr*(p: var TParser): Node =
+  let oldcontext = p.context
+  p.context = conExpr
+  if p.tok.xkind == pxCommand:
+    result = parseDirective(p)
+  else:
+    var v = emptyNode(p.tok.info)
+    discard lowestExprAux(p, v, -1)
+    result = v
+  p.context = oldcontext
+
+proc parseExprStmt*(p: var TParser): Node =
+  let info = parLineInfo(p)
+  let a = parseExpr(p)
+  if p.tok.xkind == pxAsgn:
+    getTokP(p)
+    skipCom(p)
+    let b = parseExpr(p)
+    result = newNode(nkAsgn, info)
+    result.add(a)
+    result.add(b)
+  else:
+    result = a
+# ---------------------------------------------------------------------------
+# types
+
+proc parseEnum*(p: var TParser): Node =
+  # (a, b, c) or (a = 1, b = 5)
+  result = newNodeP(nkEnumTy, p)
+  getTokP(p)                    # skip (
+  skipCom(p)
+  while p.tok.xkind != pxParRi and p.tok.xkind != pxEof:
+    if p.tok.xkind != pxSymbol:
+      parError(p, "identifier expected in enum, got " & $p.tok)
+    let fieldName = p.tok.ident
+    let fieldInfo = p.tok.info
+    getTokP(p)
+    skipCom(p)
+    p.syms.declareName(fieldName)
+    if p.tok.xkind == pxEquals:
+      getTokP(p)
+      skipCom(p)
+      let val = parseExpr(p)
+      let fld = newNode(nkEnumFieldDef, fieldInfo)
+      fld.add(newIdentNode(fieldName, fieldInfo))
+      fld.add(val)
+      result.add(fld)
+    else:
+      result.add(newIdentNode(fieldName, fieldInfo))
+    p.opt(pxComma)
+    skipCom(p)
+  p.eat(pxParRi)
+
+proc parseRecordCase*(p: var TParser): Node =
+  # `case FTag: Integer of ...` inside a record/object
+  result = newNodeP(nkRecCase, p)
+  getTokP(p)                    # skip `case`
+  skipCom(p)
+  # discriminant: `name: Type`
+  if p.tok.xkind != pxSymbol:
+    parError(p, "identifier expected for discriminant")
+  let discName = p.tok.ident
+  let discInfo = p.tok.info
+  getTokP(p)
+  p.syms.declareName(discName)
+  p.eat(pxColon)
+  let discTy = parseTypeDesc(p, emptyNode(p.tok.info))
+  let disc = newNode(nkIdentDefs, discInfo)
+  disc.add(newIdentNode(discName, discInfo))
+  disc.add(discTy)
+  disc.add(emptyNode(discInfo))
+  result.add(disc)
+  p.eat(pxOf)
+  skipCom(p)
+  while p.tok.xkind != pxEnd and p.tok.xkind != pxEof:
+    var branch: Node
+    if p.tok.xkind == pxElse:
+      branch = newNodeP(nkElse, p)
+      getTokP(p)
+    else:
+      branch = newNodeP(nkOfBranch, p)
+      while p.tok.xkind != pxEof and p.tok.xkind != pxColon:
+        branch.add(rangeExpr(p))
+        p.opt(pxComma)
+        skipCom(p)
+      p.eat(pxColon)
+    skipCom(p)
+    # fields of this branch: `a, b: Typ;` or a nested `()`
+    if p.tok.xkind == pxParLe:
+      # nested case in parens - parse fields recursively
+      getTokP(p)
+      let body = newNode(nkRecList, p.tok.info)
+      while p.tok.xkind != pxParRi and p.tok.xkind != pxEof:
+        let defs = parseIdentColonEquals(p, false)
+        body.add(defs)
+        p.opt(pxSemiColon)
+        skipCom(p)
+      p.eat(pxParRi)
+      branch.add(body)
+    else:
+      let body = parseIdentColonEquals(p, false)
+      branch.add(body)
+    result.add(branch)
+    p.opt(pxSemiColon)
+    skipCom(p)
+
+proc genSelfType(p: var TParser): Node =
+  if p.selfClass.len > 0: newIdentNode(p.selfClass, p.tok.info)
+  else: emptyNode(p.tok.info)
+
+proc genSelfParam(p: var TParser; isVar: bool): Node =
+  ## `self: MyClass` or `self: var MyClass`
+  let d = newNodeP(nkIdentDefs, p)
+  d.add(newIdentNameNodeP("self", p))
+  if isVar:
+    let vt = newNodeP(nkVarTy, p)
+    vt.add(genSelfType(p))
+    d.add(vt)
+  else:
+    d.add(genSelfType(p))
+  d.add(emptyNode(p.tok.info))
+  result = d
+
+proc parseParamList*(p: var TParser): Node =
+  ## returns nkFormalParams; may be empty (no parens)
+  result = newNodeP(nkFormalParams, p)
+  result.add(emptyNode(p.tok.info))  # return type at position 0
+  if p.tok.xkind == pxParLe:
+    getTokP(p)
+    skipCom(p)
+    p.inParamList = true
+    while p.tok.xkind != pxParRi and p.tok.xkind != pxEof:
+      var isVar = false
+      if p.tok.xkind == pxVar:
+        isVar = true
+        getTokP(p)
+      elif p.tok.xkind == pxConst:
+        # treat `const` params as plain params; the mutability distinction
+        # does not matter for the generated code
+        getTokP(p)
+      skipCom(p)
+      # names
+      var names: seq[string] = @[]
+      while true:
+        if p.tok.xkind != pxSymbol:
+          parError(p, "identifier expected in params, got " & $p.tok)
+        names.add(p.tok.ident)
+        getTokP(p)
+        skipCom(p)
+        if p.tok.xkind == pxComma:
+          getTokP(p)
+          skipCom(p)
+        else:
+          break
+      var lastType = emptyNode(p.tok.info)
+      if p.tok.xkind == pxColon:
+        getTokP(p)
+        skipCom(p)
+        lastType = parseTypeDesc(p, emptyNode(p.tok.info))
+        skipCom(p)
+      # optional default value
+      var def = emptyNode(p.tok.info)
+      if p.tok.xkind == pxEquals:
+        getTokP(p)
+        skipCom(p)
+        def = parseExpr(p)
+        skipCom(p)
+      for n in names:
+        p.syms.declareName(n)
+        let d = newNode(nkIdentDefs, p.tok.info)
+        d.add(newIdentNode(n, p.tok.info))
+        if isVar:
+          let vt = newNode(nkVarTy, p.tok.info)
+          if lastType.kind != nkEmpty: vt.add(lastType)
+          else: vt.add(newIdentNode("untyped", p.tok.info))
+          d.add(vt)
+        elif lastType.kind != nkEmpty:
+          d.add(lastType)
+        else:
+          d.add(newIdentNode("untyped", p.tok.info))
+        if def.kind != nkEmpty: d.add(def) else: d.add(emptyNode(p.tok.info))
+        result.add(d)
+      if p.tok.xkind == pxSemiColon:
+        getTokP(p)
+        skipCom(p)
+    p.inParamList = false
+    p.eat(pxParRi)
+    skipCom(p)
+
+proc parseRoutineType*(p: var TParser): Node =
+  # `procedure of object` / `function(x: int): int of object`
+  result = newNodeP(nkProcTy, p)
+  getTokP(p)                    # skip procedure/function
+  skipCom(p)
+  let params = p.parseParamList()
+  result.add(params)
+  skipCom(p)
+  var isClosure = false
+  # `of object` closure marker
+  if p.tok.xkind == pxOf:
+    getTokP(p)
+    skipCom(p)
+    if p.tok.xkind == pxObject:
+      isClosure = true
+      getTokP(p)
+      skipCom(p)
+    else:
+      parError(p, "object expected after `of` in procedure type")
+  # return type
+  if p.tok.xkind == pxColon:
+    getTokP(p)
+    skipCom(p)
+    let ret = parseTypeDesc(p, emptyNode(p.tok.info))
+    result[0] = ret
+  if isClosure:
+    let pragmas = newNode(nkPragma, p.tok.info)
+    pragmas.add(newIdentNode("closure", p.tok.info))
+    result.add(pragmas)
+  else:
+    result.add(emptyNode(p.tok.info))
+
+# ---------------------------------------------------------------------------
+# declarations
+
+proc parseIdentColonEquals*(p: var TParser; withVis: bool): Node =
+  ## `a, b: Type = init;`  (var/field declaration group)
+  result = newNodeP(nkIdentDefs, p)
+  let exportNames = p.section == seInterface and p.visibility != visPrivate
+  while true:
+    if p.tok.xkind != pxSymbol:
+      parError(p, "identifier expected, got " & $p.tok)
+    p.syms.declareName(p.tok.ident)
+    result.add(exSymbol(newIdentNode(p.tok.ident, p.tok.info), exportNames))
+    getTokP(p)
+    skipCom(p)
+    if p.tok.xkind == pxComma:
+      getTokP(p)
+      skipCom(p)
+    else:
+      break
+  if p.tok.xkind == pxColon:
+    getTokP(p)
+    skipCom(p)
+    result.add(parseTypeDesc(p, emptyNode(p.tok.info)))
+    skipCom(p)
+  else:
+    result.add(emptyNode(p.tok.info))
+  if p.tok.xkind == pxAsgn:
+    getTokP(p)
+    skipCom(p)
+    result.add(parseExpr(p))
+  else:
+    result.add(emptyNode(p.tok.info))
+
+proc parseVarSection*(p: var TParser): Node =
+  result = newNodeP(nkVarSection, p)
+  getTokP(p)                    # skip var/threadvar
+  skipCom(p)
+  while p.tok.xkind == pxSymbol:
+    let defs = parseIdentColonEquals(p, false)
+    skipCom(p)
+    result.add(defs)
+    p.opt(pxSemiColon)
+    skipCom(p)
+    # remember the var types: for set literals, class casts and the
+    # typed for-loop bounds
+    let tyNode = defs[defs.len - 2]
+    if tyNode.kind == nkSetTy:
+      for i in 0 ..< defs.len - 2:
+        if defs[i].kind == nkIdent:
+          p.varTypes[defs[i].strVal.toLowerAscii] = "set"
+    elif tyNode.kind == nkIdent:
+      let tyKey = tyNode.strVal.toLowerAscii
+      if p.syms.isClass(tyKey):
+        for i in 0 ..< defs.len - 2:
+          if defs[i].kind == nkIdent:
+            p.varTypes[defs[i].strVal.toLowerAscii] = "class:" & tyKey
+      else:
+        let mapped = rtlSpelling(tyKey)
+        if mapped.len > 0:
+          for i in 0 ..< defs.len - 2:
+            if defs[i].kind == nkIdent:
+              p.varTypes[defs[i].strVal.toLowerAscii] = mapped
+
+proc parseConstSection*(p: var TParser): Node =
+  result = newNodeP(nkConstSection, p)
+  getTokP(p)                    # skip const/resourcestring
+  skipCom(p)
+  while p.tok.xkind == pxSymbol:
+    let info = p.tok.info
+    let name = p.tok.ident
+    getTokP(p)
+    skipCom(p)
+    p.syms.declareName(name)
+    let def = newNode(nkIdentDefs, info)
+    def.add(newIdentNode(name, info))
+    if p.tok.xkind == pxColon:
+      getTokP(p)
+      skipCom(p)
+      def.add(parseTypeDesc(p, emptyNode(p.tok.info)))
+      skipCom(p)
+    else:
+      def.add(emptyNode(info))
+    p.eat(pxEquals)
+    skipCom(p)
+    def.add(parseExpr(p))
+    result.add(def)
+    p.opt(pxSemiColon)
+    skipCom(p)
+
+proc parseTypeDesc*(p: var TParser, definition: Node): Node =
+  let oldcontext = p.context
+  p.context = conTypeDesc
+  if p.tok.xkind == pxPacked: getTokP(p)  # {.packed.} handled by renderer
+  case p.tok.xkind
+  of pxCommand:
+    result = parseDirective(p)
+  of pxProcedure, pxFunction:
+    result = parseRoutineType(p)
+  of pxRecord:
+    # anonymous record -> object type
+    result = newNodeP(nkObjectTy, p)
+    result.isRecordType = true
+    getTokP(p)
+    skipCom(p)
+    result.add(emptyNode(p.tok.info))     # no inheritance
+    let body = newNode(nkRecList, p.tok.info)
+    while p.tok.xkind != pxEnd and p.tok.xkind != pxEof:
+      case p.tok.xkind
+      of pxSymbol:
+        let defs = parseIdentColonEquals(p, false)
+        body.add(defs)
+        p.opt(pxSemiColon)
+        skipCom(p)
+      of pxCase:
+        body.add(parseRecordCase(p))
+      of pxComment:
+        skipCom(p)
+      else:
+        parError(p, "field or `case` expected in record body, got " & $p.tok)
+    p.eat(pxEnd)
+    skipCom(p)
+    result.add(body)
+  of pxObject:
+    # `object` type inside a type section body (already parsed by
+    # parseRecordOrObject when part of a named def)
+    result = newNodeP(nkObjectTy, p)
+    getTokP(p)
+    skipCom(p)
+    result.add(emptyNode(p.tok.info))
+    result.add(emptyNode(p.tok.info))
+  of pxClass:
+    result = parseRecordOrObject(p, nkRefTy, definition)
+  of pxParLe:
+    result = parseEnum(p)
+  of pxArray:
+    result = newNodeP(nkArrayTy, p)
+    getTokP(p)
+    skipCom(p)
+    if p.tok.xkind == pxBracketLe:
+      # static array: array[lo..hi] of T
+      getTokP(p)
+      let idx = rangeExpr(p)
+      p.eat(pxBracketRi)
+      p.syms = p.syms  # no-op; keep table
+      result.add(idx)
+    elif p.inParamList:
+      if p.peekTok.xkind == pxConst:
+        # `array of const` -> TArrayOfConst (shim)
+        result = newIdentNode("TArrayOfConst", p.tok.info)
+        getTokP(p)          # consume `of`
+        p.eat(pxConst)
+        p.context = oldcontext
+        return
+      result.kind = nkOpenArrayTy
+    else:
+      # named dynamic array type: `array of T` -> seq[T]
+      result.kind = nkSeqTy
+    p.eat(pxOf)
+    skipCom(p)
+    result.add(parseTypeDesc(p, emptyNode(p.tok.info)))
+  of pxSet:
+    result = newNodeP(nkSetTy, p)
+    getTokP(p)
+    p.eat(pxOf)
+    skipCom(p)
+    result.add(parseTypeDesc(p, emptyNode(p.tok.info)))
+  of pxHat:
+    getTokP(p)
+    if p.peekTok.xkind == pxCommand:
+      result = parseDirective(p)
+    elif pfRefs in p.flags:
+      result = newNodeP(nkRefTy, p)
+    else:
+      result = newNodeP(nkPtrTy, p)
+    skipCom(p)
+    result.add(parseTypeDesc(p, emptyNode(p.tok.info)))
+  of pxType:
+    getTokP(p)
+    result = parseTypeDesc(p, emptyNode(p.tok.info))
+  else:
+    let a = parseExpr(p)
+    if p.tok.xkind == pxDotDot:
+      result = newNodeP(nkRangeTy, p)
+      let r = newNode(nkRange, a.info)
+      r.add(a)
+      getTokP(p)
+      r.add(parseExpr(p))
+      result.add(r)
+    else:
+      result = a
+  p.context = oldcontext
+
+proc addPragmaToIdent*(ident: Node, pragma: Node): Node =
+  ## attach a pragma to a type definition's name node
+  if ident.kind == nkPragmaExpr:
+    ident[1].add(pragma)
+    result = ident
+  else:
+    let pragmasNode = newNode(nkPragma, ident.info)
+    pragmasNode.add(pragma)
+    let e = newNode(nkPragmaExpr, ident.info)
+    e.add(ident)
+    e.add(pragmasNode)
+    result = e
+
+proc parseRecordBody(p: var TParser, result: Node, definition: Node) =
+  let oldSelfClass = p.selfClass
+  let oldVisibility = p.visibility
+  if definition.kind == nkIdent:
+    p.selfClass = definition.strVal
+  skipCom(p)
+  p.visibility = visPublic
+  var body = newNode(nkRecList, p.tok.info)
+  while p.tok.xkind != pxEnd and p.tok.xkind != pxEof:
+    case p.tok.xkind
+    of pxSymbol:
+      let defs = parseIdentColonEquals(p, false)
+      # register fields for self-qualification
+      if p.selfClass.len > 0 and defs[1].kind != nkProcTy:
+        for i in 0 ..< defs.len - 2:
+          if defs[i].kind == nkIdent:
+            p.syms.addField(p.selfClass, defs[i].strVal)
+            if defs[1].kind == nkSetTy:
+              p.varTypes[defs[i].strVal.toLowerAscii] = "set"
+      skipCom(p)
+      body.add(defs)
+      p.opt(pxSemiColon)
+      skipCom(p)
+    of pxCase:
+      body.add(parseRecordCase(p))
+      p.opt(pxSemiColon)
+      skipCom(p)
+    of pxPrivate:
+      p.visibility = visPrivate
+      getTokP(p)
+      p.opt(pxSemiColon)
+      skipCom(p)
+    of pxProtected:
+      p.visibility = visProtected
+      getTokP(p)
+      p.opt(pxSemiColon)
+      skipCom(p)
+    of pxPublic:
+      p.visibility = visPublic
+      getTokP(p)
+      p.opt(pxSemiColon)
+      skipCom(p)
+    of pxPublished:
+      p.visibility = visPublished
+      getTokP(p)
+      p.opt(pxSemiColon)
+      skipCom(p)
+    of pxComment:
+      skipCom(p)
+    of pxFunction, pxProcedure, pxConstructor, pxDestructor:
+      # bodiless method declarations inside the class body
+      let xkind = p.tok.xkind
+      let a = parseRoutine(p, true)
+      discard xkind
+      body.add(a)
+      p.opt(pxSemiColon)
+      skipCom(p)
+    of pxProperty:
+      discard parseProperty(p)
+      p.opt(pxSemiColon)
+      skipCom(p)
+    else:
+      parError(p, "class member expected, got " & $p.tok)
+      break
+  result.add(body)
+  p.eat(pxEnd)
+  # optional trailing class pragma/command (e.g. `acyclic`)
+  if p.tok.xkind == pxSymbol and definition.kind == nkIdent:
+    let word = p.tok.ident.toLowerAscii
+    if word == "acyclic":
+      getTokP(p)
+      discard
+  elif p.tok.xkind == pxCommand and definition.kind == nkIdent:
+    discard parseDirective(p)
+  p.opt(pxSemiColon)
+  skipCom(p)
+  p.visibility = oldVisibility
+  p.selfClass = oldSelfClass
+
+proc parseRecordOrObject*(p: var TParser, kind: NodeKind,
+                          definition: Node): Node =
+  ## parses `class`/`object` bodies; `definition` is the def name node
+  var record: Node
+  result = newNode(kind, definition.info)
+  if kind == nkRefTy:
+    record = newNode(nkObjectTy, definition.info)
+    result.add(record)
+  else:
+    record = result
+  getTokP(p)                    # skip `class`/`object`
+  skipCom(p)
+  if p.tok.xkind == pxSemiColon:
+    # forward declaration: `Name = class;`
+    getTokP(p)
+    result = newNode(nkCommentStmt, definition.info)
+    result.strVal = "# forward: " & definition.strVal
+    return
+  let defName = definition.strVal
+  var parent = ""
+  if p.tok.xkind == pxParLe:
+    getTokP(p)
+    skipCom(p)
+    let parentTy = parseTypeDesc(p, emptyNode(p.tok.info))
+    if parentTy.kind == nkIdent:
+      parent = parentTy.strVal
+    let ofInh = newNode(nkOfInherit, parentTy.info)
+    ofInh.add(parentTy)
+    record.add(ofInh)
+    p.eat(pxParRi)
+    skipCom(p)
+  elif kind == nkRefTy:
+    # class without ancestor: inherit from RootRef
+    let ofInh = newNode(nkOfInherit, definition.info)
+    ofInh.add(newIdentNode("RootRef", definition.info))
+    record.add(ofInh)
+  else:
+    record.add(emptyNode(definition.info))
+  p.syms.registerClass(defName, parent, kind == nkRefTy)
+  parseRecordBody(p, record, definition)
+
+# ---------------------------------------------------------------------------
+# properties (accessors generated in genPropertyAccessors)
+
+proc parseProperty*(p: var TParser): Node =
+  ## `property Name: Typ read FData write setData;` — returns a comment
+  ## node; the real accessors are generated in a post-pass.
+  result = newNodeP(nkCommentStmt, p)
+  getTokP(p)                    # skip `property`
+  skipCom(p)
+  if p.tok.xkind != pxSymbol:
+    parError(p, "property name expected, got " & $p.tok)
+  let propName = p.tok.ident
+  getTokP(p)
+  p.syms.declareName(propName)
+  let decl = TPropDecl(cls: p.selfClass, name: propName,
+                       isPublic: p.visibility != visPrivate)
+  if p.tok.xkind == pxBracketLe:
+    # array property: [index: Integer]
+    getTokP(p)
+    let params = newNode(nkFormalParams, p.tok.info)
+    params.add(emptyNode(p.tok.info))
+    while p.tok.xkind != pxBracketRi and p.tok.xkind != pxEof:
+      var isVar = false
+      if p.tok.xkind == pxConst or p.tok.xkind == pxVar:
+        getTokP(p)
+      if p.tok.xkind != pxSymbol:
+        parError(p, "index name expected")
+      let idxName = p.tok.ident
+      getTokP(p)
+      p.syms.declareName(idxName)
+      p.eat(pxColon)
+      let idxTy = parseTypeDesc(p, emptyNode(p.tok.info))
+      let d = newNode(nkIdentDefs, idxTy.info)
+      d.add(newIdentNode(idxName, idxTy.info))
+      d.add(idxTy)
+      d.add(emptyNode(idxTy.info))
+      params.add(d)
+      p.opt(pxSemiColon)
+      skipCom(p)
+    p.eat(pxBracketRi)
+    decl.params = params
+  p.eat(pxColon)
+  skipCom(p)
+  decl.typ = parseTypeDesc(p, emptyNode(p.tok.info))
+  skipCom(p)
+  while p.tok.xkind != pxEof and p.tok.xkind != pxSemiColon:
+    if p.tok.xkind == pxSymbol:
+      let word = p.tok.ident.toLowerAscii
+      if word == "read":
+        getTokP(p)
+        if p.tok.xkind == pxSymbol:
+          decl.readId = p.tok.ident
+          getTokP(p)
+      elif word == "write":
+        getTokP(p)
+        if p.tok.xkind == pxSymbol:
+          decl.writeId = p.tok.ident
+          getTokP(p)
+      elif word == "default":
+        getTokP(p)
+        if p.tok.xkind != pxSemiColon:
+          # `default;` after the accessor list vs `default <value>`
+          discard parseExpr(p)
+        else:
+          decl.isDefault = true
+      elif word == "nodefault":
+        getTokP(p)
+      else:
+        parError(p, "unexpected token in property: " & p.tok.ident)
+    else:
+      parError(p, "unexpected token in property: " & $p.tok)
+  p.opt(pxSemiColon)
+  skipCom(p)
+  if p.tok.xkind == pxSymbol and p.tok.ident.toLowerAscii == "default":
+    decl.isDefault = true
+    getTokP(p)
+    p.opt(pxSemiColon)
+    skipCom(p)
+  result.strVal = "property " & propName
+  p.props.add(decl)
+  if decl.isDefault and decl.readId.len > 0:
+    p.syms.setArrayProp(decl.cls, decl.name, decl.readId, decl.writeId,
+                        "", "")
+
+proc parseTypeDef*(p: var TParser): Node =
+  ## one `Name = type` definition
+  result = newNodeP(nkTypeDef, p)
+  if p.tok.xkind != pxSymbol:
+    parError(p, "type name expected, got " & $p.tok)
+  let name = p.tok.ident
+  let nameInfo = p.tok.info
+  getTokP(p)
+  skipCom(p)
+  p.syms.declareName(name)
+  let nameNode = newIdentNode(name, nameInfo)
+  if p.section == seInterface and p.visibility != visPrivate:
+    nameNode.exported = true
+  result.add(nameNode)
+  result.add(emptyNode(nameInfo))      # generic params (unused)
+  if p.tok.xkind == pxEquals:
+    getTokP(p)
+    skipCom(p)
+    case p.tok.xkind
+    of pxClass:
+      let ty = parseRecordOrObject(p, nkRefTy, nameNode)
+      if ty.kind == nkCommentStmt:
+        # forward declaration: emit only the comment
+        result = ty
+        return
+      result.add(ty)
+    of pxObject:
+      result.add(parseRecordOrObject(p, nkObjectTy, nameNode))
+    else:
+      result.add(parseTypeDesc(p, nameNode))
+  else:
+    result.add(emptyNode(nameInfo))
+  if p.tok.xkind == pxSemiColon:
+    getTokP(p)
+    skipCom(p)
+
+proc parseTypeSection*(p: var TParser): Node =
+  result = newNodeP(nkTypeSection, p)
+  getTokP(p)                    # skip `type`
+  skipCom(p)
+  while p.tok.xkind == pxSymbol:
+    let def = parseTypeDef(p)
+    skipCom(p)
+    result.add(def)
+
+# ---------------------------------------------------------------------------
+# routines
+
+proc routineKindNode(p: TParser, kind: TTokKind, isMethod: bool): NodeKind =
+  if isMethod: result = nkMethodDef
+  elif kind == pxFunction: result = nkFuncDef
+  else: result = nkProcDef
+
+proc parseRoutineSpecifiers*(p: var TParser, noBody: var bool,
+                             isVirtual: var bool): Node =
+  ## parses `virtual; override; overload; forward; static; inline;` etc.
+  result = newNodeP(nkPragma, p)
+  while true:
+    if p.tok.xkind != pxSymbol:
+      # calling convention directives come as commands (e.g. {$X+}) - skip
+      break
+    let word = p.tok.ident.toLowerAscii
+    case word
+    of "virtual":
+      isVirtual = true
+      getTokP(p)
+    of "override":
+      isVirtual = true
+      getTokP(p)
+    of "overload":
+      getTokP(p)
+    of "static":
+      getTokP(p)
+    of "inline":
+      result.add(newIdentNode("inline", p.tok.info))
+      getTokP(p)
+    of "forward":
+      noBody = true
+      getTokP(p)
+    of "reintroduce", "abstract", "dynamic", "deprecated", "platform",
+       "experimental", "safecall", "pascal", "cdecl", "stdcall", "register":
+      getTokP(p)
+    of "external":
+      # external declarations: skip the string/qualifier
+      getTokP(p)
+      while p.tok.xkind in {pxStrLit, pxSymbol, pxDot}:
+        getTokP(p)
+      noBody = true
+    else:
+      break
+    p.opt(pxSemiColon)
+    skipCom(p)
+
+proc parseRoutineBody(p: var TParser, result: Node) =
+  ## local decls + begin/end of a routine with a body
+  var stmts = newNodeP(nkStmtList, p)
+  p.nestedProcs = @[]
+  p.opt(pxSemiColon)
+  while true:
+    case p.tok.xkind
+    of pxVar, pxThreadvar:
+      stmts.add(parseVarSection(p))
+      p.opt(pxSemiColon)
+      skipCom(p)
+    of pxConst, pxResourcestring:
+      stmts.add(parseConstSection(p))
+      p.opt(pxSemiColon)
+      skipCom(p)
+    of pxType:
+      stmts.add(parseTypeSection(p))
+      p.opt(pxSemiColon)
+      skipCom(p)
+    of pxLabel:
+      parError(p, "labels/goto are not supported by pas2nimony")
+    of pxComment:
+      skipCom(p)
+    of pxBegin:
+      break
+    of pxProcedure, pxFunction:
+      let nested = parseRoutine(p, false)
+      if nested.kind in {nkProcDef, nkFuncDef, nkMethodDef} and
+          nested[0].kind == nkIdent:
+        p.nestedProcs.add(nested[0].strVal)
+      stmts.add(nested)
+      p.opt(pxSemiColon)
+      skipCom(p)
+    else:
+      parError(p, "begin expected in routine body, got " & $p.tok)
+  let body = parseStmt(p)
+  if body.kind == nkStmtList:
+    for s in body.sons: stmts.add(s)
+  else:
+    stmts.add(body)
+  result.add(stmts)
+
+proc parseRoutine*(p: var TParser; noBody: bool): Node =
+  ## procedure/function/constructor/destructor
+  var noBody = noBody
+  var isVirtual: bool = false
+  let kind = p.tok.xkind
+  let oldOuterName = p.outerProcName
+  let oldOuterIsMethod = p.outerIsMethod
+  let oldClass = p.classOfProc
+  let oldSelfClass = p.selfClass
+  let oldVisibility = p.visibility
+  result = newNodeP(nkProcDef, p)
+  getTokP(p)
+  skipCom(p)
+  if p.tok.xkind != pxSymbol:
+    parError(p, "routine name expected, got " & $p.tok)
+  var name = p.tok.ident
+  let nameInfo = p.tok.info
+  getTokP(p)
+  skipCom(p)
+  var isMethod = false
+  var isDotted = false
+  if p.tok.xkind == pxDot:
+    # qualified: `MyClass.doIt`
+    let cls = name
+    p.removeNextTok()
+    skipCom(p)
+    if p.tok.xkind != pxSymbol:
+      parError(p, "method name expected, got " & $p.tok)
+    name = p.tok.ident
+    p.selfClass = cls
+    p.classOfProc = cls
+    isMethod = true
+    isDotted = true
+    getTokP(p)
+    skipCom(p)
+  elif p.classOfProc.len > 0 and p.section != seInterface:
+    # nested routine inside a method body: it sees `self` implicitly
+    isMethod = true
+  elif p.selfClass.len > 0 and p.section == seInterface:
+    # bodiless member declaration inside an interface class body
+    isMethod = true
+    p.classOfProc = p.selfClass
+  # name + export marker
+  let nameNode = newIdentNode(name, nameInfo)
+  var isExported = p.section == seInterface and p.visibility != visPrivate
+  if p.section == seImplementation and
+      p.syms.exportedNames.getOrDefault(name.toLowerAscii, false):
+    # the implementation of an interface-declared routine stays exported;
+    # an unmarked redeclaration would shadow the export
+    isExported = true
+  if isExported:
+    p.syms.exportedNames[name.toLowerAscii] = true
+  result.add(exSymbol(nameNode, isExported))
+  # generic params: none
+  result.add(emptyNode(nameInfo))
+  # params
+  let params = p.parseParamList()
+  p.opt(pxSemiColon)
+  skipCom(p)
+  # return type (function)
+  if p.tok.xkind == pxColon:
+    getTokP(p)
+    skipCom(p)
+    let ret = parseTypeDesc(p, emptyNode(p.tok.info))
+    params[0] = ret
+    skipCom(p)
+  # constructors: return the class type (before self-param insertion)
+  if kind == pxConstructor and isMethod:
+    params[0] = genSelfType(p)
+    result.isCtor = true
+  # self parameter for methods
+  if isMethod:
+    # value objects get `var self`; class instances a plain ref
+    let ci = p.syms.classes.getOrDefault(p.classOfProc.toLowerAscii)
+    let selfParam = genSelfParam(p, not ci.isRef)
+    var np = newNode(nkFormalParams, params.info)
+    np.add(params[0])
+    np.add(selfParam)
+    for i in 1 ..< params.len:
+      np.add(params[i])
+    result.add(np)
+  else:
+    result.add(params)
+  if isMethod:
+    result.defClass = p.classOfProc
+  # specifiers & pragmas
+  let pragmas = parseRoutineSpecifiers(p, noBody, isVirtual)
+  result.add(pragmas)
+  result.add(emptyNode(nameInfo))  # exceptions (unused)
+  # register the routine name
+  if kind in {pxFunction, pxConstructor}:
+    p.syms.returnsValue[name.toLowerAscii] = true
+  if isMethod and (isDotted or p.section == seInterface):
+    if kind == pxConstructor or kind == pxDestructor:
+      p.syms.addCtor(p.classOfProc, name)
+    else:
+      p.syms.addRoutine(p.classOfProc, name)
+    if not isVirtual and p.section != seInterface:
+      # implementation of a method declared virtual in the interface
+      if p.syms.isMethodOf(p.classOfProc, name):
+        isVirtual = true
+    if isVirtual:
+      p.syms.addMethod(p.classOfProc, name)
+  elif isMethod and p.section != seInterface:
+    # implementation of a method declared virtual in the interface
+    if p.syms.isMethodOf(p.classOfProc, name):
+      isVirtual = true
+  if not isMethod:
+    p.syms.declareName(name)
+  # body
+  var savedOuterParams = p.outerParams
+  if p.section == seInterface or noBody:
+    result.add(emptyNode(nameInfo))
+  else:
+    p.outerProcName = name
+    p.outerIsMethod = isVirtual and isMethod
+    # remember the param names for bare `inherited;` forwarding
+    p.outerParams = @[]
+    for i in 1 ..< params.len:
+      let d = params[i]
+      if d.kind == nkIdentDefs:
+        for j in 0 ..< d.len - 2:
+          if d[j].kind == nkIdent:
+            p.outerParams.add(d[j].strVal)
+    parseRoutineBody(p, result)
+    if kind == pxConstructor and isMethod:
+      # constructors return self so `X := T.create(...)` works
+      let pre = newNode(nkAsgn, nameInfo)
+      pre.add(newIdentNode("result", nameInfo))
+      pre.add(newIdentNode("self", nameInfo))
+      let bodyNode = result[result.len - 1]
+      var newSons: seq[Node] = @[pre]
+      for i in 0 ..< bodyNode.sons.len:
+        newSons.add(bodyNode.sons[i])
+      bodyNode.sons = newSons
+    p.outerProcName = oldOuterName
+    p.outerIsMethod = oldOuterIsMethod
+    p.outerParams = savedOuterParams
+    p.classOfProc = oldClass
+  # virtual/override -> method definition
+  if isVirtual and isMethod:
+    result.kind = nkMethodDef
+  p.selfClass = oldSelfClass
+  p.classOfProc = oldClass
+  p.visibility = oldVisibility
+
+# ---------------------------------------------------------------------------
+# statements
+
+proc parseInherited*(p: var TParser): Node =
+  ## `inherited;` / `inherited name(args)` -> parent cast + call
+  let info = p.tok.info
+  p.eat(pxInherited)
+  let parent = p.syms.ancestorSpelling(p.classOfProc)
+  if parent.len == 0:
+    parError(p, "no parent class for `inherited`")
+  let selfNode = newIdentNode("self", info)
+  let parentCast = newNode(nkCall, info)
+  parentCast.add(newIdentNode(parent, info))
+  parentCast.add(selfNode)
+  if p.tok.xkind == pxSemiColon:
+    # call the same routine on the parent, forwarding our params
+    if p.outerProcName.len == 0:
+      parError(p, "`inherited` outside of a routine")
+    getTokP(p)
+    p.opt(pxSemiColon)
+    skipCom(p)
+    let call = newNode(nkCall, info)
+    call.add(newIdentNode(p.outerProcName, info))
+    call.add(parentCast)
+    for name in p.outerParams:
+      call.add(newIdentNode(name, info))
+    call.noQualCallee = true
+    if p.outerIsMethod:
+      let pc = newNode(nkCommand, info)
+      pc.add(newIdentNode("procCall", info))
+      pc.add(call)
+      result = pc
+    else:
+      result = call
+    if p.syms.returnsValue.getOrDefault(p.outerProcName.toLowerAscii, false):
+      let d = newNode(nkDiscardStmt, info)
+      d.add(result)
+      result = d
+  else:
+    # `inherited name(args)` or `inherited name`
+    var a = parseStmt(p)
+    var call: Node
+    # a bare call statement comes back discard-wrapped; unwrap it
+    if a.kind == nkDiscardStmt and a.len > 0 and a[0].kind == nkCall:
+      a = a[0]
+    if a.kind == nkCall:
+      call = newNode(nkCall, a.info)
+      call.add(a[0])
+      call.add(parentCast)
+      for i in 1 ..< a.len:
+        call.add(a[i])
+    else:
+      call = newNode(nkCall, a.info)
+      call.add(a)
+      call.add(parentCast)
+    call.noQualCallee = true
+    if p.outerIsMethod:
+      let pc = newNode(nkCommand, info)
+      pc.add(newIdentNode("procCall", info))
+      pc.add(call)
+      result = pc
+    else:
+      # a value-returning inherited call must be discarded explicitly
+      # (nimony rejects the bare value-dropping call in ctor bodies)
+      let callee = if call.len > 0 and call[0].kind == nkIdent: call[0].strVal
+                   else: ""
+      if p.syms.returnsValue.getOrDefault(callee.toLowerAscii, false):
+        let d = newNode(nkDiscardStmt, info)
+        d.add(call)
+        result = d
+      else:
+        result = call
+
+proc parseCase*(p: var TParser): Node =
+  result = newNodeP(nkCaseStmt, p)
+  getTokP(p)                    # skip `case`
+  skipCom(p)
+  result.add(parseExpr(p))
+  p.eat(pxOf)
+  skipCom(p)
+  while p.tok.xkind != pxEnd and p.tok.xkind != pxEof:
+    var b: Node
+    if p.tok.xkind == pxElse:
+      b = newNodeP(nkElse, p)
+      getTokP(p)
+    else:
+      b = newNodeP(nkOfBranch, p)
+      while p.tok.xkind != pxEof and p.tok.xkind != pxColon:
+        b.add(rangeExpr(p))
+        p.opt(pxComma)
+        skipCom(p)
+      p.eat(pxColon)
+    skipCom(p)
+    b.add(parseStmt(p))
+    result.add(b)
+    if b.kind == nkElse: break
+  p.eat(pxEnd)
+
+proc parseTry*(p: var TParser): Node =
+  result = newNodeP(nkTryStmt, p)
+  getTokP(p)                    # skip try
+  skipCom(p)
+  let body = newNodeP(nkStmtList, p)
+  while not (p.tok.xkind in {pxFinally, pxExcept, pxEof, pxEnd}):
+    body.add(parseStmt(p))
+  result.add(body)
+  if p.tok.xkind == pxExcept:
+    getTokP(p)
+    skipCom(p)
+    var sawOn = false
+    let info = parLineInfo(p)
+    while p.tok.xkind == pxSymbol and p.tok.ident.toLowerAscii == "on":
+      sawOn = true
+      let b = newNodeP(nkExceptBranch, p)
+      getTokP(p)
+      # `on E: SomeEx do`
+      if p.tok.xkind != pxSymbol:
+        parError(p, "exception variable name expected")
+      let varName = p.tok.ident
+      getTokP(p)
+      p.syms.declareName(varName)
+      p.eat(pxColon)
+      let excTy = qualifiedIdent(p)
+      skipCom(p)
+      p.eat(pxDo)
+      let handler = parseStmt(p)
+      # map the Delphi exception class to an ErrorCode
+      var code: string = ""
+      if excTy.kind == nkIdent:
+        code = excSpelling(excTy.strVal.toLowerAscii)
+      elif excTy.kind == nkDotExpr:
+        code = excSpelling(excTy[1].strVal.toLowerAscii)
+      if code.len == 0:
+        code = "Failure"
+      # except ErrorCode as varName: case varName of code: handler
+      b.add(newIdentNode("ErrorCode", info))
+      b.add(newIdentNode(varName, info))
+      let caseNode = newNode(nkCaseStmt, info)
+      caseNode.add(newIdentNode(varName, info))
+      let ofBranch = newNode(nkOfBranch, info)
+      ofBranch.add(newIdentNode(code, info))
+      ofBranch.add(handler)
+      caseNode.add(ofBranch)
+      let elseB = newNode(nkElse, info)
+      let skip = newNode(nkStmtList, info)
+      let discardN = newNode(nkDiscardStmt, info)
+      discardN.add(emptyNode(info))
+      skip.add(discardN)
+      elseB.add(skip)
+      caseNode.add(elseB)
+      b.add(caseNode)
+      result.add(b)
+      p.opt(pxSemiColon)
+      skipCom(p)
+    if p.tok.xkind == pxSymbol and p.tok.ident.toLowerAscii == "else":
+      # bare `else` handler for the whole except section
+      getTokP(p)
+      let b = newNodeP(nkExceptBranch, p)
+      b.add(emptyNode(info))
+      b.add(emptyNode(info))
+      if sawOn:
+        # handled via the re-raise in each `on` branch; plain body here
+        let body2 = parseStmt(p)
+        b.add(body2)
+        # replace: bare else only applies when no `on` branches exist
+        b.kind = nkCommentStmt
+        b.strVal = "# except-else after on-branches not supported"
+      else:
+        let body2 = parseStmt(p)
+        b[1] = body2
+      result.add(b)
+      p.opt(pxSemiColon)
+      skipCom(p)
+    if not sawOn and result.len == 1:
+      # `except <stmts> end` without on/else: plain handler
+      let b = newNodeP(nkExceptBranch, p)
+      b.add(emptyNode(info))
+      b.add(emptyNode(info))
+      let body2 = parseStmt(p)
+      b[1] = body2
+      result.add(b)
+  if p.tok.xkind == pxFinally:
+    getTokP(p)
+    let fin = newNodeP(nkFinally, p)
+    skipCom(p)
+    let body2 = parseStmt(p)
+    if body2.kind == nkStmtList:
+      for s in body2.sons: fin.add(s)
+    else:
+      fin.add(body2)
+    result.add(fin)
+  p.eat(pxEnd)
+
+var forLoopVarName: string = ""
+
+proc parseFor*(p: var TParser): Node =
+  result = newNodeP(nkForStmt, p)
+  getTokP(p)                    # skip `for`
+  skipCom(p)
+  if p.tok.xkind != pxSymbol:
+    parError(p, "loop variable expected, got " & $p.tok)
+  let loopVarName = p.tok.ident
+  # the for binds `_`: the shim iterator drives the *declared* Pascal
+  # variable through its var parameter, so the body must resolve the
+  # loop variable to that declaration, not to a fresh binding
+  result.add(newIdentNode("_", p.tok.info))
+  forLoopVarName = loopVarName
+  getTokP(p)
+  skipCom(p)
+  if p.tok.xkind == pxAsgn:
+    # `for i := a to/downto b do body` ->
+    # `for _ in pforTo(i, a, b): body` / `for _ in pforDownto(i, a, b)`
+    # The shim iterators take the loop variable by `var` and drive it,
+    # keeping Pascal semantics: the declared variable IS the loop
+    # variable (captures see the live value, break leaves it at the
+    # broken-out value, after normal termination it holds b+1 / b-1).
+    # The `var T` parameter also pins the iterator's T to the declared
+    # type, so literal bounds need no casts.
+    getTokP(p)
+    skipCom(p)
+    let a = parseExpr(p)
+    var down = false
+    if p.tok.xkind == pxTo:
+      getTokP(p)
+    elif p.tok.xkind == pxDownto:
+      down = true
+      getTokP(p)
+    else:
+      parError(p, "to/downto expected in for loop, got " & $p.tok)
+    skipCom(p)
+    let b = parseExpr(p)
+    let iter = newNode(nkCall, b.info)
+    iter.add(newIdentNode(if down: "pforDownto" else: "pforTo", b.info))
+    iter.add(newIdentNode(forLoopVarName, result[0].info))
+    iter.add(a)
+    iter.add(b)
+    result.add(iter)
+  elif p.tok.xkind == pxIn:
+    # for x in items do
+    getTokP(p)
+    skipCom(p)
+    result.add(parseExpr(p))
+  else:
+    parError(p, ":= or `in` expected in for loop")
+  p.eat(pxDo)
+  skipCom(p)
+  result.add(parseStmt(p))
+
+proc parseRepeat*(p: var TParser): Node =
+  # repeat ... until cond  ->  while true: ... if cond: break
+  result = newNodeP(nkWhileStmt, p)
+  getTokP(p)
+  skipCom(p)
+  result.add(newIdentNode("true", p.tok.info))
+  let body = newNodeP(nkStmtList, p)
+  while p.tok.xkind != pxEof and p.tok.xkind != pxUntil:
+    body.add(parseStmt(p))
+  p.eat(pxUntil)
+  skipCom(p)
+  let a = newNodeP(nkIfStmt, p)
+  let b = newNodeP(nkElifBranch, p)
+  let c = newNodeP(nkBreakStmt, p)
+  c.add(emptyNode(p.tok.info))
+  b.add(parseExpr(p))
+  skipCom(p)
+  b.add(c)
+  a.add(b)
+  body.add(a)
+  result.add(body)
+
+proc fixExit(p: var TParser, n: Node): bool =
+  # legacy helper; `Exit` is now handled directly in parseStmt
+  result = false
+
+proc asStrOperand(n: Node): Node =
+  ## `$n` for non-string operands; string literals pass through
+  if n.kind == nkStrLit:
+    return n
+  let dollar = newNode(nkCall, n.info)
+  dollar.add(newIdentNode("$", n.info))
+  dollar.add(n)
+  return dollar
+
+proc mapBuiltinCall*(p: var TParser, n: Node): Node =
+  ## rewrite builtins that need argument changes:
+  ## write(x) -> write(stdout, x); writeln(...) -> echo(...);
+  ## Pos(sub, s) -> find(s, sub); Copy(s, a, b) -> substr(s, a, b);
+  ## Exit / Exit(x) -> return / return x
+  if n.kind != nkCall or n.len == 0: return n
+  if n[0].kind != nkIdent: return n
+  let name = n[0].strVal.toLowerAscii
+  case name
+  of "write":
+    n[0].strVal = "write"
+    let stdoutNode = newIdentNode("stdout", n[0].info)
+    var newSons: seq[Node] = @[n[0], stdoutNode]
+    for i in 1 ..< n.len:
+      newSons.add(n[i])
+    n.sons = newSons
+    if n.len > 3:
+      # nimony's write takes one value; fold into a single string,
+      # $-converting every operand that is not a string literal
+      var folded: Node = asStrOperand(n[2])
+      for i in 3 ..< n.len:
+        let cat = newNode(nkInfix, n.info)
+        cat.add(newIdentNode("&", n.info))
+        cat.add(folded)
+        cat.add(asStrOperand(n[i]))
+        folded = cat
+      n.sons = @[n[0], stdoutNode, folded]
+    return n
+  of "writeln":
+    n[0].strVal = "echo"
+    return n
+  of "pos":
+    if n.len == 3:
+      let sub = n[1]
+      let s = n[2]
+      n[0].strVal = "find"
+      n[1] = s
+      n[2] = sub
+    return n
+  of "copy":
+    if n.len == 4:
+      n[0].strVal = "substr"
+    return n
+  of "exit":
+    # Exit; / Exit(value);
+    let ret = newNode(nkReturnStmt, n.info)
+    if n.len == 2:
+      ret.add(n[1])
+    else:
+      ret.add(emptyNode(n.info))
+    return ret
+  else:
+    return n
+
+proc checkSetLiteral(p: var TParser, n: Node): Node =
+  ## if `n` is an array literal and the context wants a set, convert
+  ## (the parser tracks var types for this)
+  result = n
+
+proc parseStmt*(p: var TParser): Node =
+  case p.tok.xkind
+  of pxEof:
+    result = emptyNode(p.tok.info)
+  of pxComment:
+    result = newNode(nkCommentStmt, p.tok.info)
+    result.strVal = p.tok.literal
+    getTokP(p)
+  of pxCurlyDirLe, pxStarDirLe:
+    if isHandledDirective(p):
+      result = parseDirective(p)
+    else:
+      parError(p, p.tok.ident & " not allowed here")
+      result = emptyNode(p.tok.info)
+  of pxBegin:
+    result = newNodeP(nkStmtList, p)
+    getTokP(p)
+    skipCom(p)
+    while p.tok.xkind != pxEnd and p.tok.xkind != pxEof:
+      let s = parseStmt(p)
+      if s.kind != nkEmpty: result.add(s)
+      if p.tok.xkind == pxSemiColon:
+        getTokP(p)
+        skipCom(p)
+    p.eat(pxEnd)
+    p.opt(pxDot)
+  of pxIf:
+    result = newNodeP(nkIfStmt, p)
+    while true:
+      getTokP(p)              # skip `if`/`else if`
+      let branch = newNodeP(nkElifBranch, p)
+      skipCom(p)
+      branch.add(parseExpr(p))
+      p.eat(pxThen)
+      skipCom(p)
+      branch.add(parseStmt(p))
+      result.add(branch)
+      skipCom(p)
+      if p.tok.xkind == pxElse:
+        getTokP(p)
+        skipCom(p)
+        if p.tok.xkind == pxIf:
+          continue            # else if -> additional elif branch
+        let elseBranch = newNodeP(nkElse, p)
+        skipCom(p)
+        elseBranch.add(parseStmt(p))
+        result.add(elseBranch)
+      break
+  of pxWhile:
+    result = newNodeP(nkWhileStmt, p)
+    getTokP(p)
+    skipCom(p)
+    result.add(parseExpr(p))
+    p.eat(pxDo)
+    skipCom(p)
+    result.add(parseStmt(p))
+  of pxRepeat:
+    result = parseRepeat(p)
+  of pxCase:
+    result = parseCase(p)
+  of pxTry:
+    result = parseTry(p)
+  of pxFor:
+    result = parseFor(p)
+  of pxRaise:
+    result = newNodeP(nkRaiseStmt, p)
+    getTokP(p)
+    skipCom(p)
+    if p.tok.xkind != pxSemiColon:
+      let e = parseExpr(p)
+      # Delphi: `raise SomeE.Create(msg)` -> `raise SomeErrorCode`
+      if e.kind == nkCall and e.len >= 1 and e[0].kind == nkDotExpr and
+          e[0][1].kind == nkIdent and
+          e[0][1].strVal.toLowerAscii == "create":
+        let excName = e[0][0]
+        var code = ""
+        if excName.kind == nkIdent:
+          code = excSpelling(excName.strVal.toLowerAscii)
+        if code.len == 0: code = "Failure"
+        result.add(newIdentNode(code, e.info))
+      elif e.kind == nkCall and e.len >= 2 and e[1].kind == nkDotExpr and
+          e[1][1].kind == nkIdent and
+          e[1][1].strVal.toLowerAscii == "create":
+        # method-call form: ESome.Create(...)
+        discard
+      else:
+        result.add(e)
+    else:
+      result.add(emptyNode(p.tok.info))
+    p.opt(pxSemiColon)
+  of pxInherited:
+    result = parseInherited(p)
+  of pxWith:
+    parError(p, "`with` statements are not supported by pas2nimony; " &
+      "qualify the member accesses explicitly in the Pascal source")
+    result = emptyNode(p.tok.info)
+  of pxGoto:
+    parError(p, "`goto` is not supported by pas2nimony")
+    result = emptyNode(p.tok.info)
+  of pxAsm:
+    parError(p, "`asm` blocks are not supported by pas2nimony")
+    result = emptyNode(p.tok.info)
+  of pxLabel:
+    parError(p, "`label` is not supported by pas2nimony")
+    result = emptyNode(p.tok.info)
+  of pxExports:
+    # exports clauses are irrelevant for a single-module translation
+    result = newNode(nkCommentStmt, p.tok.info)
+    result.strVal = "# exports"
+    while p.tok.xkind != pxEof and p.tok.xkind != pxSemiColon: getTokP(p)
+    p.opt(pxSemiColon)
+  of pxUses:
+    result = parseUsesStmt(p)
+  of pxInterface:
+    getTokP(p)
+    p.section = seInterface
+    p.visibility = visPublic
+    result = newNode(nkCommentStmt, p.tok.info)
+    result.strVal = "# interface"
+  of pxImplementation:
+    getTokP(p)
+    p.section = seImplementation
+    result = newNode(nkCommentStmt, p.tok.info)
+    result.strVal = "# implementation"
+  of pxInitialization:
+    getTokP(p)
+    result = newNode(nkCommentStmt, p.tok.info)
+    result.strVal = "# initialization section:"
+    let body = parseStmt(p)
+    if body.kind == nkStmtList:
+      result = body
+    else:
+      let l = newNodeP(nkStmtList, p)
+      l.add(body)
+      result = l
+  of pxFinalization:
+    getTokP(p)
+    # module finalization: no nimony equivalent; keep as comment
+    result = newNode(nkCommentStmt, p.tok.info)
+    result.strVal = "# finalization section skipped"
+    discard parseStmt(p)
+  of pxVar:
+    result = parseVarSection(p)
+  of pxThreadvar:
+    # translate like a var section; the renderer adds {.threadvar.}
+    result = parseVarSection(p)
+  of pxConst, pxResourcestring:
+    result = parseConstSection(p)
+  of pxType:
+    result = parseTypeSection(p)
+  of pxProcedure, pxFunction, pxConstructor, pxDestructor:
+    result = parseRoutine(p, false)
+  of pxProgram:
+    # `program Name;` header - skip; a program is one implementation
+    getTokP(p)
+    while p.tok.xkind != pxEof and p.tok.xkind != pxSemiColon: getTokP(p)
+    p.opt(pxSemiColon)
+    p.section = seImplementation
+    result = newNode(nkCommentStmt, p.tok.info)
+    result.strVal = "# program"
+  of pxUnit:
+    # `unit Name;` header - skip
+    getTokP(p)
+    while p.tok.xkind != pxEof and p.tok.xkind != pxSemiColon: getTokP(p)
+    p.opt(pxSemiColon)
+    result = newNode(nkCommentStmt, p.tok.info)
+    result.strVal = "# unit"
+  of pxProperty:
+    result = parseProperty(p)
+  else:
+    # expression / assignment statement
+    let info = parLineInfo(p)
+    let a = parseExpr(p)
+    if p.tok.xkind == pxAsgn:
+      getTokP(p)
+      skipCom(p)
+      let b = parseExpr(p)
+      result = newNode(nkAsgn, info)
+      result.add(a)
+      result.add(b)
+      if a.kind == nkIdent and p.varTypes.getOrDefault(
+          a.strVal.toLowerAscii) == "set" and b.kind == nkBracket:
+        # set literal assignment
+        b.kind = nkCurly
+      if a.kind == nkIdent and b.kind in {nkInfix, nkCall}:
+        # Pascal computes Integer arithmetic in the declared width;
+        # nimony types pure-literal arithmetic as int (64), so
+        # `x = 21 * 2` on an int32 x needs an explicit cast
+        let lhsTy = p.varTypes.getOrDefault(a.strVal.toLowerAscii)
+        if lhsTy in ["int8", "uint8", "int16", "uint16", "int32",
+                    "uint32", "int64", "uint64"]:
+          let castN = newNode(nkCall, b.info)
+          castN.add(newIdentNode(lhsTy, b.info))
+          castN.add(b)
+          result[1] = castN
+      p.opt(pxSemiColon)
+    elif a.kind == nkIdent and a.strVal.toLowerAscii == "exit":
+      # bare `Exit;` statement
+      result = newNode(nkReturnStmt, info)
+      result.add(emptyNode(info))
+      p.opt(pxSemiColon)
+    else:
+      result = mapBuiltinCall(p, a)
+      if result.kind in {nkDotExpr, nkIdent}:
+        # statement-level proc call without parentheses
+        let call = newNode(nkCall, info)
+        call.add(result)
+        result = call
+      if result.kind == nkCall and result.len >= 1 and
+          result[0].kind == nkIdent and
+          result[0].strVal in p.nestedProcs:
+        # nested routines see `self` implicitly
+        result.add(newIdentNode("self", info))
+      if result.kind == nkCall and result.len >= 1 and
+          result[0].kind == nkIdent and
+          p.syms.returnsValue.getOrDefault(result[0].strVal.toLowerAscii,
+              false) and result[0].strVal.toLowerAscii != "inttostr" and
+          p.tok.xkind != pxAsgn:
+        # nimony requires discarding unused non-void results
+        let d = newNode(nkDiscardStmt, info)
+        d.add(result)
+        result = d
+      p.opt(pxSemiColon)
+  skipCom(p)
+  if result.kind == nkEmpty:
+    result = newNode(nkCommentStmt, p.tok.info)
+    result.strVal = "#"
+
+# ---------------------------------------------------------------------------
+# post-passes
+
+proc parseStmtList(p: var TParser): Node =
+  ## statement sequence for directive bodies; stops at EOF or
+  ## at {$else}/{$endif} which the caller handles
+  result = newNodeP(nkStmtList, p)
+  while true:
+    case p.tok.xkind
+    of pxEof:
+      break
+    of pxCurlyDirLe, pxStarDirLe:
+      if not isHandledDirective(p): break
+    else:
+      discard
+    let s = parseStmt(p)
+    if s.kind != nkEmpty: result.add(s)
+    p.opt(pxSemiColon)
+    skipCom(p)
+  if result.len == 1: result = result[0]
+
+proc collectScopeNames(n: Node, names: var seq[string]) =
+  ## collect the local names declared in a statement subtree
+  case n.kind
+  of nkVarSection, nkConstSection:
+    for defs in n.sons:
+      if defs.kind == nkIdentDefs:
+        for i in 0 ..< defs.len - 2:
+          if defs[i].kind == nkIdent:
+            names.add(defs[i].strVal.toLowerAscii)
+  of nkForStmt:
+    if n[0].kind == nkIdent:
+      names.add(n[0].strVal.toLowerAscii)
+  else:
+    discard
+
+proc isMemberName(p: TParser, cls, name: string): bool =
+  ## true if `name` is a member (field/routine/property) of the class chain
+  let key = cls.toLowerAscii
+  let lower = name.toLowerAscii
+  var guard = 0
+  var k = key
+  while k.len > 0 and guard < 100:
+    let ci = p.syms.classes.getOrDefault(k)
+    if ci.spelling.len == 0: break
+    if ci.fieldSet.hasKey(lower) or ci.routineSet.hasKey(lower):
+      return true
+    k = ci.parent
+    inc guard
+  # properties
+  for pr in p.props:
+    if pr.cls.toLowerAscii == key and pr.name.toLowerAscii == lower:
+      return true
+  return false
+
+proc isCtorName(p: TParser, cls, name: string): bool =
+  p.syms.isCtorOf(cls, name)
+
+proc selfQualifyInPlace(p: var TParser, n: Node,
+                        scope: var seq[string]): Node
+
+proc selfQualifyKids(p: var TParser, n: Node,
+                     scope: var seq[string]): Node =
+  result = n
+  for i in 0 ..< n.len:
+    n[i] = selfQualifyInPlace(p, n[i], scope)
+
+proc selfQualifyInPlace(p: var TParser, n: Node,
+                        scope: var seq[string]): Node =
+  ## returns the (possibly wrapped) node with bare members qualified
+  case n.kind
+  of nkProcDef, nkFuncDef, nkMethodDef:
+    var inner: seq[string] = @[]
+    if n.len >= 3 and n[2].kind == nkFormalParams:
+      for i in 1 ..< n[2].len:
+        let d = n[2][i]
+        if d.kind == nkIdentDefs:
+          for j in 0 ..< d.len - 2:
+            if d[j].kind == nkIdent:
+              inner.add(d[j].strVal.toLowerAscii)
+    if n.len > 0:
+      let bodySon = n[n.len - 1]
+      if bodySon.kind == nkStmtList:
+        for s in bodySon.sons:
+          if s.kind in {nkVarSection, nkConstSection, nkTypeSection}:
+            collectScopeNames(s, inner)
+        for i in 0 ..< bodySon.len:
+          bodySon[i] = selfQualifyInPlace(p, bodySon[i], inner)
+    return n
+  of nkStmtList, nkElse, nkFinally, nkOfBranch, nkElifBranch:
+    var inner = scope
+    for s in n.sons:
+      if s.kind in {nkVarSection, nkConstSection, nkTypeSection}:
+        collectScopeNames(s, inner)
+    return selfQualifyKids(p, n, inner)
+  of nkIdent:
+    let lower = n.strVal.toLowerAscii
+    if p.qualClass.len > 0 and lower notin scope and
+        lower != "self" and lower != "result" and
+        not isCtorName(p, p.qualClass, n.strVal) and
+        isMemberName(p, p.qualClass, n.strVal):
+      let dot = newNode(nkDotExpr, n.info)
+      dot.add(newIdentNode("self", n.info))
+      dot.add(n)
+      return dot
+    return n
+  of nkCommand:
+    # procCall wrapper: qualify the argument's contents but keep the
+    # inherited callee unqualified
+    n[1] = selfQualifyInPlace(p, n[1], scope)
+    return n
+  of nkCall:
+    var qualCallee = not n.noQualCallee
+    if n.len >= 1 and qualCallee:
+      n[0] = selfQualifyInPlace(p, n[0], scope)
+    for i in 1 ..< n.len:
+      n[i] = selfQualifyInPlace(p, n[i], scope)
+    return n
+  of nkDotExpr:
+    # qualify the receiver, never the selector
+    n[0] = selfQualifyInPlace(p, n[0], scope)
+    return n
+  of nkTypeDef, nkTypeSection, nkImportStmt, nkProcTy, nkRefTy, nkPtrTy,
+     nkObjectTy, nkEnumTy, nkArrayTy, nkSetTy, nkOpenArrayTy, nkRangeTy,
+     nkFormalParams, nkIdentDefs, nkVarSection, nkConstSection, nkCommentStmt:
+    return n
+  else:
+    return selfQualifyKids(p, n, scope)
+
+proc selfQualifyAll*(p: var TParser, module: Node) =
+  for i in 0 ..< module.len:
+    let def = module[i]
+    if def.kind in {nkProcDef, nkFuncDef, nkMethodDef}:
+      var scope: seq[string] = @[]
+      if def.len >= 3 and def[2].kind == nkFormalParams:
+        for j in 1 ..< def[2].len:
+          let d = def[2][j]
+          if d.kind == nkIdentDefs:
+            for k in 0 ..< d.len - 2:
+              if d[k].kind == nkIdent:
+                scope.add(d[k].strVal.toLowerAscii)
+      let savedClass = p.qualClass
+      p.qualClass = def.defClass
+      if def.len > 0 and def[def.len - 1].kind == nkStmtList:
+        let body = def[def.len - 1]
+        for s in body.sons:
+          if s.kind in {nkVarSection, nkConstSection, nkTypeSection}:
+            collectScopeNames(s, scope)
+        for j in 0 ..< body.len:
+          body[j] = selfQualifyInPlace(p, body[j], scope)
+      p.qualClass = savedClass
+
+proc rewriteClassAsgns*(p: var TParser, n: Node) =
+  ## upcast assignments between differently typed class variables:
+  ## `my = sec` -> `my = MyClass(sec)`
+  if n.kind == nkAsgn and n[0].kind == nkIdent and n[1].kind == nkIdent:
+    let lhsT = p.varTypes.getOrDefault(n[0].strVal.toLowerAscii)
+    let rhsT = p.varTypes.getOrDefault(n[1].strVal.toLowerAscii)
+    if lhsT.startsWith("class:") and rhsT.startsWith("class:") and
+        lhsT != rhsT:
+      let castCall = newNode(nkCall, n.info)
+      castCall.add(newIdentNode(lhsT[6..^1], n.info))
+      castCall.add(n[1])
+      n[1] = castCall
+      return
+  for s in n.sons:
+    rewriteClassAsgns(p, s)
+
+proc rewriteCtorCalls*(p: var TParser, n: Node): Node =
+  ## `Second.create(v)` -> `create(Second(), v)`; an inherited
+  ## constructor call gets an explicit cast back to the subclass
+  if n.kind == nkCall and n.len >= 1 and n[0].kind == nkDotExpr and
+      n[0][0].kind == nkIdent and n[0][1].kind == nkIdent:
+    let cls = n[0][0].strVal
+    let name = n[0][1].strVal
+    if p.syms.isCtorOf(cls, name):
+      let newCall = newNode(nkCall, n.info)
+      newCall.add(newIdentNode(name, n.info))
+      let ctor = newNode(nkCall, n.info)
+      ctor.add(newIdentNode(cls, n.info))
+      newCall.add(ctor)
+      for i in 1 ..< n.len:
+        newCall.add(n[i])
+      # an inherited constructor returns the declaring class; cast back
+      let decl = p.syms.findCtorClass(cls, name)
+      if decl.len > 0 and decl.toLowerAscii != cls.toLowerAscii:
+        let castCall = newNode(nkCall, n.info)
+        castCall.add(newIdentNode(cls, n.info))
+        castCall.add(newCall)
+        result = castCall
+      else:
+        result = newCall
+      return
+  if n.kind == nkDotExpr and n.len == 2 and n[0].kind == nkIdent and
+      n[1].kind == nkIdent and p.syms.isCtorOf(n[0].strVal, n[1].strVal):
+    # zero-arg constructor used as a value: `c := TClass.Create`
+    let newCall = newNode(nkCall, n.info)
+    newCall.add(newIdentNode(n[1].strVal, n.info))
+    let ctor = newNode(nkCall, n.info)
+    ctor.add(newIdentNode(n[0].strVal, n.info))
+    newCall.add(ctor)
+    result = newCall
+    return
+  result = n
+  for i in 0 ..< n.len:
+    if n.sons[i].len > 0:
+      n.sons[i] = rewriteCtorCalls(p, n.sons[i])
+
+proc rewriteArrayProps*(p: var TParser, n: Node) =
+  ## `obj.myArr[idx]` -> `myArr(obj, idx)`; `obj.myArr[idx] := v` ->
+  ## `setMyArr(obj, idx, v)`; `obj[idx]` (default property) likewise
+  if n.kind == nkAsgn and n[0].kind == nkIndexExpr and n[0].len >= 2:
+    let lhs = n[0]
+    if lhs[0].kind == nkDotExpr and lhs[0][1].kind == nkIdent:
+      let propName = lhs[0][1].strVal.toLowerAscii
+      for pr in p.props:
+        if pr.params != nil and pr.name.toLowerAscii == propName and
+            pr.writeId.len > 0:
+          let call = newNode(nkCall, n.info)
+          call.add(newIdentNode(pr.writeId, n.info))
+          call.add(lhs[0][0])
+          for i in 1 ..< lhs.len:
+            call.add(lhs[i])
+          call.add(n[1])
+          n.kind = nkCall
+          n.sons = @[]
+          for s in call.sons: n.sons.add(s)
+          return
+    elif lhs[0].kind == nkIdent:
+      let vt = p.varTypes.getOrDefault(lhs[0].strVal.toLowerAscii)
+      if vt.startsWith("class:"):
+        let arrProp = p.syms.getArrayProp(vt[6..^1])
+        if arrProp.arrName.len > 0 and arrProp.arrSetter.len > 0:
+          let call = newNode(nkCall, n.info)
+          call.add(newIdentNode(arrProp.arrSetter, n.info))
+          call.add(lhs[0])
+          for i in 1 ..< lhs.len:
+            call.add(lhs[i])
+          call.add(n[1])
+          n.kind = nkCall
+          n.sons = @[]
+          for s in call.sons: n.sons.add(s)
+          return
+  if n.kind == nkIndexExpr and n.len >= 2 and n[0].kind == nkDotExpr and
+      n[0][1].kind == nkIdent:
+    let propName = n[0][1].strVal.toLowerAscii
+    for pr in p.props:
+      if pr.params != nil and pr.name.toLowerAscii == propName and
+          pr.readId.len > 0:
+        let call = newNode(nkCall, n.info)
+        call.add(newIdentNode(pr.readId, n.info))
+        call.add(n[0][0])
+        for i in 1 ..< n.len:
+          call.add(n[i])
+        n.kind = nkCall
+        n.sons = @[]
+        for s in call.sons: n.sons.add(s)
+        return
+  for s in n.sons:
+    rewriteArrayProps(p, s)
+
+proc genPropertyAccessors*(p: var TParser, module: Node) =
+  ## generate accessor templates for all properties
+  for pr in p.props:
+    if pr.cls.len == 0: continue
+    if pr.params != nil:
+      # array properties are resolved directly to their accessors by
+      # rewriteArrayProps; no template is generated
+      discard
+    else:
+      # read accessor: template name(self: C): T = ...
+      if pr.readId.len > 0:
+        let t = newNode(nkTemplateDef, pr.typ.info)
+        t.add(exSymbol(newIdentNode(pr.name, pr.typ.info), pr.isPublic))
+        t.add(emptyNode(pr.typ.info))
+        let params = newNode(nkFormalParams, pr.typ.info)
+        params.add(pr.typ)
+        let selfDef = newNode(nkIdentDefs, pr.typ.info)
+        selfDef.add(newIdentNode("self", pr.typ.info))
+        selfDef.add(newIdentNode(pr.cls, pr.typ.info))
+        selfDef.add(emptyNode(pr.typ.info))
+        params.add(selfDef)
+        t.add(params)
+        t.add(emptyNode(pr.typ.info))
+        t.add(emptyNode(pr.typ.info))
+        let body = newNode(nkStmtList, pr.typ.info)
+        let readLower = pr.readId.toLowerAscii
+        let clsKey = pr.cls.toLowerAscii
+        var isRoutine = false
+        let ciRead = p.syms.classes.getOrDefault(clsKey)
+        isRoutine = ciRead.routineSet.hasKey(readLower)
+        let access = newNode(nkDotExpr, pr.typ.info)
+        access.add(newIdentNode("self", pr.typ.info))
+        access.add(newIdentNode(pr.readId, pr.typ.info))
+        if isRoutine:
+          let call = newNode(nkCall, pr.typ.info)
+          call.add(access)
+          body.add(call)
+        else:
+          body.add(access)
+        t.add(body)
+        module.add(t)
+      # write accessor: template `name =`(self: C; v: T) = ...
+      if pr.writeId.len > 0:
+        let t = newNode(nkTemplateDef, pr.typ.info)
+        let setterName = newIdentNode(pr.name & " =", pr.typ.info)
+        t.add(exSymbol(setterName, pr.isPublic))
+        t.add(emptyNode(pr.typ.info))
+        let params = newNode(nkFormalParams, pr.typ.info)
+        params.add(emptyNode(pr.typ.info))
+        let selfDef = newNode(nkIdentDefs, pr.typ.info)
+        selfDef.add(newIdentNode("self", pr.typ.info))
+        selfDef.add(newIdentNode(pr.cls, pr.typ.info))
+        selfDef.add(emptyNode(pr.typ.info))
+        params.add(selfDef)
+        let vDef = newNode(nkIdentDefs, pr.typ.info)
+        vDef.add(newIdentNode("v", pr.typ.info))
+        vDef.add(pr.typ)
+        vDef.add(emptyNode(pr.typ.info))
+        params.add(vDef)
+        t.add(params)
+        t.add(emptyNode(pr.typ.info))
+        t.add(emptyNode(pr.typ.info))
+        let body = newNode(nkStmtList, pr.typ.info)
+        let writeLower = pr.writeId.toLowerAscii
+        let clsKey = pr.cls.toLowerAscii
+        var isRoutine = false
+        let ciWrite = p.syms.classes.getOrDefault(clsKey)
+        isRoutine = ciWrite.routineSet.hasKey(writeLower)
+        if isRoutine:
+          let call = newNode(nkCall, pr.typ.info)
+          call.add(newIdentNode(pr.writeId, pr.typ.info))
+          call.add(newIdentNode("self", pr.typ.info))
+          call.add(newIdentNode("v", pr.typ.info))
+          body.add(call)
+        else:
+          let asgn = newNode(nkAsgn, pr.typ.info)
+          let access = newNode(nkDotExpr, pr.typ.info)
+          access.add(newIdentNode("self", pr.typ.info))
+          access.add(newIdentNode(pr.writeId, pr.typ.info))
+          asgn.add(access)
+          asgn.add(newIdentNode("v", pr.typ.info))
+          body.add(asgn)
+        t.add(body)
+        module.add(t)
+
+# ---------------------------------------------------------------------------
+# unit driver
+
+proc wrapMemberCalls*(p: var TParser, n: Node): Node =
+  ## Pascal allows calling a member function without parentheses
+  ## (`x := obj.Value`); nimony needs the call. Wrap a member access
+  ## whose selector is a routine of the receiver's class into a call.
+  if n.kind == nkDotExpr and n.len == 2 and n[0].kind == nkIdent and
+      n[1].kind == nkIdent:
+    let vt = p.varTypes.getOrDefault(n[0].strVal.toLowerAscii)
+    if vt.startsWith("class:") and p.syms.isRoutineOf(vt[6..^1], n[1].strVal):
+      let call = newNode(nkCall, n.info)
+      call.add(n)
+      return call
+    return n
+  for i in 0 ..< n.len:
+    if n.kind == nkCall and i == 0:
+      continue  # the callee of a call is already the call target
+    if n.sons[i].len > 0:
+      n.sons[i] = wrapMemberCalls(p, n.sons[i])
+  return n
+
+proc parseUnit*(p: var TParser): Node =
+  ## parse a whole unit/program; returns the module statement list with
+  ## all post-passes applied
+  while p.tok.xkind != pxEof:
+    if p.tok.xkind == pxEnd:
+      # unit/program terminator: a bare `end.` with no begin-block
+      getTokP(p)
+      p.opt(pxDot)
+      break
+    let s = parseStmt(p)
+    if s.kind != nkEmpty and s.strVal != "#":
+      p.module.add(s)
+    elif s.kind != nkCommentStmt:
+      p.module.add(s)
+    p.opt(pxSemiColon)
+    skipCom(p)
+  genPropertyAccessors(p, p.module)
+  selfQualifyAll(p, p.module)
+  for i in 0 ..< p.module.len:
+    rewriteClassAsgns(p, p.module[i])
+    p.module.sons[i] = rewriteCtorCalls(p, p.module[i])
+    rewriteArrayProps(p, p.module[i])
+  # move the generated property accessors before the first plain
+  # statement (the main block), so nimony sees them before their use
+  var accessors: seq[Node] = @[]
+  var rest: seq[Node] = @[]
+  for i in 0 ..< p.module.len:
+    let n = p.module[i]
+    if n.kind == nkTemplateDef:
+      accessors.add(n)
+    else:
+      rest.add(n)
+  var final: seq[Node] = @[]
+  var inserted = false
+  for n in rest:
+    if not inserted and n.kind notin {nkImportStmt, nkCommentStmt,
+        nkTypeSection, nkVarSection, nkConstSection, nkProcDef, nkFuncDef,
+        nkMethodDef, nkTemplateDef, nkWhenExpr}:
+      for a in accessors: final.add(a)
+      inserted = true
+    final.add(n)
+  if not inserted:
+    for a in accessors: final.add(a)
+  var m = newNode(nkStmtList, p.module.info)
+  for n in final: m.add(n)
+  discard wrapMemberCalls(p, m)
+  result = m

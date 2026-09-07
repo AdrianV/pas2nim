@@ -19,7 +19,7 @@ type
     Hallo: Integer;
     property data: string read FData write FData;
     property data2: string read FData write setData;
-    property myHello: Integer read Hello write Hello;
+    property myHello: Integer read Hallo write Hallo;
     property myArray[index: Integer]: string read getMyArray write setMyArray; default;
     constructor create(v: Integer);
     procedure doIt; virtual;
