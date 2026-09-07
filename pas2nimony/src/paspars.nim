@@ -58,6 +58,8 @@ type
     outerParams*: seq[string]   ## param names of the enclosing routine
     module*: Node               ## the nkStmtList built so far
     varTypes*: Table[string, string] ## lowercase var name -> "set"|"other"
+    paramTypes*: Table[string, string] ## current routine's param name -> mapped type
+    fieldTypes*: Table[string, string] ## "class.field" (lowercase) -> mapped type
     absorbed*: UnitSet               ## shared unit-absorption cycle guard
     unitFiles*: Table[string, string] ## lowercase unit name -> module file stem
     classOfProc*: string        ## class the current routine belongs to
@@ -368,6 +370,44 @@ proc rangeExpr*(p: var TParser): Node =
   else:
     result = a
 
+proc decIndex(p: var TParser, n: Node): Node =
+  ## 1-based Delphi index -> 0-based: fold literal 1 to 0, else `idx - 1`
+  if n.kind == nkIntLit and n.intVal == 1:
+    result = newIntNode(nkIntLit, 0, n.info)
+  else:
+    result = newNode(nkInfix, n.info)
+    result.add(newIdentNode("-", n.info))
+    result.add(n)
+    result.add(newIntNode(nkIntLit, 1, n.info))
+
+proc mappedTypeName(p: var TParser, ty: Node): string =
+  ## mapped spelling of a simple type node; "" when unknown/complex
+  result = ""
+  var t = ty
+  if t.kind == nkVarTy and t.len > 0: t = t[0]
+  if t.kind == nkIdent:
+    result = rtlSpelling(t.strVal.toLowerAscii)
+
+proc stringBaseType(p: var TParser, base: Node): string =
+  ## resolved type spelling of a simply-indexed base (var, param, field);
+  ## "" when the base is not tracked
+  result = ""
+  case base.kind
+  of nkIdent:
+    let k = base.strVal.toLowerAscii
+    result = p.paramTypes.getOrDefault(k)
+    if result.len == 0:
+      result = p.varTypes.getOrDefault(k)
+    if result.len == 0 and p.selfClass.len > 0:
+      # bare field access inside a method body (`acc[i]` means self.acc[i])
+      result = p.fieldTypes.getOrDefault(p.selfClass.toLowerAscii & "." & k)
+  of nkDotExpr:
+    if base[0].kind == nkIdent and base[1].kind == nkIdent:
+      result = p.fieldTypes.getOrDefault(
+        base[0].strVal.toLowerAscii & "." & base[1].strVal.toLowerAscii)
+  else:
+    discard
+
 proc bracketExprList(p: var TParser, first: Node): Node =
   result = newNode(nkIndexExpr, first.info)
   result.add(first)
@@ -386,6 +426,9 @@ proc bracketExprList(p: var TParser, first: Node): Node =
       getTokP(p)
       skipCom(p)
     result.add(a)
+  # Delphi strings are 1-based; nimony's `string` is 0-based
+  if result.len == 2 and stringBaseType(p, result[0]) == "string":
+    result[1] = decIndex(p, result[1])
 
 proc identOrLiteral(p: var TParser): Node =
   case p.tok.xkind
@@ -479,6 +522,7 @@ proc primary(p: var TParser): Node =
       if a.kind == nkIdent and a.strVal in p.nestedProcs:
         # nested routines see `self` implicitly
         result.add(newIdentNode("self", a.info))
+      result = mapStringBuiltins(p, result)
     of pxDot:
       let a = result
       result = newNode(nkDotExpr, a.info)
@@ -856,6 +900,13 @@ proc parseTypeDesc*(p: var TParser, definition: Node): Node =
       case p.tok.xkind
       of pxSymbol:
         let defs = parseIdentColonEquals(p, false)
+        # field types for 1-based string indexing (`rec.field[i]`)
+        let mty = p.mappedTypeName(defs[defs.len - 2])
+        if definition.kind == nkIdent and mty.len > 0:
+          for i in 0 ..< defs.len - 2:
+            if defs[i].kind == nkIdent:
+              p.fieldTypes[definition.strVal.toLowerAscii & "." &
+                           defs[i].strVal.toLowerAscii] = mty
         body.add(defs)
         p.opt(pxSemiColon)
         skipCom(p)
@@ -965,11 +1016,15 @@ proc parseRecordBody(p: var TParser, result: Node, definition: Node) =
       let defs = parseIdentColonEquals(p, false)
       # register fields for self-qualification
       if p.selfClass.len > 0 and defs[1].kind != nkProcTy:
+        let mty = p.mappedTypeName(defs[defs.len - 2])
         for i in 0 ..< defs.len - 2:
           if defs[i].kind == nkIdent:
             p.syms.addField(p.selfClass, defs[i].strVal)
             if defs[1].kind == nkSetTy:
               p.varTypes[defs[i].strVal.toLowerAscii] = "set"
+            if mty.len > 0:
+              p.fieldTypes[p.selfClass.toLowerAscii & "." &
+                           defs[i].strVal.toLowerAscii] = mty
       skipCom(p)
       body.add(defs)
       p.opt(pxSemiColon)
@@ -1406,6 +1461,17 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
   else:
     p.outerProcName = name
     p.outerIsMethod = isVirtual and isMethod
+    # param types for 1-based string indexing inside the body
+    let savedParamTypes = p.paramTypes
+    p.paramTypes = initTable[string, string]()
+    for i in 1 ..< params.len:
+      let d = params[i]
+      if d.kind == nkIdentDefs:
+        let mty = p.mappedTypeName(d[d.len - 2])
+        if mty.len > 0:
+          for j in 0 ..< d.len - 2:
+            if d[j].kind == nkIdent:
+              p.paramTypes[d[j].strVal.toLowerAscii] = mty
     # remember the param names for bare `inherited;` forwarding
     p.outerParams = @[]
     for i in 1 ..< params.len:
@@ -1428,6 +1494,7 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
     p.outerProcName = oldOuterName
     p.outerIsMethod = oldOuterIsMethod
     p.outerParams = savedOuterParams
+    p.paramTypes = savedParamTypes
     p.classOfProc = oldClass
   # virtual/override -> method definition
   if isVirtual and isMethod:
@@ -1719,11 +1786,62 @@ proc asStrOperand(n: Node): Node =
   dollar.add(n)
   return dollar
 
+proc mapStringBuiltins*(p: var TParser, n: Node): Node =
+  ## expression-level rewrites of the 1-based string family
+  ## (also invoked from mapBuiltinCall for statement-position calls)
+  if n.kind != nkCall or n.len == 0: return n
+  if n[0].kind != nkIdent: return n
+  case n[0].strVal.toLowerAscii
+  of "pos":
+    # Pos(sub, s) is 1-based (0 when absent); find is 0-based (-1 absent):
+    # find(s, sub) + 1 maps exactly
+    if n.len == 3:
+      let sub = n[1]
+      let str1 = n[2]
+      var call = newNode(nkCall, n.info)
+      call.add(newIdentNode("find", n.info))
+      call.add(str1)
+      call.add(sub)
+      let plus = newNode(nkInfix, n.info)
+      plus.add(newIdentNode("+", n.info))
+      plus.add(call)
+      plus.add(newIntNode(nkIntLit, 1, n.info))
+      return plus
+    return n
+  of "copy":
+    # Copy(s, a[, b]) -> substr(s, a-1[, a-1 + (b-1)])
+    n[0].strVal = "substr"
+    if n.len >= 3:
+      n[2] = p.decIndex(n[2])
+      if n.len == 4:
+        let minus = newNode(nkInfix, n.info)
+        minus.add(newIdentNode("-", n.info))
+        minus.add(n[3])
+        minus.add(newIntNode(nkIntLit, 1, n.info))
+        let plus = newNode(nkInfix, n.info)
+        plus.add(newIdentNode("+", n.info))
+        plus.add(n[2])
+        plus.add(minus)
+        n[3] = plus
+    return n
+  of "delete":
+    # Delete(s, idx, cnt): no string delete in nimony - 1-based shim
+    n[0].strVal = "strDelete"
+    return n
+  of "insert":
+    # Insert(src, s, idx): 1-based shim
+    n[0].strVal = "strInsert"
+    return n
+  else:
+    return n
+
 proc mapBuiltinCall*(p: var TParser, n: Node): Node =
   ## rewrite builtins that need argument changes:
   ## write(x) -> write(stdout, x); writeln(...) -> echo(...);
   ## Pos(sub, s) -> find(s, sub); Copy(s, a, b) -> substr(s, a, b);
   ## Exit / Exit(x) -> return / return x
+  let m = mapStringBuiltins(p, n)
+  if m != n: return m
   if n.kind != nkCall or n.len == 0: return n
   if n[0].kind != nkIdent: return n
   let name = n[0].strVal.toLowerAscii
@@ -1749,18 +1867,6 @@ proc mapBuiltinCall*(p: var TParser, n: Node): Node =
     return n
   of "writeln":
     n[0].strVal = "echo"
-    return n
-  of "pos":
-    if n.len == 3:
-      let sub = n[1]
-      let s = n[2]
-      n[0].strVal = "find"
-      n[1] = s
-      n[2] = sub
-    return n
-  of "copy":
-    if n.len == 4:
-      n[0].strVal = "substr"
     return n
   of "exit":
     # Exit; / Exit(value);

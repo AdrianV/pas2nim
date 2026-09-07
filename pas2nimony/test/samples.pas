@@ -62,7 +62,7 @@ begin
     writeln('high');
   end;
 
-  // strings and chars
+  // strings and chars (Delphi 1-based indexing)
   s := 'Hello';
   acc := s + ' ' + 'World';
   writeln(acc);
@@ -70,6 +70,15 @@ begin
   writeln('char: ', C);
   writeln('upper: ', Uppercase(S));
   writeln('len: ', Length(s));
+  writeln('pos: ', Pos('World', acc));
+  writeln('pos0: ', Pos('zzz', acc));
+  writeln('copy: ', Copy(acc, 2, 5));
+  s[1] := 'J';
+  writeln('set1: ', s);
+  Delete(acc, 1, 6);
+  writeln('del: ', acc);
+  Insert('Well ', acc, 1);
+  writeln('ins: ', acc);
 
   // records
   pt.x := 3;

@@ -118,7 +118,7 @@ semantics · ❌ rejected with a clear error (phase-2 lowerings)
 | `Single/Double/Real/Extended` | `float32`/`float64` | `Extended` narrows to `float64` |
 | `Boolean` | `bool` | |
 | `Char/AnsiChar/WideChar` | `char` | |
-| `String/AnsiString/WideString` | `string` | |
+| `String/AnsiString/WideString` | `string` | indexed **1-based** (Delphi); the translator shifts string index expressions by one |
 | `PChar` | `cstring` | |
 | `Pointer` | `pointer` | |
 | `TextFile/Text` | `File` | |
@@ -170,6 +170,10 @@ semantics · ❌ rejected with a clear error (phase-2 lowerings)
 | `try … finally` | `try … finally` | native |
 | `raise E.Create(msg)` | `raise <ErrorCode-const>` | mapping table `passym.excSpelling`; raising procs get `{.raises.}` |
 | `write/writeln` | `write(stdout, …)` / `echo(…)` | multi-arg `write` folds into one string with `&`/`$` |
+| `s[i]` / `s[i] := c` (string index) | `s[i-1]` | **Delphi 1-based**; literal index 1 folds to 0; bases tracked: vars, params, class fields (incl. bare `self` fields in methods), record fields. Untagged bases (function results, chained `arr[i][j]` into strings, char-typed indices) stay 0-based — documented limitation |
+| `Pos(sub, s)` | `find(s, sub) + 1` | exact Delphi semantics: 1-based, 0 when absent (nimony's `find` returns -1) |
+| `Copy(s, a[, b])` | `substr(s, a-1[, a-1 + (b-1)])` | `substr` is inclusive 0-based and clamps out-of-range like Delphi's `Copy` |
+| `Delete(s, i, n)` / `Insert(src, s, i)` | `strDelete` / `strInsert` | 1-based shims in `systempas` (nimony has no string delete/insert); out-of-range is clamped, not raised |
 | `Inc/Dec` | `inc/dec` | |
 | `with`, `goto`, `asm`, `label` | ❌ rejected | documented phase-2 lowerings |
 | `{$ifdef X}` etc. | `when defined(X)` / `when false:` | `{$if …}` conditions limited to `defined()` combinations |

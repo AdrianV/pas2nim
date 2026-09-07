@@ -176,3 +176,21 @@ translator itself — keep current:
     `(template name x . . (params ...) ret . . (stmts ...))` with
     `(quoted name =)` for setters — dropping them makes property
     reads/writes fail with "undeclared field".
+27. **Delphi 1-based strings**: the parser rewrites string index
+    expressions (`s[i]` -> `s[i-1]`, literal 1 folds to 0) using three
+    type tables: `paramTypes` (innermost routine, saved/restored like
+    `outerParams`), `varTypes` (module vars), `fieldTypes`
+    ("class.field", incl. bare self-fields inside methods). Nimony's
+    `find` returns **-1 when absent**, so `find(s, sub) + 1` maps
+    Delphi's `Pos` exactly; `Copy` maps to `substr(s, a-1, a-1+b-1)`
+    (inclusive 0-based, clamped); `Delete`/`Insert` have no nimony
+    equivalent — 1-based `strDelete`/`strInsert` shims in `systempas`
+    (clamped, not raising).
+28. **Probe naming pitfall**: a probe file named like a local variable
+    (`s.nim` with `var s`) makes nimsem resolve the ident to the *own
+    module* ("got: (module)") and fail with misleading type errors.
+    Name probes something neutral.
+29. **nimony `echo` varargs quirk**: expression-position calls are not
+    statement calls — builtin rewrites that change shape (`Pos`,
+    `Copy`, `Delete`, `Insert`) must hook the *primary* call builder,
+    not only the statement-level call site.

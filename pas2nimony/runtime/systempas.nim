@@ -17,6 +17,17 @@ import std/[strutils, syncio]
 # ---------------------------------------------------------------------------
 # string operators (Pascal uses + for concatenation)
 
+proc strDelete*(s: var string; idx, cnt: int32) =
+  ## Delphi Delete(s, idx, cnt): remove cnt chars starting at 1-based idx.
+  ## substr clamping keeps out-of-range calls well-defined.
+  if cnt <= 0 or idx < 1: return
+  s = substr(s, 0, idx - 2) & substr(s, idx - 1 + cnt)
+
+proc strInsert*(src: string; s: var string; idx: int32) =
+  ## Delphi Insert(src, s, idx): insert src before the 1-based idx
+  if idx < 1: return
+  s = substr(s, 0, idx - 2) & src & substr(s, idx - 1)
+
 proc ChrToStr*(c: char): string =
   result = ""
   result.add(c)
