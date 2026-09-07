@@ -60,6 +60,10 @@ type
     varTypes*: Table[string, string] ## lowercase var name -> "set"|"other"
     paramTypes*: Table[string, string] ## current routine's param name -> mapped type
     fieldTypes*: Table[string, string] ## "class.field" (lowercase) -> mapped type
+    paramClassTypes*: Table[string, string]
+    methodPtrTypes*: Table[string, Node] ## method-ptr type name -> its formal params
+    methodPtrVars*: Table[string, Node] ## var/field/param/prop name -> its formal params
+    thunkCounter*: int                 ## synthesized event-thunk serial
     absorbed*: UnitSet               ## shared unit-absorption cycle guard
     unitFiles*: Table[string, string] ## lowercase unit name -> module file stem
     classOfProc*: string        ## class the current routine belongs to
@@ -523,6 +527,7 @@ proc primary(p: var TParser): Node =
         # nested routines see `self` implicitly
         result.add(newIdentNode("self", a.info))
       result = mapStringBuiltins(p, result)
+      result = p.rewriteMethodPtrCall(result)
     of pxDot:
       let a = result
       result = newNode(nkDotExpr, a.info)
@@ -564,7 +569,7 @@ proc lowestExprAux(p: var TParser, v: var Node, limit: int): TTokKind =
     node.add(opNode)
     node.add(v)
     node.add(v2)
-    v = node
+    v = p.rewriteMethodPtrNilCmp(node)
     op = nextop
     opPred = getPrecedence(nextop)
   result = op
@@ -746,7 +751,16 @@ proc parseParamList*(p: var TParser): Node =
           else: vt.add(newIdentNode("untyped", p.tok.info))
           d.add(vt)
         elif lastType.kind != nkEmpty:
-          d.add(lastType)
+          # Delphi value params are locally mutable; a method-pointer
+          # param's evProc/evObj fields are assigned in the body, so
+          # lower them as var params
+          if lastType.kind == nkIdent and
+              p.methodPtrTypes.hasKey(lastType.strVal.toLowerAscii):
+            let vt = newNode(nkVarTy, p.tok.info)
+            vt.add(lastType)
+            d.add(vt)
+          else:
+            d.add(lastType)
         else:
           d.add(newIdentNode("untyped", p.tok.info))
         if def.kind != nkEmpty: d.add(def) else: d.add(emptyNode(p.tok.info))
@@ -842,6 +856,11 @@ proc parseVarSection*(p: var TParser): Node =
           p.varTypes[defs[i].strVal.toLowerAscii] = "set"
     elif tyNode.kind == nkIdent:
       let tyKey = tyNode.strVal.toLowerAscii
+      if p.methodPtrTypes.hasKey(tyKey):
+        for i in 0 ..< defs.len - 2:
+          if defs[i].kind == nkIdent:
+            p.methodPtrVars[defs[i].strVal.toLowerAscii] =
+              p.methodPtrTypes.getOrDefault(tyKey)
       if p.syms.isClass(tyKey):
         for i in 0 ..< defs.len - 2:
           if defs[i].kind == nkIdent:
@@ -1025,6 +1044,12 @@ proc parseRecordBody(p: var TParser, result: Node, definition: Node) =
             if mty.len > 0:
               p.fieldTypes[p.selfClass.toLowerAscii & "." &
                            defs[i].strVal.toLowerAscii] = mty
+        if defs[1].kind == nkIdent and
+            p.methodPtrTypes.hasKey(defs[1].strVal.toLowerAscii):
+          for i in 0 ..< defs.len - 2:
+            if defs[i].kind == nkIdent:
+              p.methodPtrVars[defs[i].strVal.toLowerAscii] =
+                p.methodPtrTypes.getOrDefault(defs[1].strVal.toLowerAscii)
       skipCom(p)
       body.add(defs)
       p.opt(pxSemiColon)
@@ -1170,6 +1195,10 @@ proc parseProperty*(p: var TParser): Node =
   p.eat(pxColon)
   skipCom(p)
   decl.typ = parseTypeDesc(p, emptyNode(p.tok.info))
+  if decl.typ.kind == nkIdent and
+      p.methodPtrTypes.hasKey(decl.typ.strVal.toLowerAscii):
+    p.methodPtrVars[propName.toLowerAscii] =
+      p.methodPtrTypes.getOrDefault(decl.typ.strVal.toLowerAscii)
   skipCom(p)
   while p.tok.xkind != pxEof and p.tok.xkind != pxSemiColon:
     if p.tok.xkind == pxSymbol:
@@ -1210,6 +1239,201 @@ proc parseProperty*(p: var TParser): Node =
     p.syms.setArrayProp(decl.cls, decl.name, decl.readId, decl.writeId,
                         "", "")
 
+proc newDotP(base: Node; name: string): Node =
+  result = newNode(nkDotExpr, base.info)
+  result.add(base)
+  result.add(newIdentNode(name, base.info))
+
+proc isNilNode(n: Node): bool =
+  n.kind == nkNilLit or
+  (n.kind == nkIdent and n.strVal.toLowerAscii == "nil")
+
+proc methodPtrLeafName(n: Node): string =
+  ## lowercase method-ptr field name for `<base>.ev` or bare `ev`
+  if n.kind == nkDotExpr and n[1].kind == nkIdent:
+    result = n[1].strVal.toLowerAscii
+  elif n.kind == nkIdent:
+    result = n.strVal.toLowerAscii
+  else:
+    result = ""
+
+proc methodPtrRecord(p: var TParser; nameNode, procTy: Node): Node =
+  ## `T = procedure(...) of object` ->
+  ## `T = object evProc: proc(self: RootRef; ...); evObj: RootRef`
+  let params = procTy[0]
+  p.methodPtrTypes[nameNode.strVal.toLowerAscii] = params
+  let info = nameNode.info
+  var recList = newNode(nkRecList, info)
+  var fp = newNode(nkFormalParams, info)
+  fp.add(emptyNode(info))            # return slot
+  var sd = newNode(nkIdentDefs, info)
+  sd.add(newIdentNode("self", info))
+  sd.add(newIdentNode("RootRef", info))
+  sd.add(emptyNode(info))
+  fp.add(sd)
+  for i in 1 ..< params.len:
+    fp.add(params[i])
+  var pt = newNode(nkProcTy, info)
+  pt.add(fp)
+  pt.add(emptyNode(info))
+  var fd = newNode(nkIdentDefs, info)
+  fd.add(newIdentNode("evProc", info))
+  fd.add(pt)
+  fd.add(emptyNode(info))
+  recList.add(fd)
+  var od = newNode(nkIdentDefs, info)
+  od.add(newIdentNode("evObj", info))
+  od.add(newIdentNode("RootRef", info))
+  od.add(emptyNode(info))
+  recList.add(od)
+  result = newNode(nkObjectTy, info)
+  result.isRecordType = true
+  result.add(emptyNode(info))
+  result.add(recList)
+
+proc methodPtrThunk(p: var TParser; cls, handler: string; params: Node;
+                    info: TLineInfo): string =
+  ## synthesize `proc pasThunkN(self: RootRef; <params>) =
+  ##   cast[Cls](self).Handler(<params>)` at module level
+  inc p.thunkCounter
+  result = "pasThunk" & $p.thunkCounter
+  var def = newNode(nkProcDef, info)
+  def.add(newIdentNode(result, info))
+  def.add(emptyNode(info))           # generic params
+  var fp = newNode(nkFormalParams, info)
+  fp.add(emptyNode(info))            # return slot
+  var sd = newNode(nkIdentDefs, info)
+  sd.add(newIdentNode("self", info))
+  sd.add(newIdentNode("RootRef", info))
+  sd.add(emptyNode(info))
+  fp.add(sd)
+  for i in 1 ..< params.len:
+    fp.add(params[i])
+  def.add(fp)
+  var pragmas = newNode(nkPragma, info)
+  pragmas.add(newIdentNode("raises", info))
+  def.add(pragmas)
+  def.add(emptyNode(info))           # exceptions
+  var castN = newNode(nkCast, info)
+  castN.add(newIdentNode(cls, info))
+  castN.add(newIdentNode("self", info))
+  var call = newNode(nkCall, info)
+  call.add(newDotP(castN, handler))
+  for i in 1 ..< params.len:
+    if params[i].kind == nkIdentDefs:
+      call.add(newIdentNode(params[i][0].strVal, info))
+  var body = newNode(nkStmtList, info)
+  body.add(call)
+  def.add(body)
+  p.module.add(def)
+
+proc methodPtrFieldBase(p: var TParser; n: Node): Node =
+  ## a property access used as a method-pointer base maps to its
+  ## backing field (`Btn.OnClick` -> `Btn.FOnClick`); the property
+  ## template only inlines in the .nim path, the NIF path needs the
+  ## real field
+  result = n
+  if n.kind != nkDotExpr or n.len != 2 or n[1].kind != nkIdent:
+    return
+  let leaf = n[1].strVal.toLowerAscii
+  for pr in p.props:
+    if pr.params == nil and pr.name.toLowerAscii == leaf:
+      let fld = if pr.writeId.len > 0: pr.writeId else: pr.readId
+      if fld.len > 0:
+        result = newDotP(n[0], fld)
+      return
+
+proc rewriteMethodPtrAsgn(p: var TParser; a, b: Node; info: TLineInfo): Node =
+  ## `ev := Handler` / `x.ev := X.Handler` / `x.ev := nil` ->
+  ## two assignments on the evProc/evObj fields
+  result = emptyNode(info)
+  let evName = methodPtrLeafName(a)
+  if evName.len == 0 or not p.methodPtrVars.hasKey(evName):
+    return
+  let params = p.methodPtrVars.getOrDefault(evName)
+  let a = p.methodPtrFieldBase(a)
+  var procAsgn = emptyNode(info)
+  var objAsgn = emptyNode(info)
+  if isNilNode(b):
+    procAsgn = newNode(nkAsgn, info)
+    procAsgn.add(newDotP(a, "evProc"))
+    var nilN = newNode(nkNilLit, info)
+    procAsgn.add(nilN)
+    objAsgn = newNode(nkAsgn, info)
+    objAsgn.add(newDotP(a, "evObj"))
+    objAsgn.add(newNode(nkNilLit, info))
+  elif b.kind == nkDotExpr and b[0].kind == nkIdent and b[1].kind == nkIdent:
+    # `X.Handler`: bind X's instance, cast in the thunk
+    let xTy = p.varTypes.getOrDefault(b[0].strVal.toLowerAscii)
+    var cls = ""
+    if xTy.startsWith("class:"):
+      cls = xTy["class:".len .. ^1]
+    elif p.paramClassTypes.getOrDefault(b[0].strVal.toLowerAscii).len > 0:
+      # X is a routine parameter of class type
+      cls = p.paramClassTypes.getOrDefault(b[0].strVal.toLowerAscii)
+    elif b[0].strVal.toLowerAscii == "self" and p.selfClass.len > 0:
+      cls = p.selfClass
+    if cls.len > 0 and p.syms.classSpelling(cls).len > 0:
+      let spelling = p.syms.classSpelling(cls)
+      if spelling.len > 0:
+        let tname = p.methodPtrThunk(spelling, b[1].strVal, params, info)
+        procAsgn = newNode(nkAsgn, info)
+        procAsgn.add(newDotP(a, "evProc"))
+        procAsgn.add(newIdentNode(tname, info))
+        objAsgn = newNode(nkAsgn, info)
+        objAsgn.add(newDotP(a, "evObj"))
+        objAsgn.add(b[0])
+  elif b.kind == nkIdent:
+    # bare `Handler` inside a method: bind `self`
+    if p.selfClass.len > 0:
+      let spelling = p.syms.classSpelling(p.selfClass)
+      if spelling.len > 0:
+        let tname = p.methodPtrThunk(spelling, b.strVal, params, info)
+        procAsgn = newNode(nkAsgn, info)
+        procAsgn.add(newDotP(a, "evProc"))
+        procAsgn.add(newIdentNode(tname, info))
+        objAsgn = newNode(nkAsgn, info)
+        objAsgn.add(newDotP(a, "evObj"))
+        objAsgn.add(newIdentNode("self", info))
+  if procAsgn.kind != nkEmpty:
+    result = newNode(nkStmtList, info)
+    result.add(procAsgn)
+    result.add(objAsgn)
+
+proc rewriteMethodPtrCall(p: var TParser; n: Node): Node =
+  ## `ev(args)` / `x.ev(args)` -> `ev.evProc(ev.evObj, args)`
+  if n.kind != nkCall or n.len == 0: return n
+  let evName = methodPtrLeafName(n[0])
+  if evName.len == 0 or not p.methodPtrVars.hasKey(evName):
+    return n
+  let base = p.methodPtrFieldBase(n[0])
+  var call = newNode(nkCall, n.info)
+  call.add(newDotP(base, "evProc"))
+  call.add(newDotP(base, "evObj"))
+  for i in 1 ..< n.len:
+    call.add(n[i])
+  return call
+
+proc rewriteMethodPtrNilCmp(p: var TParser; n: Node): Node =
+  ## `ev = nil` / `ev <> nil` -> compare the evProc field
+  if n.kind != nkInfix or n.len != 3: return n
+  let op = n[0].strVal
+  if op != "==" and op != "!=": return n
+  var mpSide = emptyNode(n.info)
+  if isNilNode(n[2]):
+    mpSide = n[1]
+  elif isNilNode(n[1]):
+    mpSide = n[2]
+  if mpSide.kind == nkEmpty: return n
+  let evName = methodPtrLeafName(mpSide)
+  if evName.len == 0 or not p.methodPtrVars.hasKey(evName):
+    return n
+  let base = p.methodPtrFieldBase(mpSide)
+  result = newNode(nkInfix, n.info)
+  result.add(n[0])
+  result.add(newDotP(base, "evProc"))
+  result.add(newNode(nkNilLit, n.info))
+
 proc parseTypeDef*(p: var TParser): Node =
   ## one `Name = type` definition
   result = newNodeP(nkTypeDef, p)
@@ -1240,6 +1464,10 @@ proc parseTypeDef*(p: var TParser): Node =
       result.add(parseRecordOrObject(p, nkObjectTy, nameNode))
     else:
       result.add(parseTypeDesc(p, nameNode))
+    # `procedure of object` -> method-pointer record (evProc/evObj)
+    if result.len == 3 and result[2].kind == nkProcTy and
+        result[2].len > 1 and result[2][1].kind == nkPragma:
+      result[2] = p.methodPtrRecord(result[0], result[2])
   else:
     result.add(emptyNode(nameInfo))
   if p.tok.xkind == pxSemiColon:
@@ -1472,6 +1700,19 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
           for j in 0 ..< d.len - 2:
             if d[j].kind == nkIdent:
               p.paramTypes[d[j].strVal.toLowerAscii] = mty
+        let pty0 = d[d.len - 2]
+        let pty = if pty0.kind == nkVarTy and pty0.len > 0: pty0[0] else: pty0
+        if pty.kind == nkIdent:
+          let pcls = p.syms.classSpelling(pty.strVal)
+          if pcls.len > 0:
+            for j in 0 ..< d.len - 2:
+              if d[j].kind == nkIdent:
+                p.paramClassTypes[d[j].strVal.toLowerAscii] = pcls
+          if p.methodPtrTypes.hasKey(pty.strVal.toLowerAscii):
+            for j in 0 ..< d.len - 2:
+              if d[j].kind == nkIdent:
+                p.methodPtrVars[d[j].strVal.toLowerAscii] =
+                  p.methodPtrTypes.getOrDefault(pty.strVal.toLowerAscii)
     # remember the param names for bare `inherited;` forwarding
     p.outerParams = @[]
     for i in 1 ..< params.len:
@@ -1792,6 +2033,17 @@ proc mapStringBuiltins*(p: var TParser, n: Node): Node =
   if n.kind != nkCall or n.len == 0: return n
   if n[0].kind != nkIdent: return n
   case n[0].strVal.toLowerAscii
+  of "assigned":
+    # Assigned(ev) -> ev.evProc != nil for method pointers
+    if n.len == 2:
+      let evName = methodPtrLeafName(n[1])
+      if evName.len > 0 and p.methodPtrVars.hasKey(evName):
+        var ne = newNode(nkInfix, n.info)
+        ne.add(newIdentNode("!=", n.info))
+        ne.add(newDotP(n[1], "evProc"))
+        ne.add(newNode(nkNilLit, n.info))
+        return ne
+    return n
   of "pos":
     # Pos(sub, s) is 1-based (0 when absent); find is 0-based (-1 absent):
     # find(s, sub) + 1 maps exactly
@@ -2064,7 +2316,10 @@ proc parseStmt*(p: var TParser): Node =
       result = newNode(nkAsgn, info)
       result.add(a)
       result.add(b)
-      if a.kind == nkIdent and p.varTypes.getOrDefault(
+      let mpAsgn = p.rewriteMethodPtrAsgn(a, b, info)
+      if mpAsgn.kind != nkEmpty:
+        result = mpAsgn
+      elif a.kind == nkIdent and p.varTypes.getOrDefault(
           a.strVal.toLowerAscii) == "set" and b.kind == nkBracket:
         # set literal assignment
         b.kind = nkCurly
@@ -2496,6 +2751,52 @@ proc parseUnit*(p: var TParser): Node =
       p.module.add(s)
     p.opt(pxSemiColon)
     skipCom(p)
+  # Delphi's inherited TObject.Create: synthesize a default no-arg
+  # constructor for ref classes that declare none (deterministic order)
+  var ctorless: seq[string] = @[]
+  for key, ci in p.syms.classes:
+    # only when neither the class nor any ancestor declares a
+    # constructor; otherwise the inherited-ctor path applies
+    if ci.isRef and p.syms.findCtorClass(key, "create").len == 0:
+      ctorless.add(key)
+  var sortedCtorless: seq[string] = @[]
+  for key in ctorless:
+    var pos = sortedCtorless.len
+    for i in 0 ..< sortedCtorless.len:
+      if key < sortedCtorless[i]:
+        pos = i
+        break
+    var rebuilt: seq[string] = @[]
+    for i in 0 ..< sortedCtorless.len:
+      if i == pos: rebuilt.add(key)
+      rebuilt.add(sortedCtorless[i])
+    if pos == sortedCtorless.len: rebuilt.add(key)
+    sortedCtorless = rebuilt
+  var synthCtors: seq[Node] = @[]
+  for key in sortedCtorless:
+    let ci = p.syms.classes.getOrDefault(key)
+    let info = TLineInfo(line: 0, col: 0, file: p.module.info.file)
+    var def = newNode(nkProcDef, info)
+    def.add(exSymbol(newIdentNode("create", info), false))
+    def.add(emptyNode(info))
+    var fp = newNode(nkFormalParams, info)
+    fp.add(newIdentNode(ci.spelling, info))
+    var sd = newNode(nkIdentDefs, info)
+    sd.add(newIdentNode("self", info))
+    sd.add(newIdentNode(ci.spelling, info))
+    sd.add(emptyNode(info))
+    fp.add(sd)
+    def.add(fp)
+    def.add(emptyNode(info))
+    def.add(emptyNode(info))
+    var body = newNode(nkStmtList, info)
+    var asgn = newNode(nkAsgn, info)
+    asgn.add(newIdentNode("result", info))
+    asgn.add(newIdentNode("self", info))
+    body.add(asgn)
+    def.add(body)
+    p.syms.addCtor(key, "create")
+    synthCtors.add(def)
   genPropertyAccessors(p, p.module)
   selfQualifyAll(p, p.module)
   for i in 0 ..< p.module.len:
@@ -2518,10 +2819,12 @@ proc parseUnit*(p: var TParser): Node =
     if not inserted and n.kind notin {nkImportStmt, nkCommentStmt,
         nkTypeSection, nkVarSection, nkConstSection, nkProcDef, nkFuncDef,
         nkMethodDef, nkTemplateDef, nkWhenExpr}:
+      for c in synthCtors: final.add(c)
       for a in accessors: final.add(a)
       inserted = true
     final.add(n)
   if not inserted:
+    for c in synthCtors: final.add(c)
     for a in accessors: final.add(a)
   var m = newNode(nkStmtList, p.module.info)
   for n in final: m.add(n)

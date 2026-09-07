@@ -132,7 +132,8 @@ semantics · ❌ rejected with a clear error (phase-2 lowerings)
 | `class` | `ref object of RootRef` | `{.inheritable.}` always emitted |
 | `class(T)` / inheritance | `ref object of T` | parent gets `{.inheritable.}` |
 | `object` / `object(T)` | `object` / `object of T` | value objects support inheritance via `{.inheritable.}` |
-| `procedure of object` | `proc (…) {.closure.}` | the implicit `self` parameter is dropped (bound-method gap, phase 2) |
+| `procedure of object` | record `{evProc: proc …; evObj: RootRef}` | bound method pointer (M4-3): `x.ev := X.H` lowers to two field asgns plus a module-level thunk `pasThunkN(self, …)` casting the bound instance back; `ev(args)` → `ev.evProc(ev.evObj, args)`; `Assigned(ev)` / `ev = nil` compare the `evProc` field. Works through fields, properties (mapped to the backing field), local vars and params (lowered as `var` so the body can rebind them; seed them by passing a method-pointer variable — plain record copy). Limits: passing a method *name* as a call-site argument is not marshaled yet; `function of object` untested; nested `A.B.Handler` bases unhandled |
+| class without a constructor | synthesized `proc create(self: T): T` | Delphi's inherited `TObject.Create`; only when no ancestor declares a constructor either |
 | `class var` | module-level `var` | one global per class, name kept |
 | enums | `enum` (keyword form) | |
 

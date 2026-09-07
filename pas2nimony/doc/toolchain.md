@@ -194,3 +194,24 @@ translator itself — keep current:
     statement calls — builtin rewrites that change shape (`Pos`,
     `Copy`, `Delete`, `Insert`) must hook the *primary* call builder,
     not only the statement-level call site.
+30. **Never truth-test a Node sentinel with `!= nil`**: `emptyNode(info)`
+    returns a valid object, so `if x != nil:` is always true — the asgn
+    rewrite silently replaced statements with the empty node and the
+    module loop turned them into `#` comments. Sentinel checks must be
+    `.kind != nkEmpty`.
+31. **Property templates only inline in the `.nim` path**: nimsem on
+    parsed NIF does not resolve `(dot obj Prop)` through the accessor
+    template (`undeclared field: 'Prop'`). Lowerings that must work in
+    both paths (method-pointer asgns/calls/nil tests) map a property
+    base to its backing field first.
+32. **`procedure of object` lowering**: nimony closures segfault and
+    anonymous thunks fail nil-proofs; the working shape is a two-field
+    record (`evProc`/`evObj`) plus *named module-level thunks* that
+    `cast` the `RootRef` self back to the handler's class. The same
+    record needs an inline `(proctype …)` in the NIF fld slot — a dot
+    type loses the field entirely.
+33. **Inherited constructors**: `Third.create(…)` on a ctor-less class
+    resolves through the *ancestor's* ctor and needs the cast-back;
+    synthesize a default no-arg `create` only when no ancestor
+    declares one either, or the synthesis hijacks inherited-ctor
+    overload resolution.

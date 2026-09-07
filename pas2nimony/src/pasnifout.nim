@@ -132,8 +132,10 @@ proc emitExpr(e: var NifEmitter; n: Node) =
       for j in 1 ..< n.len:
         e.emitExpr(n[j])
   of nkCast:
-    # `T(x)` shape used by the translator: (cast type expr)? emit as call
-    e.emitCall(n)
+    # nifler parses `cast[T](x)` as (cast T x)
+    e.buf.copyInto(globalTags.registerTag("cast"), e.info(n)):
+      e.emitTypeDesc(n[0])
+      e.emitExpr(n[1])
   of nkPar:
     if n.len == 1:
       e.emitExpr(n[0])
@@ -176,6 +178,15 @@ proc emitTypeDesc(e: var NifEmitter; n: Node) =
       e.emitTypeDesc(n[0])
   of nkPtrTy, nkRefTy:
     e.buf.addIdent("ptr", i)
+  of nkProcTy:
+    # inline procedure type: (proctype .... (params ...) ret . . .)
+    e.buf.copyInto(globalTags.registerTag("proctype"), i):
+      for k in 0 ..< 4:
+        e.buf.addDotToken(i)
+      e.emitParamList(n[0])
+      e.emitTypeDesc(n[0][0])
+      for k in 0 ..< 3:
+        e.buf.addDotToken(i)
   of nkEmpty:
     e.buf.addDotToken(i)
   else:

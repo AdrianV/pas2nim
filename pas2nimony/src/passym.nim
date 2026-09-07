@@ -101,6 +101,11 @@ proc lookupClass*(t: SymTab; name: string): ClassInfo =
 proc isClass*(t: SymTab; name: string): bool =
   t.classes.hasKey(name.toLowerAscii)
 
+proc classSpelling*(t: SymTab; name: string): string =
+  ## declared spelling of a class type; "" when unknown
+  let ci = t.classes.getOrDefault(name.toLowerAscii)
+  result = ci.spelling
+
 proc addField*(t: var SymTab; cls, spelling: string) =
   ## record a field declaration of class `cls`
   let key = cls.toLowerAscii

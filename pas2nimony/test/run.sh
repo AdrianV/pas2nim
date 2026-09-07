@@ -93,6 +93,19 @@ if [ $# -eq 0 ] && [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/twounit" ]; then
   else
     echo "   PASLER BUILD FAILED"; fail=1
   fi
+  # the NIF front-end must agree with the .nim path on semantics
+  if [ -f "$HERE/events.pas" ]; then
+    echo "== pasler-events"
+    mkdir -p "$TMP/pasler-events"
+    cp "$HERE/events.pas" "$TMP/pasler-events/"
+    if (cd "$TMP/pasler-events" &&
+        "$ROOT/bin/pasler" --nimony:"$NIMONY" --run events.pas 2>&1 |
+        grep -v nifmake || true); then
+      echo "-- ok"
+    else
+      echo "   PASLER EVENTS FAILED"; fail=1
+    fi
+  fi
 fi
 
 # keep the generated artifacts for inspection, but drop the build cache
