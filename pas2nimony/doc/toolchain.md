@@ -215,3 +215,20 @@ translator itself — keep current:
     synthesize a default no-arg `create` only when no ancestor
     declares one either, or the synthesis hijacks inherited-ctor
     overload resolution.
+34. **nimony reserves `Exception`**: the system module predefines it, so
+    a prelude class of that name is unreachable — spell the runtime
+    type `PasException` and alias the Pascal name through the
+    registry (`names["exception"]`, plus a `classes` entry so lookups
+    by the Pascal name resolve).
+35. **`T(x)` cast-calls trip the nil-proof across modules**: an
+    inherited-ctor call lowered as `Parent(self)` fails with
+    "cannot prove expression is not nil" when the parent lives in an
+    imported module — `cast[Parent](self)` is the reliable form.
+36. **Ref upcast assignments need provably-non-nil sources**: assigning
+    a routine-call result to a base-typed var fails the nil-proof
+    (`cannot prove expression is not nil`) — wrap the RHS in
+    `cast[Base](...)`.
+37. **A local declaration shadows an imported one entirely** (no
+    cross-module overload resolution): a subclass's own `create`
+    hides the prelude's constructor even for `inherited` calls —
+    give prelude routines non-colliding names (`pasExcCreate`).

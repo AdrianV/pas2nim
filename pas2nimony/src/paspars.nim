@@ -126,6 +126,17 @@ proc openParser*(p: var TParser, filename: string, flags: set[TParserFlag]) =
   p.absorbed = us
   p.unitFiles = initTable[string, string]()
   p.module = newNode(nkStmtList, TLineInfo(line: 0, col: 0, file: filename))
+  # predeclared System-unit exception class (M4-2): instances ride
+  # systempas' current-exception slot; ErrorCode stays the transport.
+  # The Nim spelling is PasException (Nim's system reserves
+  # `Exception`); the Pascal name aliases it in the registries
+  p.syms.registerClass("PasException", "", true)
+  p.syms.addField("PasException", "Message")
+  p.syms.addCtor("PasException", "create")
+  p.syms.returnsValue["pasexccreate"] = true
+  p.syms.names["exception"] = "PasException"
+  var excAlias = p.syms.classes.getOrDefault("pasexception")
+  p.syms.classes["exception"] = excAlias
   getTokP(p)
 
 proc closeParser*(p: var TParser) =
@@ -1755,7 +1766,9 @@ proc parseInherited*(p: var TParser): Node =
   if parent.len == 0:
     parError(p, "no parent class for `inherited`")
   let selfNode = newIdentNode("self", info)
-  let parentCast = newNode(nkCall, info)
+  # cast[], not the T(x) call form: the call form trips nimsem's
+  # nil-proof when the parent lives in another module
+  let parentCast = newNode(nkCast, info)
   parentCast.add(newIdentNode(parent, info))
   parentCast.add(selfNode)
   if p.tok.xkind == pxSemiColon:
@@ -1789,15 +1802,27 @@ proc parseInherited*(p: var TParser): Node =
     # a bare call statement comes back discard-wrapped; unwrap it
     if a.kind == nkDiscardStmt and a.len > 0 and a[0].kind == nkCall:
       a = a[0]
+    # the prelude exception ctor is named pasExcCreate in systempas
+    # (a user `create` would shadow it)
+    let parentIsPrelude =
+      p.syms.classSpelling(parent) == "PasException" and
+      a.kind == nkCall and a.len > 0 and a[0].kind == nkIdent and
+      a[0].strVal.toLowerAscii == "create"
     if a.kind == nkCall:
       call = newNode(nkCall, a.info)
-      call.add(a[0])
+      if parentIsPrelude:
+        call.add(newIdentNode("pasExcCreate", a.info))
+      else:
+        call.add(a[0])
       call.add(parentCast)
       for i in 1 ..< a.len:
         call.add(a[i])
     else:
       call = newNode(nkCall, a.info)
-      call.add(a)
+      if parentIsPrelude:
+        call.add(newIdentNode("pasExcCreate", a.info))
+      else:
+        call.add(a)
       call.add(parentCast)
     call.noQualCallee = true
     if p.outerIsMethod:
@@ -1878,14 +1903,39 @@ proc parseTry*(p: var TParser): Node =
         code = excSpelling(excTy[1].strVal.toLowerAscii)
       if code.len == 0:
         code = "Failure"
-      # except ErrorCode as varName: case varName of code: handler
+      # except ErrorCode as <hidden>: case <hidden> of code:
+      #   var varName: ExcTy = pasCurrentExc; handler
+      # the Pascal exception variable binds the INSTANCE (M4-2), the
+      # ErrorCode rides a hidden binding
+      inc p.thunkCounter
+      let hidName = "pasECode" & $p.thunkCounter
+      let varDecl = newNode(nkVarSection, info)
+      let vd = newNode(nkIdentDefs, info)
+      vd.add(newIdentNode(varName, info))
+      vd.add(excTy)
+      # the ErrorCode filter cannot prove the instance class: downcast
+      let instCast = newNode(nkCast, info)
+      instCast.add(excTy)
+      instCast.add(newIdentNode("pasCurrentExc", info))
+      vd.add(instCast)
+      varDecl.add(vd)
+      var body = handler
+      if body.kind != nkStmtList:
+        let sl = newNode(nkStmtList, info)
+        sl.add(body)
+        body = sl
+      # prepend the instance binding (rebuild: nimony seq has no insert)
+      let body2 = newNode(nkStmtList, info)
+      body2.add(varDecl)
+      for s in body.sons: body2.add(s)
+      body = body2
       b.add(newIdentNode("ErrorCode", info))
-      b.add(newIdentNode(varName, info))
+      b.add(newIdentNode(hidName, info))
       let caseNode = newNode(nkCaseStmt, info)
-      caseNode.add(newIdentNode(varName, info))
+      caseNode.add(newIdentNode(hidName, info))
       let ofBranch = newNode(nkOfBranch, info)
       ofBranch.add(newIdentNode(code, info))
-      ofBranch.add(handler)
+      ofBranch.add(body)
       caseNode.add(ofBranch)
       let elseB = newNode(nkElse, info)
       let skip = newNode(nkStmtList, info)
@@ -2201,29 +2251,49 @@ proc parseStmt*(p: var TParser): Node =
   of pxFor:
     result = parseFor(p)
   of pxRaise:
-    result = newNodeP(nkRaiseStmt, p)
     getTokP(p)
     skipCom(p)
     if p.tok.xkind != pxSemiColon:
+      # `raise SomeExc.Create(args)` / `raise excInstance`:
+      # stash the instance in the current-exception slot, then raise
+      # the mapped ErrorCode (nimony raise only transports ErrorCode)
       let e = parseExpr(p)
-      # Delphi: `raise SomeE.Create(msg)` -> `raise SomeErrorCode`
+      var code = ""
       if e.kind == nkCall and e.len >= 1 and e[0].kind == nkDotExpr and
           e[0][1].kind == nkIdent and
           e[0][1].strVal.toLowerAscii == "create":
         let excName = e[0][0]
-        var code = ""
         if excName.kind == nkIdent:
           code = excSpelling(excName.strVal.toLowerAscii)
-        if code.len == 0: code = "Failure"
-        result.add(newIdentNode(code, e.info))
-      elif e.kind == nkCall and e.len >= 2 and e[1].kind == nkDotExpr and
-          e[1][1].kind == nkIdent and
-          e[1][1].strVal.toLowerAscii == "create":
-        # method-call form: ESome.Create(...)
-        discard
+        elif excName.kind == nkDotExpr:
+          code = excSpelling(excName[1].strVal.toLowerAscii)
       else:
-        result.add(e)
+        # re-raising a captured instance: map its class if it is one
+        var base = e
+        if base.kind == nkDotExpr and base.len == 2:
+          base = base[1]
+        if base.kind == nkIdent:
+          let vt = p.varTypes.getOrDefault(base.strVal.toLowerAscii)
+          if vt.startsWith("class:"):
+            code = excSpelling(p.syms.classSpelling(vt[6..^1]))
+      if code.len == 0: code = "Failure"
+      let stmts = newNode(nkStmtList, p.tok.info)
+      let stash = newNode(nkAsgn, p.tok.info)
+      stash.add(newIdentNode("pasCurrentExc", p.tok.info))
+      # cast[]: the upcast of a not-provably-non-nil call result trips
+      # nimsem's nil-proof
+      let stashCast = newNode(nkCast, p.tok.info)
+      stashCast.add(newIdentNode("PasException", p.tok.info))
+      stashCast.add(e)
+      stash.add(stashCast)
+      stmts.add(stash)
+      let rn = newNode(nkRaiseStmt, p.tok.info)
+      rn.add(newIdentNode(code, p.tok.info))
+      stmts.add(rn)
+      result = stmts
     else:
+      # bare `raise;` re-raise: nimony's own handler re-raise
+      result = newNodeP(nkRaiseStmt, p)
       result.add(emptyNode(p.tok.info))
     p.opt(pxSemiColon)
   of pxInherited:
@@ -2543,8 +2613,14 @@ proc rewriteCtorCalls*(p: var TParser, n: Node): Node =
     let cls = n[0][0].strVal
     let name = n[0][1].strVal
     if p.syms.isCtorOf(cls, name):
+      # the prelude exception ctor is named pasExcCreate in systempas
+      # (a user `create` would shadow it)
+      let callee = if p.syms.findCtorClass(cls, name) == "PasException":
+          "pasExcCreate"
+        else:
+          name
       let newCall = newNode(nkCall, n.info)
-      newCall.add(newIdentNode(name, n.info))
+      newCall.add(newIdentNode(callee, n.info))
       let ctor = newNode(nkCall, n.info)
       ctor.add(newIdentNode(cls, n.info))
       newCall.add(ctor)
@@ -2829,4 +2905,43 @@ proc parseUnit*(p: var TParser): Node =
   var m = newNode(nkStmtList, p.module.info)
   for n in final: m.add(n)
   discard wrapMemberCalls(p, m)
-  result = m
+  # wrap top-level statement blocks in try/except: raising procs may
+  # only be called inside try, and an uncaught Delphi exception reports
+  # the instance message (M4-2)
+  var m2 = newNode(nkStmtList, p.module.info)
+  for n in m.sons:
+    if n.kind == nkStmtList:
+      let wrapper = newNode(nkTryStmt, n.info)
+      wrapper.add(n)
+      let eb = newNode(nkExceptBranch, n.info)
+      eb.add(newIdentNode("ErrorCode", n.info))
+      eb.add(newIdentNode("pasUncaught", n.info))
+      let hbody = newNode(nkStmtList, n.info)
+      let iff = newNode(nkIfStmt, n.info)
+      let elifb = newNode(nkElifBranch, n.info)
+      let cond = newNode(nkInfix, n.info)
+      cond.add(newIdentNode("!=", n.info))
+      cond.add(newIdentNode("pasCurrentExc", n.info))
+      cond.add(newNode(nkNilLit, n.info))
+      elifb.add(cond)
+      let rep = newNode(nkCall, n.info)
+      rep.add(newIdentNode("echo", n.info))
+      let msgcat = newNode(nkInfix, n.info)
+      msgcat.add(newIdentNode("&", n.info))
+      let pre = newNode(nkStrLit, n.info)
+      pre.strVal = "Exception: "
+      msgcat.add(pre)
+      let dot = newNode(nkDotExpr, n.info)
+      dot.add(newIdentNode("pasCurrentExc", n.info))
+      dot.add(newIdentNode("Message", n.info))
+      msgcat.add(dot)
+      rep.add(msgcat)
+      elifb.add(rep)
+      iff.add(elifb)
+      hbody.add(iff)
+      eb.add(hbody)
+      wrapper.add(eb)
+      m2.add(wrapper)
+    else:
+      m2.add(n)
+  result = m2

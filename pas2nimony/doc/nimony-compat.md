@@ -167,9 +167,11 @@ semantics · ❌ rejected with a clear error (phase-2 lowerings)
 | `case x of` | `case x of … else: discard` | ranges supported; implicit `else: discard` |
 | `Exit` | `return` | bare `Exit` → `return` with empty value |
 | `Result` | `result` | |
-| `try … except on E: C do` | `try … except ErrorCode as e: case e of <map>: … else: discard` | **lossy**: nimony's `raise` only carries `ErrorCode` values; no exception instances, no re-raise (see below) |
+| `try … except on E: C do` | `try … except ErrorCode as <hidden>: case <hidden> of <map>: var E: C = cast[C](pasCurrentExc); …` | **instance-binding (M4-2)**: the Pascal variable binds the stashed instance (downcast via `cast[]`); the ErrorCode dispatch stays lossy — distinct classes mapping to the same code share handlers (see below) |
 | `try … finally` | `try … finally` | native |
-| `raise E.Create(msg)` | `raise <ErrorCode-const>` | mapping table `passym.excSpelling`; raising procs get `{.raises.}` |
+| `raise E.Create(msg)` | `pasCurrentExc = cast[PasException](create(...)); raise <ErrorCode-const>` | instance rides the `systempas.pasCurrentExc` slot; ErrorCode via `passym.excSpelling`; raising procs get `{.raises.}` |
+| bare `raise;` (re-raise) | bare `raise` | native nimony handler re-raise; the instance slot keeps the current exception |
+| uncaught exception (program level) | main block wrapped in `try/except` printing `Exception: <Message>` | v1: execution continues after the report (Delphi terminates) |
 | `write/writeln` | `write(stdout, …)` / `echo(…)` | multi-arg `write` folds into one string with `&`/`$` |
 | `s[i]` / `s[i] := c` (string index) | `s[i-1]` | **Delphi 1-based**; literal index 1 folds to 0; bases tracked: vars, params, class fields (incl. bare `self` fields in methods), record fields. Untagged bases (function results, chained `arr[i][j]` into strings, char-typed indices) stay 0-based — documented limitation |
 | `Pos(sub, s)` | `find(s, sub) + 1` | exact Delphi semantics: 1-based, 0 when absent (nimony's `find` returns -1) |
@@ -236,11 +238,15 @@ nimony replaces Nim's exception objects with C-style error codes:
   bare re-`raise` needs `{.raises.}` too;
 - `except ErrorCode as e` catches, `case e of <const>` dispatches.
 
-Delphi's rich exception objects cannot survive this model, so stage 1
-maps them lossily: `on E: C do handler` becomes a `case` over the
-mapped `ErrorCode`; unmatched codes are swallowed (`else: discard`)
-rather than re-raised (a re-raise would force `{.raises.}` onto every
-intermediate Pascal routine — phase 2 can add a propagation mode).
+Delphi's rich exception objects cannot ride `raise` itself, so M4-2
+adds an instance side-channel: `systempas.PasException` (Nim's system
+module reserves the name `Exception`) carries `Message: string`, and a
+module-level `pasCurrentExc` slot connects raise sites to handlers.
+The ErrorCode `case` dispatch stays lossy: distinct classes mapping to
+the same code share handlers, and a handler trusts its declared class
+(the `cast[]` downcast is unchecked). `raise;` re-raise is native.
+The prelude constructor is `pasExcCreate` — a user subclass's own
+`create` must not shadow it in nimony's name resolution.
 
 ## Frontend architecture (stage 2: pasler)
 

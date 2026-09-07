@@ -141,3 +141,22 @@ iterator pforDownto*[T: Ordinal](v: var T, a, b: T): T {.inline.} =
   while v >= b:
     yield v
     dec v
+
+# ---------------------------------------------------------------------------
+# exception instances (M4-2): ErrorCode remains the raise transport; the
+# exception OBJECT rides a module-level current-exception slot that
+# `raise SomeE.Create(msg)` populates and `on E: SomeE do` handlers read
+
+type
+  # spelled PasException: Nim's system module reserves `Exception`
+  PasException* {.inheritable.} = ref object of RootRef
+    Message*: string
+
+var pasCurrentExc*: PasException = PasException(Message: "")
+
+# named pasExcCreate (not `create`): a user subclass's own `create`
+# must not shadow the prelude constructor in nimony's name resolution
+proc pasExcCreate*(self: PasException; msg: string): PasException =
+  ## Delphi Exception.Create: stash the message, return the instance
+  self.Message = msg
+  result = self
