@@ -19,6 +19,10 @@ type
     parent*: string         ## lowercase parent name ("" if none)
     isRef*: bool            ## true for `class`, false for `object`
     isInterface*: bool      ## Delphi `interface` type (M4)
+    classVars*: seq[string] ## declared class var spellings
+    classVarSet*: Table[string, bool]
+    classProcs*: seq[string]  ## declared class method spellings
+    classProcSet*: Table[string, bool]
     fields*: seq[string]    ## declared field spellings (in order)
     routines*: seq[string]  ## member routine spellings (methods, ctors, ...)
     fieldSet*: Table[string, bool]   ## lowercase field name -> true
@@ -158,6 +162,64 @@ proc addCtor*(t: var SymTab; cls, spelling: string) =
   if ci.spelling.len > 0:
     ci.ctorSet[spelling.toLowerAscii] = true
     t.classes[key] = ci
+
+proc addClassVar*(t: var SymTab; cls, spelling: string) =
+  ## record a class var declaration (module-level storage)
+  let key = cls.toLowerAscii
+  var ci = t.classes.getOrDefault(key)
+  if ci.spelling.len > 0:
+    if not ci.classVarSet.hasKey(spelling.toLowerAscii):
+      ci.classVars.add(spelling)
+      ci.classVarSet[spelling.toLowerAscii] = true
+      t.classes[key] = ci
+
+proc isClassVarOf*(t: SymTab; cls, name: string): bool =
+  ## true if `name` is a class var of `cls` or an ancestor
+  let key = cls.toLowerAscii
+  var guard = 0
+  var k = key
+  while k.len > 0 and guard < 100:
+    let ci = t.classes.getOrDefault(k)
+    if ci.spelling.len == 0: break
+    if ci.classVarSet.hasKey(name.toLowerAscii): return true
+    k = ci.parent
+    inc guard
+  return false
+
+proc addClassProc*(t: var SymTab; cls, spelling: string) =
+  ## record a class method declaration (static, no self)
+  let key = cls.toLowerAscii
+  var ci = t.classes.getOrDefault(key)
+  if ci.spelling.len > 0:
+    if not ci.classProcSet.hasKey(spelling.toLowerAscii):
+      ci.classProcs.add(spelling)
+      ci.classProcSet[spelling.toLowerAscii] = true
+      t.classes[key] = ci
+
+proc isClassProcOf*(t: SymTab; cls, name: string): bool =
+  ## true if `name` is a class method of `cls` or an ancestor
+  let key = cls.toLowerAscii
+  var guard = 0
+  var k = key
+  while k.len > 0 and guard < 100:
+    let ci = t.classes.getOrDefault(k)
+    if ci.spelling.len == 0: break
+    if ci.classProcSet.hasKey(name.toLowerAscii): return true
+    k = ci.parent
+    inc guard
+  return false
+
+proc classProcName*(t: SymTab; cls, spelling: string): string =
+  ## the module-level name a class method lowers to
+  let ci = t.classes.getOrDefault(cls.toLowerAscii)
+  let cs = if ci.spelling.len > 0: ci.spelling else: cls
+  result = "pasCm_" & cs & "_" & spelling
+
+proc classVarName*(t: SymTab; cls, spelling: string): string =
+  ## the module-level name a class var lowers to
+  let ci = t.classes.getOrDefault(cls.toLowerAscii)
+  let cs = if ci.spelling.len > 0: ci.spelling else: cls
+  result = "pasCv_" & cs & "_" & spelling
 
 proc isRoutineOf*(t: SymTab; cls, name: string): bool =
   ## true if `name` is a declared routine of `cls` or an ancestor

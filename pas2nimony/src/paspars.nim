@@ -64,6 +64,7 @@ type
     classFieldTypes*: Table[string, string]  ## "cls.field" -> class spelling
     curLabels*: seq[string]     ## declared labels of the current routine
     intfSigs*: Table[string, seq[Node]]  ## interface key -> base-method defs
+    classVarHoist*: seq[Node]   ## class var decls hoisted to module level
     withTemps*: seq[string]     ## hidden per-with temporaries by depth
     withClasses*: seq[string]   ## class spelling per with depth
     withDepth*: int             ## active with-scope count
@@ -1261,6 +1262,49 @@ proc parseRecordBody(p: var TParser, result: Node, definition: Node) =
       discard parseProperty(p)
       p.opt(pxSemiColon)
       skipCom(p)
+    of pxClass:
+      # `class procedure/function` (parseRoutine consumes the prefix),
+      # `class var` (module-level storage), others rejected
+      let pk = p.peekTok().xkind
+      if pk == pxVar:
+        getTokP(p)                  # consume `class`
+        getTokP(p)                  # consume `var`
+        skipCom(p)
+        if p.tok.xkind != pxSymbol:
+          parError(p, "class var name expected, got " & $p.tok)
+        let defs = parseIdentColonEquals(p, false)
+        for i in 0 ..< defs.len - 2:
+          if defs[i].kind != nkIdent:
+            continue
+          let nm = defs[i].strVal
+          p.syms.addClassVar(p.selfClass, nm)
+          let vh = newNode(nkIdentDefs, defs[i].info)
+          let vn = newIdentNode(
+              p.syms.classVarName(p.selfClass, nm), defs[i].info)
+          vn.exported = p.visibility != visPrivate
+          vh.add(vn)
+          vh.add(defs[defs.len - 2])
+          vh.add(defs[defs.len - 1])
+          p.classVarHoist.add(vh)
+        p.opt(pxSemiColon)
+        skipCom(p)
+      elif pk in {pxProcedure, pxFunction}:
+        let rd = parseRoutine(p, true)
+        if rd.kind == nkProcDef and rd.len > 0 and
+            rd[rd.len - 1].kind == nkEmpty:
+          # class methods lower to module-level procs; the bodiless
+          # class-body declaration needs no forward (its name would
+          # even drift through the RTL spelling map: Double -> float64)
+          let c = newNode(nkCommentStmt, rd.info)
+          c.strVal = "# class method: " & rd[0].strVal
+          body.add(c)
+        else:
+          body.add(rd)
+        p.opt(pxSemiColon)
+        skipCom(p)
+      else:
+        parError(p, "unsupported class member: class " & $p.peekTok() &
+            " (v1 supports class procedure/function/var)")
     else:
       parError(p, "class member expected, got " & $p.tok)
       break
@@ -1776,10 +1820,21 @@ proc parseRoutineBody(p: var TParser, result: Node) =
   result.add(stmts)
 
 proc parseRoutine*(p: var TParser; noBody: bool): Node =
-  ## procedure/function/constructor/destructor
+  ## procedure/function/constructor/destructor; also `class procedure`
+  ## / `class function` (v1: static, lowered to module-level procs)
   var noBody = noBody
   var isVirtual: bool = false
-  let kind = p.tok.xkind
+  var isClassProc = false
+  var kind = p.tok.xkind
+  if kind == pxClass:
+    getTokP(p)
+    skipCom(p)
+    if p.tok.xkind in {pxProcedure, pxFunction}:
+      isClassProc = true
+      kind = p.tok.xkind
+    else:
+      parError(p, "unsupported `class` member: class " & $p.tok &
+          " (v1 supports class procedure/function/var)")
   let oldOuterName = p.outerProcName
   let oldOuterIsMethod = p.outerIsMethod
   let oldClass = p.classOfProc
@@ -1817,16 +1872,22 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
     # bodiless member declaration inside an interface class body
     isMethod = true
     p.classOfProc = p.selfClass
-  # name + export marker
-  let nameNode = newIdentNode(name, nameInfo)
+  # name + export marker; class methods lower to module-level names
+  let defName = if isClassProc and isMethod:
+      p.syms.classProcName(p.classOfProc, name)
+    else:
+      name
+  let nameNode = newIdentNode(defName, nameInfo)
   var isExported = p.section == seInterface and p.visibility != visPrivate
   if p.section == seImplementation and
-      p.syms.exportedNames.getOrDefault(name.toLowerAscii, false):
+      (p.syms.exportedNames.getOrDefault(name.toLowerAscii, false) or
+       p.syms.exportedNames.getOrDefault(defName.toLowerAscii, false)):
     # the implementation of an interface-declared routine stays exported;
-    # an unmarked redeclaration would shadow the export
+    # an unmarked redeclaration would shadow the export. Class methods
+    # are keyed by their mangled module-level name.
     isExported = true
   if isExported:
-    p.syms.exportedNames[name.toLowerAscii] = true
+    p.syms.exportedNames[defName.toLowerAscii] = true
   result.add(exSymbol(nameNode, isExported))
   # generic params: none
   result.add(emptyNode(nameInfo))
@@ -1845,8 +1906,8 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
   if kind == pxConstructor and isMethod:
     params[0] = genSelfType(p)
     result.isCtor = true
-  # self parameter for methods
-  if isMethod:
+  # self parameter for methods; class methods take none
+  if isMethod and not isClassProc:
     # value objects get `var self`; class instances a plain ref
     let ci = p.syms.classes.getOrDefault(p.classOfProc.toLowerAscii)
     let selfParam = genSelfParam(p, not ci.isRef)
@@ -1866,8 +1927,14 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
   result.add(emptyNode(nameInfo))  # exceptions (unused)
   # register the routine name
   if kind in {pxFunction, pxConstructor}:
-    p.syms.returnsValue[name.toLowerAscii] = true
-  if isMethod and (isDotted or p.section == seInterface):
+    if isClassProc and isMethod:
+      # call sites emit the mangled module-level name
+      p.syms.returnsValue[defName.toLowerAscii] = true
+    else:
+      p.syms.returnsValue[name.toLowerAscii] = true
+  if isClassProc and isMethod:
+    p.syms.addClassProc(p.classOfProc, name)
+  elif isMethod and (isDotted or p.section == seInterface):
     if kind == pxConstructor or kind == pxDestructor:
       p.syms.addCtor(p.classOfProc, name)
     else:
@@ -1890,7 +1957,7 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
     result.add(emptyNode(nameInfo))
   else:
     p.outerProcName = name
-    p.outerIsMethod = isVirtual and isMethod
+    p.outerIsMethod = isVirtual and isMethod and not isClassProc
     # param types for 1-based string indexing inside the body
     let savedParamTypes = p.paramTypes
     p.paramTypes = initTable[string, string]()
@@ -2866,7 +2933,13 @@ proc parseStmt*(p: var TParser): Node =
     result = parseConstSection(p)
   of pxType:
     result = parseTypeSection(p)
-  of pxProcedure, pxFunction, pxConstructor, pxDestructor:
+  of pxProcedure, pxFunction, pxConstructor, pxDestructor, pxClass:
+    # `class procedure/function` implementations land here too; the
+    # `class` prefix is consumed inside parseRoutine
+    if p.tok.xkind == pxClass and
+        p.peekTok().xkind notin {pxProcedure, pxFunction}:
+      parError(p, "unsupported statement: class " & $p.peekTok() &
+          " (v1 supports class procedure/function)")
     result = parseRoutine(p, false)
   of pxProgram:
     # `program Name;` header - skip; a program is one implementation
@@ -3075,6 +3148,143 @@ proc selfQualifyInPlace(p: var TParser, n: Node,
     return n
   else:
     return selfQualifyKids(p, n, scope)
+
+proc rewriteClassProcCalls(p: var TParser, n: Node): Node =
+  ## `TMath.Double(21)` -> `pasCm_TMath_Double(21)`;
+  ## `obj.Bump(...)` -> the class method without the receiver;
+  ## `TMath.FCount` -> the hoisted module-level var
+  if n.kind == nkCall and n.len >= 1 and n[0].kind == nkDotExpr and
+      n[0][0].kind == nkIdent and n[0][1].kind == nkIdent:
+    let cls = p.syms.classSpelling(n[0][0].strVal)
+    if cls.len > 0 and p.syms.isClassProcOf(cls, n[0][1].strVal):
+      let newCall = newNode(nkCall, n.info)
+      newCall.add(newIdentNode(
+          p.syms.classProcName(cls, n[0][1].strVal), n.info))
+      for i in 1 ..< n.len:
+        newCall.add(n[i])
+      result = newCall
+      for i in 0 ..< result.len:
+        if result.sons[i].len > 0:
+          result.sons[i] = rewriteClassProcCalls(p, result.sons[i])
+      return
+    # instance receiver: `obj.Bump(...)` on a class-method name
+    let vt = p.varTypes.getOrDefault(n[0][0].strVal.toLowerAscii)
+    if vt.startsWith("class:") and
+        p.syms.isClassProcOf(vt[6 ..^ 1], n[0][1].strVal):
+      let newCall = newNode(nkCall, n.info)
+      newCall.add(newIdentNode(
+          p.syms.classProcName(vt[6 ..^ 1], n[0][1].strVal), n.info))
+      for i in 1 ..< n.len:
+        newCall.add(n[i])
+      result = newCall
+      for i in 0 ..< result.len:
+        if result.sons[i].len > 0:
+          result.sons[i] = rewriteClassProcCalls(p, result.sons[i])
+      return
+  if n.kind == nkDotExpr and n.len == 2 and n[0].kind == nkIdent and
+      n[1].kind == nkIdent:
+    let cls = p.syms.classSpelling(n[0].strVal)
+    if cls.len > 0:
+      if p.syms.isClassVarOf(cls, n[1].strVal):
+        return newIdentNode(
+            p.syms.classVarName(cls, n[1].strVal), n.info)
+      if p.syms.isClassProcOf(cls, n[1].strVal):
+        # zero-arg class method used as a value
+        let newCall = newNode(nkCall, n.info)
+        newCall.add(newIdentNode(
+            p.syms.classProcName(cls, n[1].strVal), n.info))
+        return newCall
+  result = n
+  for i in 0 ..< n.len:
+    if n.sons[i].len > 0:
+      n.sons[i] = rewriteClassProcCalls(p, n.sons[i])
+
+proc classQualifyInPlace(p: var TParser, n: Node, cls: string,
+                         scope: var seq[string]): Node
+
+proc classQualifyKids(p: var TParser, n: Node, cls: string,
+                      scope: var seq[string]): Node =
+  result = n
+  for i in 0 ..< n.len:
+    n[i] = classQualifyInPlace(p, n[i], cls, scope)
+
+proc classQualifyInPlace(p: var TParser, n: Node, cls: string,
+                         scope: var seq[string]): Node =
+  ## rewrite bare class-var / class-method names inside the class's
+  ## own routines to their hoisted module-level spellings
+  case n.kind
+  of nkProcDef, nkFuncDef, nkMethodDef:
+    return n          # nested routines carry their own context
+  of nkIdent:
+    let lower = n.strVal.toLowerAscii
+    if lower notin scope and p.syms.isClassVarOf(cls, n.strVal):
+      return newIdentNode(p.syms.classVarName(cls, n.strVal), n.info)
+    return n
+  of nkCommand:
+    # procCall wrapper: keep the inherited callee unqualified
+    n[1] = classQualifyInPlace(p, n[1], cls, scope)
+    return n
+  of nkCall:
+    if n.len >= 1 and n[0].kind == nkIdent and
+        n[0].strVal.toLowerAscii notin scope and
+        p.syms.isClassProcOf(cls, n[0].strVal):
+      let newCall = newNode(nkCall, n.info)
+      newCall.add(newIdentNode(
+          p.syms.classProcName(cls, n[0].strVal), n.info))
+      for i in 1 ..< n.len:
+        newCall.add(classQualifyInPlace(p, n[i], cls, scope))
+      return newCall
+    return classQualifyKids(p, n, cls, scope)
+  of nkDotExpr:
+    # qualify the receiver, never the selector
+    n[0] = classQualifyInPlace(p, n[0], cls, scope)
+    return n
+  of nkStmtList, nkElse, nkFinally, nkOfBranch, nkElifBranch:
+    var inner = scope
+    for s in n.sons:
+      if s.kind in {nkVarSection, nkConstSection, nkTypeSection}:
+        collectScopeNames(s, inner)
+    return classQualifyKids(p, n, cls, inner)
+  else:
+    return classQualifyKids(p, n, cls, scope)
+
+proc hasClassStatics(p: TParser, cls: string): bool =
+  ## true if `cls` or an ancestor declares class vars or class methods
+  let key = cls.toLowerAscii
+  var guard = 0
+  var k = key
+  while k.len > 0 and guard < 100:
+    let ci = p.syms.classes.getOrDefault(k)
+    if ci.spelling.len == 0: break
+    if ci.classVarSet.len > 0 or ci.classProcSet.len > 0:
+      return true
+    k = ci.parent
+    inc guard
+  return false
+
+proc classQualifyAll(p: var TParser, module: Node) =
+  ## bare class-var / class-method references inside a class's routines
+  for def in module.sons:
+    if def.kind in {nkProcDef, nkFuncDef, nkMethodDef} and
+        def.defClass.len > 0:
+      let cls = def.defClass
+      if not hasClassStatics(p, cls):
+        continue
+      var scope: seq[string] = @[]
+      if def.len >= 3 and def[2].kind == nkFormalParams:
+        for j in 1 ..< def[2].len:
+          let d = def[2][j]
+          if d.kind == nkIdentDefs:
+            for k in 0 ..< d.len - 2:
+              if d[k].kind == nkIdent:
+                scope.add(d[k].strVal.toLowerAscii)
+      if def.len > 0 and def[def.len - 1].kind == nkStmtList:
+        let body = def[def.len - 1]
+        for s in body.sons:
+          if s.kind in {nkVarSection, nkConstSection, nkTypeSection}:
+            collectScopeNames(s, scope)
+        for j in 0 ..< body.len:
+          body[j] = classQualifyInPlace(p, body[j], cls, scope)
 
 proc selfQualifyAll*(p: var TParser, module: Node) =
   for i in 0 ..< module.len:
@@ -3411,9 +3621,29 @@ proc parseUnit*(p: var TParser): Node =
       p.module.add(def)
   genPropertyAccessors(p, p.module)
   selfQualifyAll(p, p.module)
+  classQualifyAll(p, p.module)
+  # class vars: hoist the module-level storage after the last type
+  # section so routines (declared later) see it
+  if p.classVarHoist.len > 0:
+    var vs = newNode(nkVarSection, p.module.info)
+    for v in p.classVarHoist:
+      vs.add(v)
+    var lastType = -1
+    for i in 0 ..< p.module.len:
+      if p.module[i].kind == nkTypeSection:
+        lastType = i
+    var rebuilt: seq[Node] = @[]
+    if lastType < 0:
+      rebuilt.add(vs)
+    for i in 0 ..< p.module.len:
+      rebuilt.add(p.module[i])
+      if i == lastType:
+        rebuilt.add(vs)
+    p.module.sons = rebuilt
   for i in 0 ..< p.module.len:
     rewriteClassAsgns(p, p.module[i])
     p.module.sons[i] = rewriteCtorCalls(p, p.module[i])
+    p.module.sons[i] = rewriteClassProcCalls(p, p.module[i])
     rewriteArrayProps(p, p.module[i])
   # move the generated property accessors before the first plain
   # statement (the main block), so nimony sees them before their use
