@@ -65,6 +65,7 @@ type
     curLabels*: seq[string]     ## declared labels of the current routine
     intfSigs*: Table[string, seq[Node]]  ## interface key -> base-method defs
     classVarHoist*: seq[Node]   ## class var decls hoisted to module level
+    recordTypes*: Table[string, bool]  ## lowercase record type names
     withTemps*: seq[string]     ## hidden per-with temporaries by depth
     withClasses*: seq[string]   ## class spelling per with depth
     withDepth*: int             ## active with-scope count
@@ -1077,6 +1078,8 @@ proc parseTypeDesc*(p: var TParser, definition: Node): Node =
     result.isRecordType = true
     getTokP(p)
     skipCom(p)
+    if definition.kind == nkIdent:
+      p.recordTypes[definition.strVal.toLowerAscii] = true
     result.add(emptyNode(p.tok.info))     # no inheritance
     let body = newNode(nkRecList, p.tok.info)
     while p.tok.xkind != pxEnd and p.tok.xkind != pxEof:
@@ -1097,6 +1100,43 @@ proc parseTypeDesc*(p: var TParser, definition: Node): Node =
         body.add(parseRecordCase(p))
       of pxComment:
         skipCom(p)
+      of pxPublic:
+        p.visibility = visPublic
+        getTokP(p)
+        p.opt(pxSemiColon)
+        skipCom(p)
+      of pxPrivate:
+        p.visibility = visPrivate
+        getTokP(p)
+        p.opt(pxSemiColon)
+        skipCom(p)
+      of pxProtected:
+        p.visibility = visProtected
+        getTokP(p)
+        p.opt(pxSemiColon)
+        skipCom(p)
+      of pxPublished:
+        p.visibility = visPublished
+        getTokP(p)
+        p.opt(pxSemiColon)
+        skipCom(p)
+      of pxClass:
+        # `class operator` (v1); class vars in records rejected
+        let pk = p.peekTok().xkind
+        if pk in {pxProcedure, pxFunction, pxOperator}:
+          let rd = parseRoutine(p, true)
+          if rd.kind == nkProcDef and rd.len > 0 and
+              rd[rd.len - 1].kind == nkEmpty:
+            let c = newNode(nkCommentStmt, rd.info)
+            c.strVal = "# class method: " & rd[0].strVal
+            body.add(c)
+          else:
+            body.add(rd)
+          p.opt(pxSemiColon)
+          skipCom(p)
+        else:
+          parError(p, "unsupported record member: class " & $p.peekTok() &
+              " (v1 supports class operator only)")
       else:
         parError(p, "field or `case` expected in record body, got " & $p.tok)
     p.eat(pxEnd)
@@ -1288,7 +1328,7 @@ proc parseRecordBody(p: var TParser, result: Node, definition: Node) =
           p.classVarHoist.add(vh)
         p.opt(pxSemiColon)
         skipCom(p)
-      elif pk in {pxProcedure, pxFunction}:
+      elif pk in {pxProcedure, pxFunction, pxOperator}:
         let rd = parseRoutine(p, true)
         if rd.kind == nkProcDef and rd.len > 0 and
             rd[rd.len - 1].kind == nkEmpty:
@@ -1819,6 +1859,32 @@ proc parseRoutineBody(p: var TParser, result: Node) =
   p.curLabels = savedLabels
   result.add(stmts)
 
+proc delphiOperatorSymbol(name: string): string =
+  ## Delphi `class operator` method name -> nimony operator spelling;
+  ## "" for operators v1 does not support
+  case name.toLowerAscii
+  of "add": result = "+"
+  of "subtract": result = "-"
+  of "multiply": result = "*"
+  of "divide": result = "/"
+  of "intdivide": result = "div"
+  of "modulus": result = "mod"
+  of "and": result = "and"
+  of "or": result = "or"
+  of "xor": result = "xor"
+  of "leftshift": result = "shl"
+  of "rightshift": result = "shr"
+  of "equal": result = "=="
+  of "notequal": result = "!="
+  of "greaterthan": result = ">"
+  of "greaterthanorequal": result = ">="
+  of "lessthan": result = "<"
+  of "lessthanorequal": result = "<="
+  of "negative": result = "-"
+  of "positive": result = "+"
+  of "logicalnot", "bitwisenot": result = "not"
+  else: result = ""
+
 proc parseRoutine*(p: var TParser; noBody: bool): Node =
   ## procedure/function/constructor/destructor; also `class procedure`
   ## / `class function` (v1: static, lowered to module-level procs)
@@ -1829,12 +1895,12 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
   if kind == pxClass:
     getTokP(p)
     skipCom(p)
-    if p.tok.xkind in {pxProcedure, pxFunction}:
+    if p.tok.xkind in {pxProcedure, pxFunction, pxOperator}:
       isClassProc = true
       kind = p.tok.xkind
     else:
       parError(p, "unsupported `class` member: class " & $p.tok &
-          " (v1 supports class procedure/function/var)")
+          " (v1 supports class procedure/function/operator/var)")
   let oldOuterName = p.outerProcName
   let oldOuterIsMethod = p.outerIsMethod
   let oldClass = p.classOfProc
@@ -1872,8 +1938,18 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
     # bodiless member declaration inside an interface class body
     isMethod = true
     p.classOfProc = p.selfClass
-  # name + export marker; class methods lower to module-level names
-  let defName = if isClassProc and isMethod:
+  # name + export marker; class methods lower to module-level names,
+  # class operators to the nimony operator symbol (resolved by the
+  # infix/prefix expression machinery)
+  let opSym = if kind == pxOperator: delphiOperatorSymbol(name)
+              else: ""
+  if kind == pxOperator and opSym.len == 0:
+    parError(p, "unsupported class operator: " & name &
+        " (v1 supports arithmetic, bitwise, comparison and unary " &
+        "operators)")
+  let defName = if kind == pxOperator and isClassProc:
+      opSym
+    elif isClassProc and isMethod:
       p.syms.classProcName(p.classOfProc, name)
     else:
       name
@@ -1932,7 +2008,7 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
       p.syms.returnsValue[defName.toLowerAscii] = true
     else:
       p.syms.returnsValue[name.toLowerAscii] = true
-  if isClassProc and isMethod:
+  if isClassProc and isMethod and kind != pxOperator:
     p.syms.addClassProc(p.classOfProc, name)
   elif isMethod and (isDotted or p.section == seInterface):
     if kind == pxConstructor or kind == pxDestructor:
@@ -2934,12 +3010,12 @@ proc parseStmt*(p: var TParser): Node =
   of pxType:
     result = parseTypeSection(p)
   of pxProcedure, pxFunction, pxConstructor, pxDestructor, pxClass:
-    # `class procedure/function` implementations land here too; the
-    # `class` prefix is consumed inside parseRoutine
+    # `class procedure/function/operator` implementations land here
+    # too; the `class` prefix is consumed inside parseRoutine
     if p.tok.xkind == pxClass and
-        p.peekTok().xkind notin {pxProcedure, pxFunction}:
+        p.peekTok().xkind notin {pxProcedure, pxFunction, pxOperator}:
       parError(p, "unsupported statement: class " & $p.peekTok() &
-          " (v1 supports class procedure/function)")
+          " (v1 supports class procedure/function/operator)")
     result = parseRoutine(p, false)
   of pxProgram:
     # `program Name;` header - skip; a program is one implementation
@@ -3286,6 +3362,30 @@ proc classQualifyAll(p: var TParser, module: Node) =
         for j in 0 ..< body.len:
           body[j] = classQualifyInPlace(p, body[j], cls, scope)
 
+proc initValueResult(p: var TParser, module: Node) =
+  ## nimony's result-init proof rejects procs whose body only assigns
+  ## fields of a value-object result; give record-returning procs an
+  ## explicit `result = default(T)` preamble
+  for def in module.sons:
+    if def.kind in {nkProcDef, nkFuncDef, nkMethodDef} and
+        def.len >= 3 and def[2].kind == nkFormalParams:
+      let ret = def[2][0]
+      if ret.kind == nkIdent and
+          p.recordTypes.hasKey(ret.strVal.toLowerAscii) and
+          def.len > 0 and def[def.len - 1].kind == nkStmtList and
+          def[def.len - 1].len > 0:
+        let body = def[def.len - 1]
+        var asgn = newNode(nkAsgn, ret.info)
+        asgn.add(newIdentNode("result", ret.info))
+        var dcall = newNode(nkCall, ret.info)
+        dcall.add(newIdentNode("default", ret.info))
+        dcall.add(ret)
+        asgn.add(dcall)
+        var rebuilt: seq[Node] = @[asgn]
+        for s in body.sons:
+          rebuilt.add(s)
+        body.sons = rebuilt
+
 proc selfQualifyAll*(p: var TParser, module: Node) =
   for i in 0 ..< module.len:
     let def = module[i]
@@ -3620,6 +3720,7 @@ proc parseUnit*(p: var TParser): Node =
     for def in p.intfSigs.getOrDefault(key):
       p.module.add(def)
   genPropertyAccessors(p, p.module)
+  initValueResult(p, p.module)
   selfQualifyAll(p, p.module)
   classQualifyAll(p, p.module)
   # class vars: hoist the module-level storage after the last type

@@ -106,6 +106,18 @@ if [ $# -eq 0 ] && [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/twounit" ]; then
       echo "   PASLER EVENTS FAILED"; fail=1
     fi
   fi
+  if [ -f "$HERE/opover.pas" ]; then
+    echo "== pasler-op"
+    mkdir -p "$TMP/pasler-op"
+    cp "$HERE/opover.pas" "$TMP/pasler-op/"
+    if (cd "$TMP/pasler-op" &&
+        "$ROOT/bin/pasler" --nimony:"$NIMONY" --run opover.pas 2>&1 |
+        grep -v nifmake || true); then
+      echo "-- ok"
+    else
+      echo "   PASLER OP FAILED"; fail=1
+    fi
+  fi
   if [ -f "$HERE/classmeth.pas" ]; then
     echo "== pasler-cm"
     mkdir -p "$TMP/pasler-cm"

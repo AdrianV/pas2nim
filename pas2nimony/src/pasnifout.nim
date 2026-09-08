@@ -101,12 +101,12 @@ proc emitExpr(e: var NifEmitter; n: Node) =
   case n.kind
   of nkInfix:
     e.buf.copyInto(globalTags.registerTag("infix"), i):
-      e.buf.addIdent(e.canon(n[0].strVal), i)
+      e.buf.addIdent(escapeNifOp(e.canon(n[0].strVal)), i)
       e.emitExpr(n[1])
       e.emitExpr(n[2])
   of nkPrefix:
     e.buf.copyInto(globalTags.registerTag("prefix"), i):
-      e.buf.addIdent(e.canon(n[0].strVal), i)
+      e.buf.addIdent(escapeNifOp(e.canon(n[0].strVal)), i)
       e.emitExpr(n[1])
   of nkCall, nkCommand:
     e.emitCall(n)
@@ -435,14 +435,33 @@ proc emitParamList(e: var NifEmitter; params: Node) =
           else:
             e.buf.addDotToken(pi)
 
+proc escapeNifOp(name: string): string =
+  ## the writer (nifbuilder) escapes a leading (+ -) byte to \2B / \2D;
+  ## pass the raw spelling through and let the writer do it
+  result = name
+
+proc isPlainIdentStr(s: string): bool =
+  ## true for names that can appear as a bare NIF identifier
+  if s.len == 0:
+    return false
+  for ch in s:
+    if not ((ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
+            (ch >= '0' and ch <= '9') or ch == '_'):
+      return false
+  result = true
+
 proc emitProcName(e: var NifEmitter; n: Node; i: NifLineInfo) =
   ## operator names like `data2 =` need the (quoted ...) form
   let name = e.nameOf(n[0])
-  if name.find(' ') >= 0 or name.find('=') >= 0:
+  if name.find(' ') >= 0:
     e.buf.copyInto(globalTags.registerTag("quoted"), i):
       for part in name.split(' '):
         if part.len > 0:
           e.buf.addIdent(part, i)
+  elif not isPlainIdentStr(name):
+    # operator symbols: nifler writes (+ -) as hex escapes, the rest raw
+    e.buf.copyInto(globalTags.registerTag("quoted"), i):
+      e.buf.addIdent(escapeNifOp(name), i)
   else:
     e.buf.addIdent(name, i)
 
