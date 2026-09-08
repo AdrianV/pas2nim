@@ -313,6 +313,11 @@ proc scanNimExports(ln: string; s: var SymTab) =
     while j < t.len and t[j] in {' ', '\t'}: inc j
     if j < t.len and t[j] in {'=', '{', '[', '.'}:
       s.declareName(name)
+      # exported ref-object type: register as a class so receiver-typed
+      # logic (varTypes "class:<t>", per-class method return keys) sees
+      # shim types like TStringList
+      if t.find("ref object") >= 0:
+        s.registerClass(name, "", true)
       return
   # declaration keywords: `proc* name` / `proc name*(`
   const kws = ["proc", "func", "iterator", "template", "converter",
@@ -337,6 +342,16 @@ proc scanNimExports(ln: string; s: var SymTab) =
       if exported and name notin kws:
         s.declareName(name)
         if kw == "proc" or kw == "func":
+          # method? `proc Add*(self: TStringList; ...)` - key the
+          # return info per class so a user routine with the same
+          # name cannot shadow the shim method's signature
+          var sq = t.find("self:")
+          var cty = ""
+          if sq >= 0:
+            var v = sq + 5
+            while v < t.len and t[v] in {' ', '\t'}: inc v
+            while v < t.len and t[v] in {'a'..'z', 'A'..'Z', '0'..'9', '_'}:
+              cty.add(t[v]); inc v
           # value-returning? walk the param list's parens; a `: Type`
           # after the depth-0 close means the routine returns a value
           # (needed for the statement-position discard wrapper)
@@ -352,6 +367,9 @@ proc scanNimExports(ln: string; s: var SymTab) =
                 while r < t.len and t[r] in {' ', '\t'}: inc r
                 if r < t.len and t[r] == ':':
                   s.returnsValue[name.toLowerAscii] = true
+                  if cty.len > 0:
+                    s.returnsValue[cty.toLowerAscii & "." &
+                                   name.toLowerAscii] = true
                   var v = r + 1
                   while v < t.len and t[v] in {' ', '\t'}: inc v
                   var ty = ""
@@ -360,6 +378,10 @@ proc scanNimExports(ln: string; s: var SymTab) =
                     inc v
                   if ty.toLowerAscii == "bool":
                     s.returnsBool[name.toLowerAscii] = true
+                elif cty.len > 0:
+                  # a void method: the per-class key must say false
+                  s.returnsValue[cty.toLowerAscii & "." &
+                                 name.toLowerAscii] = false
                 break
             inc q
     break
@@ -958,8 +980,22 @@ proc lowestExprAux(p: var TParser, v: var Node, limit: int): TTokKind =
       node.add(callee)
       node.add(v)
     else:
+      if op == pxSlash:
+        # Pascal `/` is real division; nimony's `/` accepts floats
+        # only - convert non-float operands explicitly
+        if rhsExprType(p, v) notin ["float32", "float64"]:
+          let c = newNode(nkCall, v.info)
+          c.add(newIdentNode("float64", v.info))
+          c.add(v)
+          v = c
       node.add(opNode)
       node.add(v)
+      if op == pxSlash:
+        if rhsExprType(p, v2) notin ["float32", "float64"]:
+          let c = newNode(nkCall, v2.info)
+          c.add(newIdentNode("float64", v2.info))
+          c.add(v2)
+          v2 = c
       node.add(v2)
     v = p.rewriteMethodPtrNilCmp(node)
     op = nextop
@@ -1861,6 +1897,14 @@ proc parseRecordOrObject*(p: var TParser, kind: NodeKind,
     record.add(ofInh)
     p.eat(pxParRi)
     skipCom(p)
+    if p.tok.xkind == pxSemiColon:
+      # one-liner subclass: `EBadLine = class(Exception);` - emit the
+      # type with an empty body so ctors/raises resolve
+      getTokP(p)
+      p.syms.registerClass(defName, parent, true)
+      var emptyBody = newNode(nkRecList, definition.info)
+      record.add(emptyBody)
+      return
   elif kind == nkRefTy:
     # class without ancestor: inherit from RootRef
     let ofInh = newNode(nkOfInherit, definition.info)
@@ -2530,6 +2574,9 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
       p.syms.returnsValue[defName.toLowerAscii] = true
     else:
       p.syms.returnsValue[name.toLowerAscii] = true
+    if isMethod and not isClassProc:
+      p.syms.returnsValue[p.classOfProc.toLowerAscii & "." &
+                          name.toLowerAscii] = true
   elif kind == pxProcedure:
     # a void procedure with the same name must clear the flag (the
     # latest declaration wins; shim units may register value-returning
@@ -2538,6 +2585,9 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
       p.syms.returnsValue[defName.toLowerAscii] = false
     else:
       p.syms.returnsValue[name.toLowerAscii] = false
+    if isMethod and not isClassProc:
+      p.syms.returnsValue[p.classOfProc.toLowerAscii & "." &
+                          name.toLowerAscii] = false
   if isClassProc and isMethod and kind != pxOperator:
     p.syms.addClassProc(p.classOfProc, name)
   elif isMethod and (isDotted or p.section == seInterface or noBody):
@@ -2629,6 +2679,35 @@ proc parseInherited*(p: var TParser): Node =
   p.eat(pxInherited)
   let parent = p.syms.ancestorSpelling(p.classOfProc)
   if parent.len == 0:
+    # v1: a parentless class inherits TObject; its Create/Destroy
+    # are observable no-ops in our model, so bare `inherited`,
+    # `inherited Create` and `inherited Destroy` lower to nothing.
+    # A parent call with arguments has no sensible target - keep
+    # the error for that case.
+    if p.tok.xkind in {pxSemiColon, pxEnd}:
+      # bare `inherited;` forwarding - nothing to do at the root
+      if p.tok.xkind == pxSemiColon:
+        getTokP(p)
+        p.opt(pxSemiColon)
+        skipCom(p)
+      result = newNode(nkEmpty, info)
+      return
+    if p.tok.xkind == pxSymbol and
+        p.tok.ident.toLowerAscii in ["create", "destroy", "free"]:
+      getTokP(p)
+      skipCom(p)
+      if p.tok.xkind == pxParLe:
+        # argument list on a root call: still a no-op, skip it
+        var depth = 1
+        getTokP(p)
+        while depth > 0 and p.tok.xkind != pxEof:
+          if p.tok.xkind == pxParLe: depth.inc
+          elif p.tok.xkind == pxParRi: depth.dec
+          getTokP(p)
+      p.opt(pxSemiColon)
+      skipCom(p)
+      result = newNode(nkEmpty, info)
+      return
     parError(p, "no parent class for `inherited`")
   let selfNode = newIdentNode("self", info)
   # cast[], not the T(x) call form: the call form trips nimsem's
@@ -2844,11 +2923,14 @@ proc parseTry*(p: var TParser): Node =
     getTokP(p)
     let fin = newNodeP(nkFinally, p)
     skipCom(p)
-    let body2 = parseStmt(p)
-    if body2.kind == nkStmtList:
-      for s in body2.sons: fin.add(s)
-    else:
-      fin.add(body2)
+    # the finally body is a statement list up to `end` (a single
+    # parseStmt stopped after the first statement)
+    while not (p.tok.xkind in {pxEnd, pxEof}):
+      let s = parseStmt(p)
+      if s.kind == nkStmtList:
+        for k in 0 ..< s.len: fin.add(s[k])
+      else:
+        fin.add(s)
     result.add(fin)
   p.eat(pxEnd)
 
@@ -3761,6 +3843,17 @@ proc parseStmt*(p: var TParser): Node =
   else:
     # expression / assignment statement
     let info = parLineInfo(p)
+    if p.tok.xkind == pxSymbol and
+        p.tok.ident.toLowerAscii in ["break", "continue"]:
+      # loop control (not lexer keywords in v1)
+      result = if p.tok.ident.toLowerAscii == "break":
+                 newNodeP(nkBreakStmt, p)
+               else: newNodeP(nkContinueStmt, p)
+      result.add(emptyNode(p.tok.info))
+      getTokP(p)
+      p.opt(pxSemiColon)
+      skipCom(p)
+      return
     let a = parseExpr(p)
     if p.tok.xkind == pxAsgn:
       getTokP(p)
@@ -3850,14 +3943,32 @@ proc parseStmt*(p: var TParser): Node =
         # callee may be a bare ident or a dot-call (shim methods like
         # TStringList.Add return the index)
         var callee = ""
+        var recvClass = ""
         if result[0].kind == nkIdent:
           callee = result[0].strVal
         elif result[0].kind == nkDotExpr and result[0].len == 2 and
             result[0][1].kind == nkIdent:
           callee = result[0][1].strVal
-        if callee.len > 0 and
-            p.syms.returnsValue.getOrDefault(callee.toLowerAscii,
-                false) and callee.toLowerAscii != "inttostr":
+          if result[0][0].kind == nkIdent:
+            let rvt = p.varTypes.getOrDefault(
+                result[0][0].strVal.toLowerAscii)
+            if rvt.startsWith("class:"):
+              recvClass = rvt[6 .. ^1].toLowerAscii
+        var retFlag = false
+        if recvClass.len > 0:
+          # the receiver's class decides: the per-class key survives a
+          # user routine clearing the global name (e.g. TFoo.Add vs
+          # TStringList.Add)
+          retFlag = p.syms.returnsValue.getOrDefault(
+              recvClass & "." & callee.toLowerAscii,
+              p.syms.returnsValue.getOrDefault(callee.toLowerAscii,
+                  false))
+        elif callee.len > 0:
+          retFlag = p.syms.returnsValue.getOrDefault(callee.toLowerAscii,
+              false)
+
+        if callee.len > 0 and retFlag and
+            callee.toLowerAscii != "inttostr":
           let d = newNode(nkDiscardStmt, info)
           d.add(result)
           result = d

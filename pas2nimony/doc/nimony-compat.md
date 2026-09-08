@@ -525,3 +525,32 @@ types (14th oracle sample `operators.pas`, byte-identical):
   the parser injects it (already the case for plain functions).
 - Delphi note: `Inc`/`Dec` class operators are unary; the two-arg
   `Inc(x, n)` statement form stays arithmetic-only.
+
+## M6-2: real-world "food" sample (wordfreq)
+
+`test/oracle/wordfreq.pas` - a corpus generator + word-frequency
+analyzer - is the 15th oracle sample, byte-identical with FPC.
+Building it flushed out eight real gaps, all fixed:
+
+- forward-style one-liner class decls (`EBadLine =
+  class(Exception);`) now emit the real type (empty body).
+- parentless classes: `inherited`, `inherited Create/Destroy`
+  lower to no-ops (TObject semantics; argful parent calls still
+  error). Parentless classes inherit RootRef like the M4 ones.
+- `try..finally` bodies parse all statements up to `end` (the
+  parser stopped after one); the .nim renderer prints every
+  nkFinally son (it dropped all but the first).
+- `break` / `continue` statements (v1 lexer has no keywords for
+  them; statement-position symbols lower to the loop-control
+  nodes).
+- method return info is keyed per class
+  (`returnsValue["tstringlist.add"]`): a user `TFoo.Add` can no
+  longer suppress the discard for `TStringList.Add` call sites.
+  Shim ref-object types now register as classes and derive
+  RootRef (the `Free(self: RootRef)` call type-checks).
+- Pascal `/` (real division) converts non-float operands to
+  float64 explicitly - nimony's `/` accepts floats only.
+- int->float assignment widening casts (M6-1) also cover the
+  `result :=` bodies of float-returning routines.
+- the discarded-value rule now consults the receiver's class
+  before the global name flag.

@@ -577,7 +577,14 @@ proc stmt(s: var TRendor, n: Node) =
         emitBranchBody(s, b[2])
       elif b.kind == nkFinally:
         s.line("finally:")
-        emitBranchBody(s, b[0])
+        # nkFinally holds the body statements directly (flattened)
+        s.indent = s.indent + 1
+        if b.len == 0:
+          s.line("discard")
+        else:
+          for c in b.sons:
+            s.stmt(c)
+        s.indent = s.indent - 1
   of nkReturnStmt:
     if n[0].kind == nkEmpty:
       s.line("return")

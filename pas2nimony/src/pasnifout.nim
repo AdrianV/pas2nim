@@ -332,8 +332,9 @@ proc emitStmt(e: var NifEmitter; n: Node) =
   when defined(PASLER_DEBUG_AST):
     if n.kind == nkDiscardStmt:
       echo "DBG discard son kind=", n[0].kind, " len=", n[0].len
-      for s in n[0].sons:
-        echo "DBG   son: ", $s.kind, " strVal=", s.strVal
+      if n[0].kind == nkCall and n[0].len >= 1:
+        if n[0][0].kind == nkDotExpr:
+          echo "DBG   callee: ", n[0][0][0].strVal, ".", n[0][0][1].strVal
   case n.kind
   of nkAsgn:
     e.buf.copyInto(globalTags.registerTag("asgn"), i):

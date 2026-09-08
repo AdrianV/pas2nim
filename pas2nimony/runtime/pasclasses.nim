@@ -24,7 +24,7 @@ type
                                      # zero-initialized field errors (v1:
                                      # treated like accept, no exception)
 
-  TStringList* = ref object
+  TStringList* = ref object of RootRef
     fLines*: seq[string]
     fSorted*: bool
     fCaseSensitive*: bool
