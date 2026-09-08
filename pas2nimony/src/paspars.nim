@@ -81,6 +81,7 @@ type
     classOfProc*: string        ## class the current routine belongs to
     qualClass*: string          ## class context of the self-qualify pass
     nestedProcs*: seq[string]   ## nested routine names of the current proc
+    arrayTypeLows*: Table[string, int]  ## alias type name -> declared low
 
 # ---------------------------------------------------------------------------
 # token plumbing
@@ -502,8 +503,24 @@ proc exprListAux(p: var TParser, endTok, sepTok: TTokKind, result: Node) =
     if p.tok.xkind == pxEof:
       parError(p, tokKindToStr(endTok) & " expected")
       break
-    let a = parseExpr(p)
+    var a = parseExpr(p)
     skipCom(p)
+    if p.tok.xkind == pxColon:
+      # Delphi write/Str width[:precision] argument: e:w[:p] is
+      # lowered to pasW(e, w[, p]) and rendered by the shim
+      getTokP(p)
+      skipCom(p)
+      let c = newNode(nkCall, a.info)
+      c.add(newIdentNode("pasW", a.info))
+      c.add(a)
+      c.add(parseExpr(p))
+      skipCom(p)
+      if p.tok.xkind == pxColon:
+        getTokP(p)
+        skipCom(p)
+        c.add(parseExpr(p))
+        skipCom(p)
+      a = c
     if p.tok.xkind == pxComma or p.tok.xkind == pxSemiColon:
       getTokP(p)
       skipCom(p)
@@ -808,6 +825,15 @@ proc primary(p: var TParser): Node =
       result = newNode(nkCall, a.info)
       result.add(a)
       exprListAux(p, pxParRi, pxEquals, result)
+      # a 1-char Pascal literal passed to a callee is a string in
+      # almost every signature; char-arg procs keep the char
+      if result.len > 1 and not (a.kind == nkIdent and
+          a.strVal.toLowerAscii in ["stringofchar", "ord", "chr"]):
+        for ai in 1 ..< result.len:
+          if result[ai].kind == nkCharLit:
+            let sd = newNode(nkStrLit, result[ai].info)
+            sd.strVal = result[ai].strVal
+            result[ai] = sd
       if a.kind == nkIdent and a.strVal in p.nestedProcs:
         # nested routines see `self` implicitly
         result.add(newIdentNode("self", a.info))
@@ -846,6 +872,11 @@ proc lowestExprAux(p: var TParser, v: var Node, limit: int): TTokKind =
   v = primary(p)
   var op = p.tok.xkind
   var opPred = getPrecedence(op)
+  if p.context == conTypeDesc and op == pxEquals:
+    # in a type-desc context `=` never starts an infix: `T = default`
+    # belongs to the const/param declaration, not the type
+    result = op
+    return
   if p.genericArgDepth > 0 and op == pxGt:
     # inside `<...>` the `>` closes the bracket; it is not the
     # greater-than operator
@@ -860,6 +891,22 @@ proc lowestExprAux(p: var TParser, v: var Node, limit: int): TTokKind =
       opNode.strVal = "=="
     of pxNeq:
       opNode.strVal = "!="
+    of pxShr:
+      # FPC's shr is LOGICAL (zero fill); nimony's is arithmetic -
+      # route through the shim so negative left operands match
+      node.kind = nkCall
+      node.sons = @[]
+      node.add(newIdentNode("delphiShr", node.info))
+      node.add(v)
+      node.add(emptyNode(node.info))
+      skipCom(p)
+      var v2s = emptyNode(p.tok.info)
+      discard lowestExprAux(p, v2s, opPred)
+      node[2] = v2s
+      v = node
+      op = p.tok.xkind
+      opPred = getPrecedence(op)
+      continue
     else:
       discard
     skipCom(p)
@@ -908,7 +955,10 @@ proc lowestExprAux(p: var TParser, v: var Node, limit: int): TTokKind =
 
 proc parseExpr*(p: var TParser): Node =
   let oldcontext = p.context
-  p.context = conExpr
+  if p.context != conTypeDesc:
+    # a type-desc context must survive into sub-expressions: `T = v`
+    # in const/param declarations belongs to the declaration
+    p.context = conExpr
   if p.tok.xkind == pxCommand:
     result = parseDirective(p)
   else:
@@ -960,19 +1010,35 @@ proc parseEnum*(p: var TParser): Node =
   p.eat(pxParRi)
 
 proc parseRecordCase*(p: var TParser): Node =
-  # `case FTag: Integer of ...` inside a record/object
-  result = newNodeP(nkRecCase, p)
+  # `case FTag: Integer of ...` inside a record/object. Variant
+  # records overlay storage in Delphi; v1 renders ALL branches as
+  # plain fields (flat layout) - typical use writes one branch and
+  # reads it back, which behaves identically. The result is an
+  # nkRecList so both renderers stay uniform.
+  result = newNodeP(nkRecList, p)
+  var caseFields = newNodeP(nkRecCase, p)
   getTokP(p)                    # skip `case`
   skipCom(p)
-  # discriminant: `name: Type`
+  # discriminant: `name: Type` or the tagless `Type of` form
   if p.tok.xkind != pxSymbol:
     parError(p, "identifier expected for discriminant")
-  let discName = p.tok.ident
+  var discName = p.tok.ident
+  let first = p.tok.ident
   let discInfo = p.tok.info
   getTokP(p)
-  p.syms.declareName(discName)
-  p.eat(pxColon)
-  let discTy = parseTypeDesc(p, emptyNode(p.tok.info))
+  var discTy: Node
+  if p.tok.xkind == pxColon:
+    # named discriminant: the symbol was the name
+    getTokP(p)
+    p.syms.declareName(discName)
+    discTy = parseTypeDesc(p, emptyNode(p.tok.info))
+  else:
+    # `case Integer of` - tagless variant record; the symbol was the
+    # type. The record renders flat, so a synthetic discriminant
+    # keeps the node shape uniform (v1: ident types only)
+    discName = "pasVariantTag"
+    p.syms.declareName(discName)
+    discTy = newIdentNode(first, discInfo)
   let disc = newNode(nkIdentDefs, discInfo)
   disc.add(newIdentNode(discName, discInfo))
   disc.add(discTy)
@@ -1008,9 +1074,15 @@ proc parseRecordCase*(p: var TParser): Node =
     else:
       let body = parseIdentColonEquals(p, false)
       branch.add(body)
-    result.add(branch)
+    caseFields.add(branch)
     p.opt(pxSemiColon)
     skipCom(p)
+  # flatten: every branch's fields are appended unconditionally
+  # (the discriminant itself was already added as a plain field)
+  for i in 0 ..< caseFields.len:
+    let b = caseFields[i]
+    for j in 0 ..< b[b.len - 1].len:
+      result.add(b[b.len - 1][j])
 
 proc genSelfType(p: var TParser): Node =
   if p.selfClass.len > 0:
@@ -1082,6 +1154,12 @@ proc parseParamList*(p: var TParser): Node =
         skipCom(p)
         def = parseExpr(p)
         skipCom(p)
+        if def.kind == nkCharLit:
+          # nimony defaults must match the declared type: a 1-char
+          # Pascal literal is a char, string params need a string
+          let sd = newNode(nkStrLit, def.info)
+          sd.strVal = def.strVal
+          def = sd
       for n in names:
         p.syms.declareName(n)
         let d = newNode(nkIdentDefs, p.tok.info)
@@ -1214,6 +1292,11 @@ proc parseVarSection*(p: var TParser): Node =
           p.arrayLows[defs[i].strVal.toLowerAscii] = int(low)
     elif tyNode.kind == nkIdent:
       let tyKey = tyNode.strVal.toLowerAscii
+      if p.arrayTypeLows.hasKey(tyKey):
+        for i in 0 ..< defs.len - 2:
+          if defs[i].kind == nkIdent:
+            p.arrayLows[defs[i].strVal.toLowerAscii] =
+              p.arrayTypeLows.getOrDefault(tyKey)
       if p.methodPtrTypes.hasKey(tyKey):
         for i in 0 ..< defs.len - 2:
           if defs[i].kind == nkIdent:
@@ -1223,6 +1306,11 @@ proc parseVarSection*(p: var TParser): Node =
         for i in 0 ..< defs.len - 2:
           if defs[i].kind == nkIdent:
             p.varTypes[defs[i].strVal.toLowerAscii] = "class:" & tyKey
+      elif p.recordTypes.hasKey(tyKey):
+        for i in 0 ..< defs.len - 2:
+          if defs[i].kind == nkIdent:
+            # record vars carry their spelling for `with` lowering
+            p.varTypes[defs[i].strVal.toLowerAscii] = "record:" & tyNode.strVal
       else:
         let mapped = rtlSpelling(tyKey)
         if mapped.len > 0:
@@ -1401,7 +1489,9 @@ proc parseTypeDesc*(p: var TParser, definition: Node): Node =
         p.opt(pxSemiColon)
         skipCom(p)
       of pxCase:
-        body.add(parseRecordCase(p))
+        let flat = parseRecordCase(p)
+        for k in 0 ..< flat.len:
+          body.add(flat[k])
       of pxComment:
         skipCom(p)
       of pxPublic:
@@ -1468,6 +1558,10 @@ proc parseTypeDesc*(p: var TParser, definition: Node): Node =
       # static array: array[lo..hi] of T
       getTokP(p)
       let idx = rangeExpr(p)
+      if definition.kind == nkIdent and idx.kind == nkRange and
+          idx.len == 2 and idx[0].kind in {nkIntLit, nkInt64Lit}:
+        # alias types carry their low bound for var declarations
+        p.arrayTypeLows[definition.strVal.toLowerAscii] = int(idx[0].intVal)
       p.eat(pxBracketRi)
       p.syms = p.syms  # no-op; keep table
       result.add(idx)
@@ -1587,7 +1681,9 @@ proc parseRecordBody(p: var TParser, result: Node, definition: Node) =
       p.opt(pxSemiColon)
       skipCom(p)
     of pxCase:
-      body.add(parseRecordCase(p))
+      let flat2 = parseRecordCase(p)
+      for k2 in 0 ..< flat2.len:
+        body.add(flat2[k2])
       p.opt(pxSemiColon)
       skipCom(p)
     of pxPrivate:
@@ -2184,7 +2280,10 @@ proc parseRoutineBody(p: var TParser, result: Node) =
       let nested = parseRoutine(p, false)
       p.curLabels = savedLabels
       if nested.kind in {nkProcDef, nkFuncDef, nkMethodDef} and
-          nested[0].kind == nkIdent:
+          nested[0].kind == nkIdent and nested.defClass.len > 0:
+        # only method-nested routines get an explicit `self` param
+        # (and thus need `self` at call sites); standalone nested
+        # procs close over locals natively
         p.nestedProcs.add(nested[0].strVal)
       stmts.add(nested)
       p.opt(pxSemiColon)
@@ -2900,6 +2999,42 @@ proc writelnArg(p: var TParser, n: Node): Node =
     c.add(newIdentNode("delphiBool", n.info))
     c.add(n)
     return c
+  if n.kind == nkIdent and n.strVal in ["true", "false"]:
+    # a bare Boolean literal renders TRUE/FALSE
+    let c = newNode(nkCall, n.info)
+    c.add(newIdentNode("delphiBool", n.info))
+    c.add(n)
+    return c
+  if n.kind == nkPrefix and n.len == 2 and n[0].kind == nkIdent and
+      n[0].strVal == "not":
+    # `not expr` is always Boolean
+    let c = newNode(nkCall, n.info)
+    c.add(newIdentNode("delphiBool", n.info))
+    c.add(n)
+    return c
+  if n.kind == nkInfix and n.len == 3 and n[0].kind == nkIdent:
+    let op = n[0].strVal
+    if op == "not":
+      # unary not is always Boolean
+      let c = newNode(nkCall, n.info)
+      c.add(newIdentNode("delphiBool", n.info))
+      c.add(n)
+      return c
+    if op in ["and", "or", "xor"]:
+      # wrap only when both operands are Boolean-shaped; integer
+      # and/or/xor must keep its numeric result
+      var allBool = true
+      for i in 1 ..< n.len:
+        let o = n[i]
+        let boolish = (o.kind == nkIdent and
+                       (o.strVal in ["true", "false"] or
+                        p.varTypes.getOrDefault(o.strVal.toLowerAscii) == "bool"))
+        if not boolish: allBool = false
+      if allBool:
+        let c = newNode(nkCall, n.info)
+        c.add(newIdentNode("delphiBool", n.info))
+        c.add(n)
+        return c
   return n
 
 proc mapBuiltinCall*(p: var TParser, n: Node): Node =
@@ -2913,6 +3048,29 @@ proc mapBuiltinCall*(p: var TParser, n: Node): Node =
   if n[0].kind != nkIdent: return n
   let name = n[0].strVal.toLowerAscii
   case name
+  of "inc", "dec":
+    # nimony's inc/dec require the offset to match the var's type;
+    # Pascal offsets are plain int literals -> lower to an
+    # assignment `x = x +/- cast` so the types line up
+    if n.len >= 3:
+      let target = n[1]
+      if target.kind == nkIdent:
+        let vt = p.varTypes.getOrDefault(target.strVal.toLowerAscii)
+        if vt in ["int32", "int16", "int8", "uint8", "uint16", "uint32"]:
+          let off = n[2]
+          let castNode = newNode(nkCall, n.info)
+          castNode.add(newIdentNode(vt, n.info))
+          castNode.add(off)
+          let op = if name == "inc": "+" else: "-"
+          let inf = newNode(nkInfix, n.info)
+          inf.add(newIdentNode(op, n.info))
+          inf.add(target)
+          inf.add(castNode)
+          let asgn = newNode(nkAsgn, n.info)
+          asgn.add(target)
+          asgn.add(inf)
+          return asgn
+    return n
   of "write":
     n[0].strVal = "write"
     let stdoutNode = newIdentNode("stdout", n[0].info)
@@ -3142,6 +3300,8 @@ proc withExprClass(p: var TParser, e: Node): string =
       if p.withTemps[i] == e.strVal:
         return p.withClasses[i]
     let vt = p.varTypes.getOrDefault(e.strVal.toLowerAscii)
+    if vt.startsWith("record:"):
+      return vt[7 .. ^1]
     if vt.startsWith("class:"):
       let sp = p.syms.classSpelling(vt[6..^1])
       if sp.len > 0:
@@ -3190,6 +3350,9 @@ proc withQualify(p: var TParser, n: Node): Node =
     var c = p.withClasses[i].toLowerAscii
     var guard = 0
     while c.len > 0 and guard < 100:
+      # records qualify through the fieldTypes map
+      if p.fieldTypes.hasKey(c & "." & k):
+        return newDotP(newIdentNode(p.withTemps[i], n.info), n.strVal)
       let ci = p.syms.classes.getOrDefault(c)
       if ci.spelling.len == 0: break
       if ci.fieldSet.hasKey(k) or ci.routineSet.hasKey(k) or
@@ -3224,19 +3387,30 @@ proc parseWith(p: var TParser): Node =
     inc p.withCounter
     let temp = "pasW" & $p.withCounter
     let info = p.tok.info
-    let vd = newNode(nkVarSection, info)
-    let d = newNode(nkIdentDefs, info)
-    d.add(newIdentNode(temp, info))
-    d.add(newIdentNode(cls, info))
-    d.add(e)
-    vd.add(d)
-    result.add(vd)
-    # push the scope (fixed-size stack: nimony seqs have no pop)
+    # record variables are qualified DIRECTLY against the original
+    # expression: records copy by value, so a hidden temp would
+    # receive writes Delphi applies to the original
+    let vt = if e.kind == nkIdent:
+               p.varTypes.getOrDefault(e.strVal.toLowerAscii)
+             else:
+               ""
+    let isRecord = vt.startsWith("record:")
+    if not isRecord:
+      let vd = newNode(nkVarSection, info)
+      let d = newNode(nkIdentDefs, info)
+      d.add(newIdentNode(temp, info))
+      d.add(newIdentNode(cls, info))
+      d.add(e)
+      vd.add(d)
+      result.add(vd)
+    # push the scope (fixed-size stack: nimony seqs have no pop);
+    # record withs use the original name as the qualifier
+    let qualifier = if isRecord and e.kind == nkIdent: e.strVal else: temp
     if p.withDepth < p.withTemps.len:
-      p.withTemps[p.withDepth] = temp
+      p.withTemps[p.withDepth] = qualifier
       p.withClasses[p.withDepth] = cls
     else:
-      p.withTemps.add(temp)
+      p.withTemps.add(qualifier)
       p.withClasses.add(cls)
     inc p.withDepth
     inc pushed

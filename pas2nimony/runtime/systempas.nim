@@ -91,6 +91,248 @@ proc StringOfChar*(c: char; count: int): string = repeat(c, count)
 
 proc WriteLn*() = echo ""
 
+proc delphiShr*(a: int64; b: int32): int64 =
+  ## FPC's shr is LOGICAL (fills zeros); nimony's is arithmetic
+  int64(uint64(a) shr uint32(b))
+
+proc Odd*(i: int64): bool =
+  (i and 1) != 0
+
+proc Even*(i: int64): bool =
+  (i and 1) == 0
+
+proc padWidth(s: string; w: int32): string =
+  ## right-align in `w` columns (Str/writeln width)
+  result = s
+  while result.len < w:
+    result = " " & result
+
+proc pasW*(v: int64; w: int32): string = padWidth($v, w)
+
+proc pasW*(v: float64; w: int32): string = padWidth(fpcShortestSci(v), w)
+
+proc pasW*(v: float64; w: int32; p: int32): string =
+  padWidth(fpcFormatF(v, int(p)), w)
+
+proc Str*(v: int64; s: var string) = s = $v
+
+proc Str*(v: int32; s: var string) = s = $v
+
+proc Str*(v: int64; w: int32; s: var string) = s = padWidth($v, w)
+
+proc Str*(v: int32; w: int32; s: var string) = s = padWidth($v, w)
+
+proc Str*(v: float64; w: int32; p: int32; s: var string) =
+  s = padWidth(fpcFormatF(v, int(p)), w)
+
+proc Str*(v: string; target: var string) = target = v
+
+proc Val*(s: string; v: var int32; code: var int32) =
+  ## Integer var (Pascal Integer = int32); nimony var params match
+  ## exactly, no implicit widening
+  var big: int64 = 0
+  Val(s, big, code)
+  v = int32(big)
+
+proc Val*(s: string; v: var int64; code: var int32) =
+  ## FPC semantics: skip leading blanks, optional sign, decimal or
+  ## $hex digits; code = 1-based position of the first offending
+  ## character (0 = ok); the out value is 0 on error
+  var i = 0
+  while i < s.len and s[i] == ' ':
+    inc i
+  var neg = false
+  if i < s.len and (s[i] == '-' or s[i] == '+'):
+    neg = s[i] == '-'
+    inc i
+  var acc: int64 = 0
+  var any = false
+  var bad = s.len
+  if i < s.len and s[i] == '$':
+    inc i
+    while i < s.len and ((s[i] >= '0' and s[i] <= '9') or
+        (s[i] >= 'a' and s[i] <= 'f') or (s[i] >= 'A' and s[i] <= 'F')):
+      let c = s[i]
+      if c >= '0' and c <= '9':
+        acc = acc * 16 + ord(c) - ord('0')
+      elif c >= 'a' and c <= 'f':
+        acc = acc * 16 + ord(c) - ord('a') + 10
+      else:
+        acc = acc * 16 + ord(c) - ord('A') + 10
+      inc i
+      any = true
+  else:
+    while i < s.len and s[i] >= '0' and s[i] <= '9':
+      acc = acc * 10 + ord(s[i]) - ord('0')
+      inc i
+      any = true
+  if any and i == s.len:
+    if neg: acc = -acc
+    v = acc
+    code = 0
+  else:
+    bad = i
+    v = 0
+    code = int32(bad + 1)
+
+proc Val*(s: string; v: var float64; code: var int32) =
+  var i = 0
+  while i < s.len and s[i] == ' ':
+    inc i
+  var j = i
+  if j < s.len and (s[j] == '-' or s[j] == '+'):
+    inc j
+  var sawDigit = false
+  while j < s.len and s[j] >= '0' and s[j] <= '9':
+    inc j
+    sawDigit = true
+  if j < s.len and s[j] == '.':
+    inc j
+    while j < s.len and s[j] >= '0' and s[j] <= '9':
+      inc j
+      sawDigit = true
+  if sawDigit and j < s.len and (s[j] == 'e' or s[j] == 'E'):
+    var k = j + 1
+    if k < s.len and (s[k] == '-' or s[k] == '+'):
+      inc k
+    var any = false
+    while k < s.len and s[k] >= '0' and s[k] <= '9':
+      inc k
+      any = true
+    if any: j = k
+  if sawDigit and j == s.len:
+    v = StrToFloatDef(substr(s, i, j - 1), 0.0)
+    code = 0
+  else:
+    v = 0
+    if sawDigit: code = int32(j + 1) else: code = int32(i + 1)
+
+proc ffSection(pattern: string; idx: int): string =
+  ## the idx-th ';'-separated section of a FormatFloat pattern
+  var sec = 0
+  var cur = ""
+  var i = 0
+  while i <= pattern.len:
+    if i == pattern.len or pattern[i] == ';':
+      if sec == idx: return cur
+      inc sec
+      cur = ""
+    else:
+      cur.add(pattern[i])
+    inc i
+  return cur
+
+proc ffCount(s: string; chars: set[char]): int =
+  result = 0
+  var i = 0
+  while i < s.len:
+    if s[i] in chars: inc result
+    inc i
+
+proc FormatFloat*(pattern: char; value: float64): string =
+  ## 1-char Pascal literal pattern ('0')
+  FormatFloat(ChrToStr(pattern), value)
+
+proc FormatFloat*(pattern: string; value: float64): string =
+  ## Delphi/FPC FormatFloat: '0' mandatory digit, '#' optional,
+  ## ',' thousands, 'E+xx' scientific, ';' positive/negative/zero
+  ## sections. Rounding: shortest-repr half-away (2.5 '0' -> "3").
+  var pat = pattern
+  var v = value
+  # section selection
+  var secs = ffCount(pattern, {';'})
+  if secs == 0: secs = 1
+  if value < 0:
+    if secs >= 2:
+      pat = ffSection(pattern, 1)
+      v = -value
+    # else: keep the sign, fpcFormatF renders it
+  elif value == 0 and secs >= 3:
+    pat = ffSection(pattern, 2)
+  if pat.len == 0:
+    pat = "0"
+  # scientific?
+  var epos = find(pat, "E+", 0)
+  var eNeg = false
+  if epos < 0: epos = find(pat, "E-", 0)
+  if epos >= 0:
+    # mantissa: '0's after the point in the pattern, then E+dd
+    var after = substr(pat, 0, epos - 1)
+    var expDigits = ffCount(substr(pat, epos + 2, pat.len - 1), {'0', '#'})
+    if expDigits < 1: expDigits = 1
+    let dot = find(after, ".", 0)
+    var mantDigits = 0
+    if dot > 0:
+      mantDigits = ffCount(substr(after, dot + 1, after.len - 1), {'0', '#'})
+    let sci = fpcSciMantissa(abs(v), mantDigits)   # d.ddd e+xx
+    let ep2 = find(sci, "e", 0)
+    var m = substr(sci, 0, ep2 - 1)
+    var ex = substr(sci, ep2 + 1, sci.len - 1)     # +04
+    # pad the exponent to expDigits
+    var digits = substr(ex, 1, ex.len - 1)
+    while digits.len < expDigits: digits = "0" & digits
+    var neg = v < 0
+    if neg: m = "-" & m
+    result = m & "E" & substr(ex, 0, 0) & digits
+    return
+  # fixed: decimals wanted = trailing '0's + '#'s after the point
+  let dot = find(pat, ".", 0)
+  var dec0 = 0
+  var decHash = 0
+  if dot > 0:
+    let frac = substr(pat, dot + 1, pat.len - 1)
+    dec0 = ffCount(frac, {'0'})
+    decHash = ffCount(frac, {'#'})
+  let prec = dec0 + decHash
+  var outp = fpcFormatF(v, prec)
+  # strip optional decimals: trailing zeros beyond the mandatory digits
+  if decHash > 0:
+    let dp = find(outp, ".", 0)
+    if dp > 0:
+      var frac = substr(outp, dp + 1, outp.len - 1)
+      var cut = decHash
+      while cut > 0 and frac.len > dec0 and frac[frac.len - 1] == '0':
+        frac = substr(frac, 0, frac.len - 2)
+        dec cut
+      outp = substr(outp, 0, dp)   # keeps the dot
+      if frac.len > 0: outp = outp & frac
+      if outp[outp.len - 1] == '.' and dec0 == 0:
+        outp = substr(outp, 0, outp.len - 2)
+  # no leading zero when the integer pattern has only '#'
+  var intPat = pat
+  if dot > 0: intPat = substr(pat, 0, dot - 1)
+  if ffCount(intPat, {'0'}) == 0 and ffCount(intPat, {'#'}) > 0:
+    if outp.len > 0 and outp[0] == '0' and outp.len > 1 and outp[1] == '.':
+      outp = substr(outp, 1, outp.len - 1)
+  # thousands separators
+  if find(pat, ",", 0) >= 0:
+    let dp = find(outp, ".", 0)
+    var ip: string
+    var rest: string
+    if dp > 0:
+      ip = substr(outp, 0, dp - 1)
+      rest = substr(outp, dp, outp.len - 1)
+    else:
+      ip = outp
+      rest = ""
+    var neg = false
+    if ip.len > 0 and ip[0] == '-':
+      neg = true
+      ip = substr(ip, 1, ip.len - 1)
+    var grouped = ""
+    var cnt = 0
+    var j = ip.len - 1
+    while j >= 0:
+      if cnt == 3:
+        grouped = "," & grouped
+        cnt = 0
+      grouped = substr(ip, j, j) & grouped
+      inc cnt
+      dec j
+    if neg: grouped = "-" & grouped
+    outp = grouped & rest
+  result = outp
+
 proc delphiBool*(b: bool): string =
   ## writeln(bool) renders TRUE/FALSE like Delphi/FPC
   if b: result = "TRUE" else: result = "FALSE"
@@ -393,6 +635,164 @@ proc vrecToStr(v: TVarRec): string =
   of vrBool: result = vrecToBoolStr(v)
   of vrStr: result = v.s
   of vrObj: result = ""
+
+proc fpcFormatF*(f: float64; prec: int): string =
+  ## FPC's Str(:w:p) fixed-point form: FPC rounds the SHORTEST
+  ## round-trip decimal representation half-away-from-zero
+  ## (2.675 -> "2.68"), unlike Format's %f variable path
+  var p2 = prec
+  if p2 < 0: p2 = 2
+  var s = $f
+  var neg = false
+  if s.len > 0 and s[0] == '-':
+    neg = true
+    s = substr(s, 1, s.len - 1)
+  var digits = ""
+  var point = 0
+  var ep = find(s, "e", 0)
+  if ep < 0: ep = find(s, "E", 0)
+  var mant: string
+  var expPart: string
+  if ep >= 0:
+    mant = substr(s, 0, ep - 1)
+    expPart = substr(s, ep + 1, s.len - 1)
+  else:
+    mant = s
+    expPart = "0"
+  var seenDot = false
+  var k = 0
+  while k < mant.len:
+    if mant[k] == '.':
+      seenDot = true
+      point = k
+    else:
+      digits.add(mant[k])
+    inc k
+  if not seenDot: point = mant.len
+  var exp = 0
+  var q = 0
+  var eneg = false
+  if q < expPart.len and expPart[q] in {'+', '-'}:
+    eneg = expPart[q] == '-'
+    inc q
+  while q < expPart.len and expPart[q] >= '0' and expPart[q] <= '9':
+    exp = exp * 10 + ord(expPart[q]) - ord('0')
+    inc q
+  if eneg: exp = -exp
+  point = point + exp
+  while digits.len > point and digits[digits.len - 1] == '0':
+    digits = substr(digits, 0, digits.len - 2)
+  let keep = point + p2
+  if keep <= 0:
+    digits = "0"
+    point = 1
+  else:
+    var kept = ""
+    if digits.len <= keep:
+      kept = digits
+      var z = digits.len
+      while z < keep:
+        kept.add('0')
+        inc z
+    else:
+      kept = substr(digits, 0, keep - 1)
+      if digits[keep] >= '5':
+        var i = keep - 1
+        var done = false
+        while i >= 0 and not done:
+          if kept[i] == '9':
+            kept[i] = '0'
+            dec i
+          else:
+            kept[i] = chr(ord(kept[i]) + 1)
+            done = true
+        if not done:
+          kept = "1" & kept
+          point = point + 1
+    digits = kept
+  var outp = ""
+  if point <= 0:
+    outp = "0."
+    var z = 0
+    while z < -point:
+      outp.add('0')
+      inc z
+    outp.add(digits)
+  else:
+    if point >= digits.len:
+      outp = digits
+      var z = digits.len
+      while z < point:
+        outp.add('0')
+        inc z
+      if p2 > 0: outp.add('.')
+      var z2 = 0
+      while z2 < p2:
+        outp.add('0')
+        inc z2
+    else:
+      outp = substr(digits, 0, point - 1) & "." & substr(digits, point, digits.len - 1)
+  if neg: outp = "-" & outp
+  result = outp
+
+proc fpcShortestSci*(f: float64): string =
+  ## FPC's :width-only float form: shortest mantissa + E+-ddd
+  ## (2.5 -> "2.5E+000")
+  var s = $f
+  var neg = false
+  if s.len > 0 and s[0] == '-':
+    neg = true
+    s = substr(s, 1, s.len - 1)
+  var digits = ""
+  var point = 0
+  var ep = find(s, "e", 0)
+  if ep < 0: ep = find(s, "E", 0)
+  var mant: string
+  var expPart: string
+  if ep >= 0:
+    mant = substr(s, 0, ep - 1)
+    expPart = substr(s, ep + 1, s.len - 1)
+  else:
+    mant = s
+    expPart = "0"
+  var seenDot = false
+  var k = 0
+  while k < mant.len:
+    if mant[k] == '.':
+      seenDot = true
+      point = k
+    else:
+      digits.add(mant[k])
+    inc k
+  if not seenDot: point = mant.len
+  var exp = 0
+  var q = 0
+  var eneg = false
+  if q < expPart.len and expPart[q] in {'+', '-'}:
+    eneg = expPart[q] == '-'
+    inc q
+  while q < expPart.len and expPart[q] >= '0' and expPart[q] <= '9':
+    exp = exp * 10 + ord(expPart[q]) - ord('0')
+    inc q
+  if eneg: exp = -exp
+  point = point + exp
+  # first significant digit
+  var z = 0
+  while z < digits.len - 1 and digits[z] == '0':
+    inc z
+  var m = ""
+  m.add(digits[z])
+  var frac = substr(digits, z + 1, digits.len - 1)
+  while frac.len > 0 and frac[frac.len - 1] == '0':
+    frac = substr(frac, 0, frac.len - 2)
+  if frac.len > 0: m = m & "." & frac
+  let e10 = point - 1 - z
+  var es = $e10
+  while es.len < 3: es = "0" & es
+  var sign = "+"
+  if e10 < 0: sign = "-"
+  result = m & "E" & sign & es
+  if neg: result = "-" & result
 
 proc fpcSciMantissa(f: float64; afterPoint: int): string =
   ## the mantissa digits FPC prints: C printf rounding at afterPoint

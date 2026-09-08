@@ -398,7 +398,7 @@ const RtlNames* = [
   # builtin routines (pure renames)
   ("ord", "ord"), ("chr", "chr"), ("length", "len"), ("low", "low"),
   ("high", "high"), ("setlength", "setLen"), ("inc", "inc"), ("dec", "dec"),
-  ("succ", "succ"), ("pred", "pred"), ("abs", "abs"), ("odd", "odd"),
+  ("succ", "succ"), ("pred", "pred"), ("abs", "abs"), ("odd", "Odd"),
   ("round", "round"), ("trunc", "trunc"), ("sizeof", "sizeof"),
   ("sqr", "sqr"), ("sqrt", "sqrt"), ("sin", "sin"), ("cos", "cos"),
   ("min", "min"), ("max", "max"),
@@ -417,7 +417,7 @@ const RtlNames* = [
   ("trim", "Trim"), ("trimleft", "TrimLeft"), ("trimright", "TrimRight"),
   ("sameText", "SameText"), ("comparetext", "CompareText"),
   ("stringofchar", "StringOfChar"), ("ansipos", "Pos"),
-  ("strtofloatdef", "StrToFloatDef"),
+  ("strtofloatdef", "StrToFloatDef"), ("even", "Even"),
 ]
 
 proc rtlSpelling*(lowercaseName: string): string =

@@ -436,3 +436,43 @@ Divergences and fidelity fixes the oracle drove:
   `function Speak: string; virtual;` finally parses.
 - `IntToStr` had a duplicate int64/int overload (nimony's `int` IS
   int64) - removed.
+
+## M5-2: Str/Val/FormatFloat + oracle growth
+
+Four new samples (ordinals, records, funcs, strconv) join the
+oracle - eleven in total, all byte-identical. New fidelity work:
+
+- `Str(v, s)` and `Str(v:w:p, s)`: FPC's Str rounds the SHORTEST
+  round-trip decimal half-away (2.675:0:2 -> "2.68") - a different
+  path from Format's %f variable path. The `:w[:p]` argument syntax
+  parses in call args and lowers to a `pasW` shim call.
+- `Val(s, v, code)`: FPC semantics - leading blanks skipped,
+  optional sign, decimal and `$hex`, code = 1-based position of the
+  first offending character, value zeroed on error. int32/int64/
+  float64 overloads (nimony var params match exactly).
+- `FormatFloat(pattern, value)`: '0' mandatory, '#' optional,
+  ',' thousands, '0.00E+00' scientific, ';'-sections, half-away
+  rounding, "-0" for negatives that round to zero (FPC does too).
+- `Odd`/`Even` shims; `Ord('A')` keeps char args (the 1-char
+  literal seam: most callees want a string, char-arg procs -
+  StringOfChar, Ord, Chr - are on a denylist).
+- FPC's `shr` is LOGICAL (zero fill) while nimony's is arithmetic;
+  `a shr b` lowers to a delphiShr shim call so negatives match.
+- `Inc(x, n)`/`Dec(x, n)` lower to typed assignments - nimony's
+  inc/dec reject mismatched offset types (int64 literal vs int32).
+- `with` on RECORD variables qualifies members directly against
+  the original expression (records copy by value; a hidden temp
+  would swallow writes). Class `with` keeps the ref temp.
+- Variant records (`case Integer of` and `case Tag: Type of`)
+  parse; v1 flattens every branch into plain fields (typical use
+  writes one branch and reads it back - identical behavior).
+- Aliased array types (`TArr = array[1..3] of TPoint`) now carry
+  their low bound into variable declarations (index offset pass).
+- Typed constants (`const Answer: Integer = 42`) and default
+  parameter values (`punct: string = '!')` parse; nimony needs the
+  default's type to match, so 1-char literals become strings.
+- Documented v1 gaps found on the way: untyped integer constants
+  in mixed arithmetic (declare them typed), literal arguments to
+  int/float overloads (nimony resolves ambiguously - use typed
+  vars), FPC requires `;overload` on every overload in a unit,
+  Succ/Pred past the last enum value is out of range in FPC.
