@@ -772,6 +772,7 @@ proc primary(p: var TParser): Node =
         # nested routines see `self` implicitly
         result.add(newIdentNode("self", a.info))
       result = mapStringBuiltins(p, result)
+      result = lowerFormatArrayOfConst(p, result)
       result = p.rewriteMethodPtrCall(result)
     of pxDot:
       let a = result
@@ -2777,6 +2778,21 @@ proc mapStringBuiltins*(p: var TParser, n: Node): Node =
   else:
     return n
 
+proc lowerFormatArrayOfConst*(p: var TParser, n: Node): Node =
+  ## Delphi array-of-const: Format(fmt, [a, b, c]) lowers the bracket
+  ## literal to toVrec calls so the shim's TVarRec openArray accepts it
+  if n.kind == nkCall and n.len >= 1 and n[0].kind == nkIdent and
+      n[0].strVal.toLowerAscii == "format" and n.len == 3 and
+      n[2].kind == nkBracket:
+    var lst = newNode(nkBracket, n[2].info)
+    for e in n[2].sons:
+      var c = newNode(nkCall, e.info)
+      c.add(newIdentNode("toVrec", e.info))
+      c.add(e)
+      lst.add(c)
+    n.sons = @[n[0], n[1], lst]
+  result = n
+
 proc mapBuiltinCall*(p: var TParser, n: Node): Node =
   ## rewrite builtins that need argument changes:
   ## write(x) -> write(stdout, x); writeln(...) -> echo(...);
@@ -2810,6 +2826,8 @@ proc mapBuiltinCall*(p: var TParser, n: Node): Node =
   of "writeln":
     n[0].strVal = "echo"
     return n
+  of "format":
+    return lowerFormatArrayOfConst(p, n)
   of "exit":
     # Exit; / Exit(value);
     let ret = newNode(nkReturnStmt, n.info)

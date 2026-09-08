@@ -161,6 +161,11 @@ proc emitExpr(e: var NifEmitter; n: Node) =
     # rare wrapper; emit inline
     for son in n.sons:
       e.emitExpr(son)
+  of nkBracket:
+    # array literal (array-of-const args): (bracket elem1 elem2 ...)
+    e.buf.copyInto(globalTags.registerTag("bracket"), i):
+      for son in n.sons:
+        e.emitExpr(son)
   else:
     e.emitAtom(n)
 
