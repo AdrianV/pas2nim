@@ -16,3 +16,4 @@ test.txt
 # harness / editor state
 .dsh/
 .vscode/
+*.log

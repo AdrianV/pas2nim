@@ -152,6 +152,20 @@ proc emitExpr(e: var NifEmitter; n: Node) =
 # ---------------------------------------------------------------------------
 # type descriptors
 
+proc emitTypeVars(e: var NifEmitter; d: Node; i: NifLineInfo) =
+  ## the `(typevars (typevar K . . . .) ...)` slot; a dot when the def
+  ## carries no type parameters
+  if d.len > 1 and d[1].kind == nkBracket and d[1].len > 0:
+    e.buf.copyInto(globalTags.registerTag("typevars"), i):
+      for pn in d[1].sons:
+        let pi = e.info(pn)
+        e.buf.copyInto(globalTags.registerTag("typevar"), pi):
+          e.buf.addIdent(e.nameOf(pn), pi)
+          for k in 0 ..< 4:
+            e.buf.addDotToken(pi)
+  else:
+    e.buf.addDotToken(i)
+
 proc emitTypeDesc(e: var NifEmitter; n: Node) =
   let i = e.info(n)
   case n.kind
@@ -190,6 +204,12 @@ proc emitTypeDesc(e: var NifEmitter; n: Node) =
         e.buf.addDotToken(i)
   of nkEmpty:
     e.buf.addDotToken(i)
+  of nkIndexExpr:
+    # generic instantiation: (at Base arg1 arg2)
+    e.buf.copyInto(globalTags.registerTag("at"), i):
+      e.emitTypeDesc(n[0])
+      for j in 1 ..< n.len:
+        e.emitTypeDesc(n[j])
   else:
     e.buf.addDotToken(i)
 
@@ -484,7 +504,7 @@ proc emitProcDef(e: var NifEmitter; n: Node) =
     e.emitProcName(n, i)
     e.emitExportSlot(n[0], i)
     e.buf.addDotToken(i)      # pattern
-    e.buf.addDotToken(i)      # typevars
+    e.emitTypeVars(n, i)
     if n.len > 2 and n[2].kind == nkFormalParams:
       e.emitParamList(n[2])
       # rettype from params[0]
@@ -515,13 +535,16 @@ proc emitTypeDef(e: var NifEmitter; n: Node; hoisted: var seq[Node]) =
   e.buf.copyInto(globalTags.registerTag("type"), i):
     e.buf.addIdent(e.nameOf(n[0]), e.info(n[0]))
     e.emitExportSlot(n[0], i)
-    e.buf.addDotToken(i)      # generics
+    e.emitTypeVars(n, i)
     if ty.kind == nkRefTy and ty[0].kind == nkObjectTy:
       # class
       let obj = ty[0]
       let pi = e.info(n)
-      e.buf.copyInto(globalTags.registerTag("pragmas"), pi):
-        e.buf.addIdent("inheritable", pi)
+      if n.len > 1 and n[1].kind == nkBracket and n[1].len > 0:
+        e.buf.addDotToken(pi)   # generic: no {.inheritable.} allowed
+      else:
+        e.buf.copyInto(globalTags.registerTag("pragmas"), pi):
+          e.buf.addIdent("inheritable", pi)
       e.buf.copyInto(globalTags.registerTag("ref"), e.info(ty)):
         let oi = e.info(obj)
         e.buf.copyInto(globalTags.registerTag("object"), oi):

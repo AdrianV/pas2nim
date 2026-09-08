@@ -66,6 +66,8 @@ type
     intfSigs*: Table[string, seq[Node]]  ## interface key -> base-method defs
     classVarHoist*: seq[Node]   ## class var decls hoisted to module level
     recordTypes*: Table[string, bool]  ## lowercase record type names
+    curTypeParams*: seq[string]  ## params of the type being declared
+    genericArgDepth*: int  ## > 0 while parsing `<...>` generic args
     withTemps*: seq[string]     ## hidden per-with temporaries by depth
     withClasses*: seq[string]   ## class spelling per with depth
     withDepth*: int             ## active with-scope count
@@ -405,6 +407,74 @@ proc decIndex(p: var TParser, n: Node): Node =
     result.add(n)
     result.add(newIntNode(nkIntLit, 1, n.info))
 
+proc finishGenericInstantiation(p: var TParser, head: Node,
+    headConsumed: bool): Node =
+  ## consume `<T, U>` after a generic type name -> nkIndexExpr and
+  ## register the instance as a class sharing the generic's sets;
+  ## `headConsumed` is false in type positions (the name is current),
+  ## true in the postfix loop (the head was already consumed)
+  result = newNode(nkIndexExpr, head.info)
+  result.add(head)
+  if not headConsumed:
+    getTokP(p)
+    skipCom(p)
+  p.eat(pxLt)
+  skipCom(p)
+  inc p.genericArgDepth
+  var key = head.strVal.toLowerAscii & "<"
+  var spell = head.strVal & "<"
+  var first = true
+  while p.tok.xkind != pxGt and p.tok.xkind != pxEof:
+    if not first:
+      key.add(",")
+      spell.add(", ")
+    let t = parseTypeDesc(p, emptyNode(p.tok.info))
+    result.add(t)
+    if t.kind == nkIdent:
+      let m = rtlSpelling(t.strVal.toLowerAscii)
+      key.add(m)
+      spell.add(m)
+    else:
+      key.add("?")
+      spell.add("?")
+    first = false
+    if p.tok.xkind == pxComma:
+      getTokP(p)
+      skipCom(p)
+  key.add(">")
+  spell.add(">")
+  dec p.genericArgDepth
+  p.eat(pxGt)
+  skipCom(p)
+  p.syms.registerSpecializedAlias(head.strVal, spell)
+
+proc parseGenericParams(p: var TParser): Node =
+  ## `<K, V: class, constructor>` -> nkBracket [K, V]; the
+  ## constraint list after a param's colon is dropped (v1)
+  result = newNode(nkBracket, p.tok.info)
+  getTokP(p)
+  skipCom(p)
+  p.curTypeParams = @[]
+  while p.tok.xkind != pxGt and p.tok.xkind != pxEof:
+    if p.tok.xkind != pxSymbol:
+      parError(p, "type parameter name expected, got " & $p.tok)
+    let nm = p.tok.ident
+    p.curTypeParams.add(nm)
+    result.add(newIdentNode(nm, p.tok.info))
+    getTokP(p)
+    skipCom(p)
+    if p.tok.xkind == pxColon:
+      # drop the constraint: scan to the next comma/semicolon/angle-close
+      while p.tok.xkind != pxEof and
+          p.tok.xkind notin {pxComma, pxSemiColon, pxGt}:
+        getTokP(p)
+        skipCom(p)
+    if p.tok.xkind == pxComma or p.tok.xkind == pxSemiColon:
+      getTokP(p)
+      skipCom(p)
+  p.eat(pxGt)
+  skipCom(p)
+
 proc mappedTypeName(p: var TParser, ty: Node): string =
   ## mapped spelling of a simple type node; "" when unknown/complex
   result = ""
@@ -412,6 +482,15 @@ proc mappedTypeName(p: var TParser, ty: Node): string =
   if t.kind == nkVarTy and t.len > 0: t = t[0]
   if t.kind == nkIdent:
     result = rtlSpelling(t.strVal.toLowerAscii)
+  elif t.kind == nkIndexExpr and t.len > 1 and t[0].kind == nkIdent:
+    result = t[0].strVal.toLowerAscii & "<"
+    for i in 1 ..< t.len:
+      if i > 1: result.add(",")
+      if t[i].kind == nkIdent:
+        result.add(rtlSpelling(t[i].strVal.toLowerAscii))
+      else:
+        result.add("?")
+    result.add(">")
 
 proc stringBaseType(p: var TParser, base: Node): string =
   ## resolved type spelling of a simply-indexed base (var, param, field);
@@ -560,6 +639,14 @@ proc primary(p: var TParser): Node =
         getTokP(p)
       else:
         parError(p, "identifier expected after '.'")
+    of pxLt:
+      # generic instantiation in an expression: `TFoo<int>.Create`;
+      # only when the head is a declared generic type, which
+      # disambiguates from the `<` operator
+      if result.kind == nkIdent and p.syms.isGenericClass(result.strVal):
+        result = finishGenericInstantiation(p, result, true)
+      else:
+        break
     of pxHat:
       let a = result
       result = newNode(nkDeref, a.info)
@@ -573,6 +660,11 @@ proc lowestExprAux(p: var TParser, v: var Node, limit: int): TTokKind =
   v = primary(p)
   var op = p.tok.xkind
   var opPred = getPrecedence(op)
+  if p.genericArgDepth > 0 and op == pxGt:
+    # inside `<...>` the `>` closes the bracket; it is not the
+    # greater-than operator
+    result = op
+    return
   while opPred > limit:
     let node = newNodeP(nkInfix, p)
     let opNode = newIdentNode($p.tok, p.tok.info)
@@ -735,8 +827,17 @@ proc parseRecordCase*(p: var TParser): Node =
     skipCom(p)
 
 proc genSelfType(p: var TParser): Node =
-  if p.selfClass.len > 0: newIdentNode(p.selfClass, p.tok.info)
-  else: emptyNode(p.tok.info)
+  if p.selfClass.len > 0:
+    let ci = p.syms.classes.getOrDefault(p.selfClass.toLowerAscii)
+    if ci.typeParams.len > 0:
+      result = newNode(nkIndexExpr, p.tok.info)
+      result.add(newIdentNode(p.selfClass, p.tok.info))
+      for t in ci.typeParams:
+        result.add(newIdentNode(t, p.tok.info))
+    else:
+      result = newIdentNode(p.selfClass, p.tok.info)
+  else:
+    result = emptyNode(p.tok.info)
 
 proc genSelfParam(p: var TParser; isVar: bool): Node =
   ## `self: MyClass` or `self: var MyClass`
@@ -1202,16 +1303,24 @@ proc parseTypeDesc*(p: var TParser, definition: Node): Node =
     getTokP(p)
     result = parseTypeDesc(p, emptyNode(p.tok.info))
   else:
-    let a = parseExpr(p)
-    if p.tok.xkind == pxDotDot:
-      result = newNodeP(nkRangeTy, p)
-      let r = newNode(nkRange, a.info)
-      r.add(a)
+    if p.tok.xkind == pxSymbol and p.tok.ident.toLowerAscii == "specialize":
+      # FPC style: `specialize TPair<int, string>`
       getTokP(p)
-      r.add(parseExpr(p))
-      result.add(r)
+      skipCom(p)
+    if p.tok.xkind == pxSymbol and p.peekTok().xkind == pxLt:
+      result = finishGenericInstantiation(p,
+          newIdentNode(p.tok.ident, p.tok.info), false)
     else:
-      result = a
+      let a = parseExpr(p)
+      if p.tok.xkind == pxDotDot:
+        result = newNodeP(nkRangeTy, p)
+        let r = newNode(nkRange, a.info)
+        r.add(a)
+        getTokP(p)
+        r.add(parseExpr(p))
+        result.add(r)
+      else:
+        result = a
   p.context = oldcontext
 
 proc addPragmaToIdent*(ident: Node, pragma: Node): Node =
@@ -1292,10 +1401,18 @@ proc parseRecordBody(p: var TParser, result: Node, definition: Node) =
       skipCom(p)
     of pxFunction, pxProcedure, pxConstructor, pxDestructor:
       # bodiless method declarations inside the class body
-      let xkind = p.tok.xkind
       let a = parseRoutine(p, true)
-      discard xkind
-      body.add(a)
+      if a.kind in {nkProcDef, nkFuncDef} and a.len > 0 and
+          a[a.len - 1].kind == nkEmpty and
+          p.syms.isGenericClass(definition.strVal):
+        # a generic class's bodiless declaration must not become a
+        # module-level forward: the type params would be undeclared
+        # there; the implementation alone defines the member
+        let c = newNode(nkCommentStmt, a.info)
+        c.strVal = "# class member: " & a[0].strVal
+        body.add(c)
+      else:
+        body.add(a)
       p.opt(pxSemiColon)
       skipCom(p)
     of pxProperty:
@@ -1422,6 +1539,10 @@ proc parseRecordOrObject*(p: var TParser, kind: NodeKind,
   else:
     record.add(emptyNode(definition.info))
   p.syms.registerClass(defName, parent, kind == nkRefTy)
+  if p.curTypeParams.len > 0:
+    var ci = p.syms.classes.getOrDefault(defName.toLowerAscii)
+    ci.typeParams = p.curTypeParams
+    p.syms.classes[defName.toLowerAscii] = ci
   parseRecordBody(p, record, definition)
 
 # ---------------------------------------------------------------------------
@@ -1712,8 +1833,13 @@ proc parseTypeDef*(p: var TParser): Node =
   result = newNodeP(nkTypeDef, p)
   if p.tok.xkind != pxSymbol:
     parError(p, "type name expected, got " & $p.tok)
-  let name = p.tok.ident
+  var name = p.tok.ident
   let nameInfo = p.tok.info
+  if name.toLowerAscii == "generic" and p.peekTok().xkind == pxSymbol:
+    # FPC objfpc style: `generic TFoo<T> = class ...`
+    getTokP(p)
+    skipCom(p)
+    name = p.tok.ident
   getTokP(p)
   skipCom(p)
   p.syms.declareName(name)
@@ -1721,7 +1847,11 @@ proc parseTypeDef*(p: var TParser): Node =
   if p.section == seInterface and p.visibility != visPrivate:
     nameNode.exported = true
   result.add(nameNode)
-  result.add(emptyNode(nameInfo))      # generic params (unused)
+  if p.tok.xkind == pxLt:
+    # generic type: `TFoo<K, V> = ...` (Delphi style)
+    result.add(parseGenericParams(p))
+  else:
+    result.add(emptyNode(nameInfo))      # generic params (unused)
   if p.tok.xkind == pxEquals:
     getTokP(p)
     skipCom(p)
@@ -1746,6 +1876,10 @@ proc parseTypeDef*(p: var TParser): Node =
   if p.tok.xkind == pxSemiColon:
     getTokP(p)
     skipCom(p)
+  # a `specialize` alias is a first-class class type
+  if result.len == 3 and result[2].kind == nkIndexExpr:
+    p.syms.registerSpecializedAlias(result[2][0].strVal, name)
+  p.curTypeParams = @[]
 
 proc parseTypeSection*(p: var TParser): Node =
   result = newNodeP(nkTypeSection, p)
@@ -1917,6 +2051,14 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
   skipCom(p)
   var isMethod = false
   var isDotted = false
+  if p.tok.xkind == pxLt:
+    # dotted generic impl: `TFoo<K, V>.DoIt` - the params come from
+    # the class registry, the bracket list is only syntax
+    while p.tok.xkind != pxGt and p.tok.xkind != pxEof:
+      getTokP(p)
+      skipCom(p)
+    p.eat(pxGt)
+    skipCom(p)
   if p.tok.xkind == pxDot:
     # qualified: `MyClass.doIt`
     let cls = name
@@ -1965,8 +2107,15 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
   if isExported:
     p.syms.exportedNames[defName.toLowerAscii] = true
   result.add(exSymbol(nameNode, isExported))
-  # generic params: none
-  result.add(emptyNode(nameInfo))
+  # generic params: the enclosing generic class's type params
+  var typeVars = emptyNode(nameInfo)
+  if p.classOfProc.len > 0:
+    let ci = p.syms.classes.getOrDefault(p.classOfProc.toLowerAscii)
+    if ci.typeParams.len > 0:
+      typeVars = newNode(nkBracket, nameInfo)
+      for t in ci.typeParams:
+        typeVars.add(newIdentNode(t, nameInfo))
+  result.add(typeVars)
   # params
   let params = p.parseParamList()
   p.opt(pxSemiColon)
@@ -3429,8 +3578,9 @@ proc rewriteCtorCalls*(p: var TParser, n: Node): Node =
   ## `Second.create(v)` -> `create(Second(), v)`; an inherited
   ## constructor call gets an explicit cast back to the subclass
   if n.kind == nkCall and n.len >= 1 and n[0].kind == nkDotExpr and
-      n[0][0].kind == nkIdent and n[0][1].kind == nkIdent:
-    let cls = n[0][0].strVal
+      n[0][0].kind in {nkIdent, nkIndexExpr} and n[0][1].kind == nkIdent:
+    let cls = if n[0][0].kind == nkIdent: n[0][0].strVal
+              else: n[0][0][0].strVal
     let name = n[0][1].strVal
     if p.syms.isCtorOf(cls, name):
       # the prelude exception ctor is named pasExcCreate in systempas
@@ -3442,7 +3592,7 @@ proc rewriteCtorCalls*(p: var TParser, n: Node): Node =
       let newCall = newNode(nkCall, n.info)
       newCall.add(newIdentNode(callee, n.info))
       let ctor = newNode(nkCall, n.info)
-      ctor.add(newIdentNode(cls, n.info))
+      ctor.add(n[0][0])
       newCall.add(ctor)
       for i in 1 ..< n.len:
         newCall.add(n[i])
@@ -3657,7 +3807,8 @@ proc parseUnit*(p: var TParser): Node =
   for key, ci in p.syms.classes:
     # only when neither the class nor any ancestor declares a
     # constructor; otherwise the inherited-ctor path applies
-    if ci.isRef and p.syms.findCtorClass(key, "create").len == 0:
+    if ci.isRef and ci.genericOf.len == 0 and
+        p.syms.findCtorClass(key, "create").len == 0:
       ctorless.add(key)
   var sortedCtorless: seq[string] = @[]
   for key in ctorless:
@@ -3678,12 +3829,23 @@ proc parseUnit*(p: var TParser): Node =
     let info = TLineInfo(line: 0, col: 0, file: p.module.info.file)
     var def = newNode(nkProcDef, info)
     def.add(exSymbol(newIdentNode("create", info), false))
-    def.add(emptyNode(info))
+    var selfTy: Node = newIdentNode(ci.spelling, info)
+    if ci.typeParams.len > 0:
+      var tv = newNode(nkBracket, info)
+      for t in ci.typeParams:
+        tv.add(newIdentNode(t, info))
+      def.add(tv)
+      selfTy = newNode(nkIndexExpr, info)
+      selfTy.add(newIdentNode(ci.spelling, info))
+      for t in ci.typeParams:
+        selfTy.add(newIdentNode(t, info))
+    else:
+      def.add(emptyNode(info))
     var fp = newNode(nkFormalParams, info)
-    fp.add(newIdentNode(ci.spelling, info))
+    fp.add(selfTy)
     var sd = newNode(nkIdentDefs, info)
     sd.add(newIdentNode("self", info))
-    sd.add(newIdentNode(ci.spelling, info))
+    sd.add(selfTy)
     sd.add(emptyNode(info))
     fp.add(sd)
     def.add(fp)

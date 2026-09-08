@@ -286,6 +286,13 @@ proc typeStr(s: var TRendor, n: Node): string =
     result = "set[" & s.typeStr(n[0]) & "]"
   of nkRangeTy:
     result = "range[" & s.expr(n[0][0]) & ".." & s.expr(n[0][1]) & "]"
+  of nkIndexExpr:
+    # generic instantiation in a type position
+    result = s.typeStr(n[0]) & "["
+    for i in 1 ..< n.len:
+      if i > 1: result.add(", ")
+      result.add(s.typeStr(n[i]))
+    result.add("]")
   of nkProcTy:
     result = "proc ("
     let params = n[0]
@@ -320,6 +327,17 @@ proc emitBranchBody(s: var TRendor, n: Node) =
     s.stmt(n)
   s.indent = s.indent - 1
 
+proc typeParamsSuffix(s: var TRendor, d: Node): string =
+  ## `[K, V]` suffix for generic defs; "" when non-generic
+  if d.len > 1 and d[1].kind == nkBracket and d[1].len > 0:
+    result = "["
+    for i in 0 ..< d[1].len:
+      if i > 0: result.add(", ")
+      result.add(s.canon(d[1][i].strVal))
+    result.add("]")
+  else:
+    result = ""
+
 proc renderDefSig(s: var TRendor, n: Node): string =
   ## `proc name(self: C; a: T): R` for a def node
   var nameNode = n[0]
@@ -332,6 +350,7 @@ proc renderDefSig(s: var TRendor, n: Node): string =
            of nkMethodDef: "method"
            else: "template"
   result = kw & " " & tickName(s.canon(nameNode.strVal))
+  result.add(s.typeParamsSuffix(n))
   if exported: result.add("*")
   if n.len >= 3 and n[2].kind == nkFormalParams:
     result.add(s.gParams(n[2]))
@@ -366,8 +385,13 @@ proc renderTypeDef(s: var TRendor, def: Node, hoisted: var seq[Node]) =
   if ty.kind == nkRefTy and ty[0].kind == nkObjectTy:
     # class: `Name {.inheritable.} = ref object of Parent`
     var line1 = s.canon(nameNode.strVal)
+    line1.add(s.typeParamsSuffix(def))
     if exported: line1.add("*")
-    line1.add(" {.inheritable.} = ref object")
+    if s.typeParamsSuffix(def).len > 0:
+      # nimony rejects {.inheritable.} on generic object types
+      line1.add(" = ref object")
+    else:
+      line1.add(" {.inheritable.} = ref object")
     let obj = ty[0]
     if obj[0].kind == nkOfInherit:
       line1.add(" of " & s.typeStr(obj[0][0]))
@@ -392,6 +416,7 @@ proc renderTypeDef(s: var TRendor, def: Node, hoisted: var seq[Node]) =
   elif ty.kind == nkObjectTy:
     # plain object/record
     var line1 = s.canon(nameNode.strVal)
+    line1.add(s.typeParamsSuffix(def))
     if exported: line1.add("*")
     var hasParent = false
     if ty[0].kind == nkOfInherit:
@@ -421,6 +446,7 @@ proc renderTypeDef(s: var TRendor, def: Node, hoisted: var seq[Node]) =
     s.indent = s.indent - 1
   elif ty.kind == nkEnumTy:
     var line1 = s.canon(nameNode.strVal)
+    line1.add(s.typeParamsSuffix(def))
     if exported: line1.add("*")
     line1.add(" = enum ")
     for i in 0 ..< ty.len:

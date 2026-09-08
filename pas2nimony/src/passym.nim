@@ -32,6 +32,9 @@ type
     ## default array property info ("" when none):
     arrName*, arrGetter*, arrSetter*: string
     arrIdxType*, arrValType*: string
+    typeParams*: seq[string]  ## generic type params ("" when non-generic)
+    genericOf*: string        ## lowercase generic key for specialized
+                              ## aliases/instances ("" for real types)
 
 const
   # Delphi exception class -> nimony ErrorCode mapping (lossy!)
@@ -92,6 +95,37 @@ proc isDeclared*(t: SymTab; spelling: string): bool =
 
 # ---------------------------------------------------------------------------
 # class registry
+
+proc isGenericClass*(t: SymTab; name: string): bool =
+  ## true when `name` declares type parameters (a generic type)
+  let ci = t.classes.getOrDefault(name.toLowerAscii)
+  result = ci.spelling.len > 0 and ci.typeParams.len > 0
+
+proc typeParamsOf*(t: SymTab; name: string): seq[string] =
+  let ci = t.classes.getOrDefault(name.toLowerAscii)
+  result = ci.typeParams
+
+proc registerSpecializedAlias*(t: var SymTab; genericName: string;
+    instance: string) =
+  ## register `instance` (e.g. `TFoo<int32,string>` or a `specialize`
+  ## alias) as a class type sharing the generic's member sets so the
+  ## ctor/method machinery behaves like for any other class
+  let ci = t.classes.getOrDefault(genericName.toLowerAscii)
+  if ci.spelling.len == 0:
+    return
+  let ikey = instance.toLowerAscii
+  if t.classes.hasKey(ikey):
+    return
+  var info = ClassInfo(spelling: instance, isRef: ci.isRef,
+                       typeParams: ci.typeParams,
+                       genericOf: genericName.toLowerAscii)
+  for f, v in ci.fieldSet: info.fieldSet[f] = v
+  for r, v in ci.routineSet: info.routineSet[r] = v
+  for c, v in ci.ctorSet: info.ctorSet[c] = v
+  for m, v in ci.methodSet: info.methodSet[m] = v
+  for s, v in ci.classVarSet: info.classVarSet[s] = v
+  for s, v in ci.classProcSet: info.classProcSet[s] = v
+  t.classes[ikey] = info
 
 proc registerClass*(t: var SymTab; spelling: string; parent: string; isRef: bool) =
   ## register a class/object type; also declares its name
@@ -256,7 +290,10 @@ proc isCtorOf*(t: SymTab; cls, name: string): bool =
     let ci = t.classes.getOrDefault(key)
     if ci.spelling.len == 0: break
     if ci.ctorSet.hasKey(name.toLowerAscii): return true
-    key = ci.parent
+    if ci.genericOf.len > 0 and ci.genericOf != key:
+      key = ci.genericOf
+    else:
+      key = ci.parent
     inc guard
   return false
 
@@ -269,7 +306,10 @@ proc isMemberOf*(t: SymTab; cls, name: string): bool =
     if ci.spelling.len == 0: break
     if ci.fieldSet.hasKey(name.toLowerAscii): return true
     if ci.routineSet.hasKey(name.toLowerAscii): return true
-    key = ci.parent
+    if ci.genericOf.len > 0 and ci.genericOf != key:
+      key = ci.genericOf
+    else:
+      key = ci.parent
     inc guard
   return false
 
@@ -281,7 +321,10 @@ proc isFieldOf*(t: SymTab; cls, name: string): bool =
     let ci = t.classes.getOrDefault(key)
     if ci.spelling.len == 0: break
     if ci.fieldSet.hasKey(name.toLowerAscii): return true
-    key = ci.parent
+    if ci.genericOf.len > 0 and ci.genericOf != key:
+      key = ci.genericOf
+    else:
+      key = ci.parent
     inc guard
   return false
 
