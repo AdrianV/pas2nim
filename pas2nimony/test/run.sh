@@ -230,6 +230,39 @@ if [ $# -eq 0 ] && [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/twounit" ]; then
   fi
 fi
 
+# ---- pasler CLI: nimony-compatible commands, -d: defines, --path: ----
+if [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/clitest" ]; then
+  echo "== pasler-cli"
+  mkdir -p "$TMP/pasler-cli"
+  cp "$HERE"/clitest/*.pas "$TMP/pasler-cli/"
+  cp -r "$HERE"/clitest/units "$TMP/pasler-cli/units"
+  out="$(cd "$TMP/pasler-cli" && timeout 300 "$ROOT/bin/pasler" \
+      --nimony:"$NIMONY" --path:units -d:CLI_FLAG --run cond.pas 2>&1 |
+      grep -v nifmake || true)"
+  echo "$out"
+  if [ "$out" = "3235
+local on" ]; then
+    echo "-- ok"
+  else
+    echo "   CLI DEFINE RUN MISMATCH (want 3235/local on)"; fail=1
+  fi
+  out2="$(cd "$TMP/pasler-cli" && rm -rf nimcache && timeout 300 \
+      "$ROOT/bin/pasler" --path:units --run cond.pas 2>&1 |
+      grep -v nifmake)"
+  if [ "$out2" = "3236
+local on" ]; then
+    echo "-- ok2"
+  else
+    echo "   CLI NO-DEFINE RUN MISMATCH (want 3236/local on)"; fail=1
+  fi
+  if (cd "$TMP/pasler-cli" && timeout 300 "$ROOT/bin/pasler" check \
+      --path:units -d:CLI_FLAG cond.pas > /dev/null 2>&1); then
+    echo "-- ok3 (check)"
+  else
+    echo "   CLI CHECK FAILED"; fail=1
+  fi
+fi
+
 # M5 oracle: differential testing against real FPC (skips without fpc)
 if ! sh "$HERE/oracle.sh"; then
   echo "   ORACLE FAILED"; fail=1

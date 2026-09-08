@@ -73,6 +73,11 @@ type
     ## conversion operator registry: key
     ## "conv:<cls>:<kind>:<from>:<to>" -> the lowered proc name
     ## (Delphi class operator Implicit/Explicit/Inc/Dec)
+    defines*: Table[string, bool]
+    ## conditional-compilation symbols: CLI -d: defines seed it and
+    ## {$define}/{$undef} mutate it; {$ifdef}/{$ifndef} evaluate at
+    ## parse time (Delphi model - the dead branch is skipped so its
+    ## units never absorb)
 
 proc initSymTab*(): SymTab =
   result = SymTab()

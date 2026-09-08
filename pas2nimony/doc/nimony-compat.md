@@ -554,3 +554,34 @@ Building it flushed out eight real gaps, all fixed:
   `result :=` bodies of float-returning routines.
 - the discarded-value rule now consults the receiver's class
   before the global name flag.
+
+## M6-3: nimony-compatible command line
+
+Both drivers now speak the nimony CLI:
+
+- `pasler [command] [options] program.pas [-- program-args]` with
+  nimony's command verbs: `c` (default; the fast NIF pipeline),
+  `n` (native libc-free backend), `w` (wasm - the shims are not
+  freestanding-safe yet, nimony's own error surfaces), `check`
+  (type-check only), plus `m`/`s`/`doc`/`l` tolerance. `n`,
+  `check`, `w`, `m`, `doc`, `l` delegate to nimony's own project
+  graph over the rendered .nim anchors; `c` keeps the TokenBuf
+  NIF pipeline.
+- Options nimony understands are forwarded verbatim (`-d:SYM`,
+  `--path:DIR`, `-o:`, `--cc:`, `--opt:`, `--passC:`, ...);
+  FPC-style `-dSYM` is accepted too. `--run`/`-r` builds and
+  executes; arguments after `--` reach the program.
+- `--path:` is shared state: it feeds the Pascal uses-resolution
+  (units can live in --path: dirs, not only beside the importer)
+  and nimony's import paths.
+- Conditional compilation (Delphi model): `{$ifdef}/{$ifndef}/
+  {$else}/{$endif}` evaluate at parse time from CLI defines plus
+  source `{$define}/{$undef}`; the dead branch is skipped at the
+  token level, so its units never absorb and its declarations
+  never register. CLI defines propagate into used units; source
+  defines stay local. `{$if}` still lowers to a nimony `when`.
+- pas2nimony accepts the same option surface (verbs are accepted
+  and ignored - it always translates).
+- Suite section `pasler-cli` covers define on/off runs and
+  `check`; `pasler n` verified manually on the probe (native
+  binary produced and runs).

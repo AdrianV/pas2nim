@@ -50,6 +50,8 @@ type
     context*: TContextKind
     visibility*: TVisibility
     selfClass*: string          ## spelling of the current class ("" if none)
+    searchPaths*: seq[string]   ## --path: dirs for uses resolution
+    sourceDefines*: Table[string, bool] ## {$define}d in this source
     flags*: set[TParserFlag]
     syms*: SymTab
     extra*: seq[TExtraStmt]
@@ -129,11 +131,21 @@ proc newNodeP(kind: NodeKind, p: TParser): Node =
 proc newIdentNameNodeP(name: string, p: TParser): Node =
   newIdentNode(name, p.tok.info)
 
-proc openParser*(p: var TParser, filename: string, flags: set[TParserFlag]) =
+proc openParser*(p: var TParser, filename: string, flags: set[TParserFlag],
+                 defines: seq[string] = @[],
+                 searchPaths: seq[string] = @[]) =
   p.lex = TLexer()
   p.lex.openLexer(filename)
   p.flags = flags
   p.syms = initSymTab()
+  for d in defines:
+    # conditional symbols are case-insensitive (Delphi model); a
+    # `-d:FOO=bar` style value defines the name only
+    let n = d.toLowerAscii
+    let eq = n.find('=')
+    p.syms.defines[if eq >= 0: n[0 ..< eq] else: n] = true
+  p.searchPaths = searchPaths
+  p.sourceDefines = initTable[string, bool]()
   var us = UnitSet()
   us.files = initTable[string, bool]()
   p.absorbed = us
@@ -217,26 +229,106 @@ proc parseIfDirAux(p: var TParser, result: Node) =
       else:
         parError(p, "{$endif} expected")
 
+proc parseCondName(p: var TParser): string =
+  ## the conditional symbol inside `{$ifdef NAME}` (case-insensitive)
+  result = ""
+  if p.tok.xkind == pxSymbol:
+    result = p.tok.ident.toLowerAscii
+    getTokP(p)
+  else:
+    parError(p, "identifier expected in conditional directive")
+
+proc skipCondBranch(p: var TParser, endMarker: TTokKind): bool =
+  ## skip tokens up to the branch end; true when a depth-0 `{$else}`
+  ## was reached (its token is KEPT for the caller), false after the
+  ## matching `{$endif}` was consumed. Nesting-aware: inner
+  ## {$ifdef}/{$if} groups are traversed.
+  var depth = 0
+  while p.tok.xkind != pxEof:
+    if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
+      let em = succ(p.tok.xkind)
+      case p.tok.ident.toLowerAscii
+      of "ifdef", "ifndef", "if":
+        inc depth
+      of "else":
+        if depth == 0:
+          return true
+      of "endif":
+        if depth == 0:
+          getTokP(p)
+          p.eat(em)
+          return false
+        dec depth
+      else: discard
+    getTokP(p)
+  result = false
+
+proc parseCondDir(p: var TParser, endMarker: TTokKind, negate: bool): Node =
+  ## Delphi-model conditional compilation: the condition is evaluated
+  ## at parse time (CLI -d: defines + {$define}); the dead branch is
+  ## skipped at the token level, so its units never absorb and its
+  ## declarations never register. The taken branch's statements are
+  ## returned as a flattened nkStmtList (both renderers inline it).
+  getTokP(p)                    # skip `{$ifdef` / `{$ifndef`
+  let name = parseCondName(p)
+  let defined = p.syms.defines.getOrDefault(name, false)
+  let taken = if negate: not defined else: defined
+  p.eat(endMarker)              # closing brace of the directive
+  result = newNodeP(nkStmtList, p)
+  result.strVal = "#condsplice"
+  template consumeDir() {.dirty.} =
+    let emX = succ(p.tok.xkind)
+    getTokP(p)
+    p.eat(emX)
+  if taken:
+    skipCom(p)
+    while true:
+      if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
+        case p.tok.ident.toLowerAscii
+        of "else":
+          # the dead alternative is skipped to the matching {$endif}
+          consumeDir()
+          discard skipCondBranch(p, endMarker)
+          break
+        of "endif":
+          consumeDir()
+          break
+        else:
+          result.add(parseStmt(p))
+      elif p.tok.xkind == pxEof:
+        break
+      else:
+        result.add(parseStmt(p))
+        p.opt(pxSemiColon)
+        skipCom(p)
+  else:
+    if skipCondBranch(p, endMarker):
+      # the {$else} branch is live: consume the kept token first
+      consumeDir()
+      skipCom(p)
+      while true:
+        if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
+          if p.tok.ident.toLowerAscii == "endif":
+            consumeDir()
+            break
+          else:
+            result.add(parseStmt(p))
+            p.opt(pxSemiColon)
+            skipCom(p)
+        elif p.tok.xkind == pxEof:
+          break
+        else:
+          result.add(parseStmt(p))
+          p.opt(pxSemiColon)
+          skipCom(p)
+  if result.len == 0:
+    result = newNodeP(nkEmpty, p)
+
 proc parseIfdefDir(p: var TParser, endMarker: TTokKind): Node =
-  result = newNodeP(nkWhenExpr, p)
-  let branch = newNodeP(nkElifBranch, p)
-  getTokP(p)                    # skip `{$ifdef`
-  branch.add(definedExpr(p))
-  result.add(branch)
-  p.eat(endMarker)
-  parseIfDirAux(p, result)
+  parseCondDir(p, endMarker, false)
 
 proc parseIfndefDir(p: var TParser, endMarker: TTokKind): Node =
-  result = newNodeP(nkWhenExpr, p)
-  let branch = newNodeP(nkElifBranch, p)
-  getTokP(p)                    # skip `{$ifndef`
-  let e = newNodeP(nkCall, p)
-  e.add(newIdentNameNodeP("not", p))
-  e.add(definedExpr(p))
-  branch.add(e)
-  result.add(branch)
-  p.eat(endMarker)
-  parseIfDirAux(p, result)
+  parseCondDir(p, endMarker, true)
 
 proc parseIfDir(p: var TParser, endMarker: TTokKind): Node =
   result = newNodeP(nkWhenExpr, p)
@@ -256,6 +348,17 @@ proc parseDirective(p: var TParser): Node =
     of "if": result = parseIfDir(p, endMarker)
     of "ifdef": result = parseIfdefDir(p, endMarker)
     of "ifndef": result = parseIfndefDir(p, endMarker)
+    of "define":
+      getTokP(p)
+      let nm = parseCondName(p)
+      p.syms.defines[nm] = true
+      p.sourceDefines[nm] = true
+      p.eat(endMarker)
+    of "undef":
+      getTokP(p)
+      let nm = parseCondName(p)
+      p.syms.defines[nm] = false
+      p.eat(endMarker)
     else:
       # skip unknown compiler directive
       while p.tok.xkind != pxEof and p.tok.xkind != endMarker: getTokP(p)
@@ -268,22 +371,38 @@ proc parseDirective(p: var TParser): Node =
 
 proc absorbUnit*(p: var TParser, unitName: string) =
   ## register the used unit's declarations (classes, ctors, routines,
-  ## canonical spellings) by parsing the unit file next to this one
-  # the unit file may be spelled in any of the usual Pascal casings
+  ## canonical spellings) by parsing the unit file next to this one;
+  ## the --path: search paths are consulted when the unit is not next
+  ## to the importer
   let dir = parentDir(p.lex.filename)
   var unitFile = ""
+  var dirs: seq[string] = @[]
+  if dir.len > 0: dirs.add(dir)
+  dirs.add(".")
+  for sp in p.searchPaths:
+    if sp notin dirs: dirs.add(sp)
   for cand in [unitName, unitName.toLowerAscii,
                unitName[0].toUpperAscii & unitName[1..^1].toLowerAscii]:
-    let f = (if dir.len > 0: dir else: ".") / cand & ".pas"
-    if fileExists(f):
-      unitFile = f
-      break
+    for d in dirs:
+      let f = d / cand & ".pas"
+      if fileExists(f):
+        unitFile = f
+        break
+    if unitFile.len > 0: break
   if unitFile.len == 0 or p.absorbed.files.hasKey(unitFile):
     return
   p.unitFiles[unitName.toLowerAscii] = splitFile(unitFile).name
   p.absorbed.files[unitFile] = true
   var up = default(TParser)
-  openParser(up, unitFile, p.flags)
+  # CLI defines propagate into units; source-level {$define}s stay
+  # local to the unit that made them (Delphi-like scoping)
+  var inheritedDefines: seq[string] = @[]
+  for d, v in p.syms.defines:
+    if v and not p.sourceDefines.hasKey(d):
+      inheritedDefines.add(d)
+  for sp in p.searchPaths:
+    up.searchPaths.add(sp)
+  openParser(up, unitFile, p.flags, inheritedDefines)
   up.absorbed = p.absorbed   # shared ref: cycle guard works across units
   discard parseUnit(up)
   closeParser(up)
@@ -4555,7 +4674,12 @@ proc parseUnit*(p: var TParser): Node =
       p.opt(pxDot)
       break
     let s = parseStmt(p)
-    if s.kind != nkEmpty and s.strVal != "#":
+    # a conditional directive's branch statements arrive as an
+    # nkStmtList - splice them so unit-level declarations register
+    if s.kind == nkStmtList and s.strVal == "#condsplice":
+      for k in 0 ..< s.len:
+        p.module.add(s[k])
+    elif s.kind != nkEmpty and s.strVal != "#":
       p.module.add(s)
     elif s.kind != nkCommentStmt:
       p.module.add(s)

@@ -14,17 +14,21 @@
 import std/[syncio, os, strutils]
 import pasast, paslex, paspars, pasnimout, pasnifout
 
-proc translateFile(infile, outfile: string, flags: set[TParserFlag]) =
+proc translateFile(infile, outfile: string, flags: set[TParserFlag],
+                   defines: seq[string] = @[],
+                   searchPaths: seq[string] = @[]) =
   var p = default(TParser)
-  openParser(p, infile, flags)
+  openParser(p, infile, flags, defines, searchPaths)
   var module = parseUnit(p)
   closeParser(p)
   renderModule(module, p.syms, infile, outfile, flags)
 
-proc emitNif(infile, outPath: string, flags: set[TParserFlag]) =
+proc emitNif(infile, outPath: string, flags: set[TParserFlag],
+             defines: seq[string] = @[],
+             searchPaths: seq[string] = @[]) =
   ## emit the parsed-NIF pair (<outPath>.p.nif + <outPath>.p.deps.nif)
   var p = default(TParser)
-  openParser(p, infile, flags)
+  openParser(p, infile, flags, defines, searchPaths)
   var module = parseUnit(p)
   closeParser(p)
   emitNifModule(module, p.syms, infile, outPath, flags)
@@ -32,8 +36,14 @@ proc emitNif(infile, outPath: string, flags: set[TParserFlag]) =
 proc usage =
   const Usage = """
 pas2nimony - Pascal to Nimony translator
-Usage: pas2nimony [options] inputfile
+Usage: pas2nimony [command] [options] inputfile
+Commands (accepted for nimony-CLI compatibility; pas2nimony always
+just translates - the backend is chosen by the tool that consumes
+the output): c, n, w, l, check, s, m, doc
 Options:
+  -d:SYM             define a conditional symbol for {$ifdef};
+                     FPC-style -dSYM accepted too, repeatable
+  --path:DIR, -p DIR extra search path for uses resolution
   -o, --out:FILE     set output filename
   --ref              use 'ref' instead of 'ptr' for Pascal ^type
   --no-self-qualify  disable the self-qualification pass
@@ -52,12 +62,18 @@ proc main =
   var outfile = ""
   var emitNifPath = ""
   var flags: set[TParserFlag] = {}
+  var defines: seq[string] = @[]
+  var searchPaths: seq[string] = @[]
   var args: seq[string] = @[]
   var i = 1
   while i <= paramCount():
     let a = paramStr(i)
     if a == "-h" or a == "--help":
       usage()
+    elif a in ["c", "n", "w", "l", "check", "s", "m", "doc"]:
+      # nimony-style command verbs: accepted and ignored (pas2nimony
+      # always translates; the consuming tool picks the backend)
+      discard
     elif a == "--ref":
       flags.incl(pfRefs)
     elif a == "--no-self-qualify":
@@ -70,6 +86,17 @@ proc main =
       flags.incl(pfV2)
     elif a.startsWith("--emit-nif:"):
       emitNifPath = a[11..^1]
+    elif a.startsWith("-d:"):
+      defines.add(a[3..^1])
+    elif a.startsWith("--define:"):
+      defines.add(a[9..^1])
+    elif a.startsWith("-d") and a.len > 2 and a[2] != ':':
+      defines.add(a[2..^1])
+    elif a.startsWith("--path:"):
+      searchPaths.add(a[7..^1])
+    elif a == "-p":
+      inc i
+      if i <= paramCount(): searchPaths.add(paramStr(i))
     elif a.startsWith("-o:"):
       outfile = a[3..^1]
     elif a == "-o":
@@ -84,11 +111,11 @@ proc main =
   if emitNifPath.len > 0:
     if not emitNifPath.endsWith(".p.nif"):
       emitNifPath.add(".p.nif")
-    emitNif(infile, emitNifPath, flags)
+    emitNif(infile, emitNifPath, flags, defines, searchPaths)
     echo "wrote " & emitNifPath & " (+ deps)"
     quit(0)
   if outfile.len == 0:
     outfile = changeFileExt(infile, "nim")
-  translateFile(infile, outfile, flags)
+  translateFile(infile, outfile, flags, defines, searchPaths)
 
 main()
