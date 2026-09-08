@@ -139,7 +139,16 @@ proc emitExpr(e: var NifEmitter; n: Node) =
   of nkDotExpr:
     e.buf.copyInto(globalTags.registerTag("dot"), i):
       e.emitExpr(n[0])
-      e.emitExpr(n[1])
+      if n[1].kind == nkIdent:
+        # member spelling: the type-ish RTL map must not win
+        # (`List.Text` is the property, not the Text file type)
+        let member = if e.syms != nil:
+          e.syms[].canonicalMember(n[1].strVal)
+        else:
+          n[1].strVal
+        e.buf.addIdent(member, e.info(n))
+      else:
+        e.emitExpr(n[1])
   of nkIndexExpr:
     # (at receiver index)
     e.buf.copyInto(globalTags.registerTag("at"), i):

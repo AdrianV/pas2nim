@@ -170,7 +170,9 @@ proc expr(s: var TRendor, n: Node): string =
                 "(" & s.expr(n[0]) & ")"
               else:
                 s.expr(n[0])
-    result = lhs & "." & s.canon(n[1].strVal)
+    let member = if s.syms != nil: s.syms[].canonicalMember(n[1].strVal)
+                 else: n[1].strVal
+    result = lhs & "." & member
   of nkIndexExpr:
     result = s.expr(n[0]) & "["
     for i in 1 ..< n.len:

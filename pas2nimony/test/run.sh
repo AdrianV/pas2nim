@@ -130,7 +130,7 @@ if [ $# -eq 0 ] && [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/twounit" ]; then
       echo "   PASLER USESNIM FAILED"; fail=1
     fi
   fi
-  for extra in shims datetime sysutils; do
+  for extra in shims datetime sysutils missing; do
     if [ -f "$HERE/$extra.pas" ]; then
       echo "== pasler-$extra"
       mkdir -p "$TMP/pasler-$extra"

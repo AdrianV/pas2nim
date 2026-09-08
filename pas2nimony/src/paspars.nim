@@ -143,7 +143,10 @@ proc openParser*(p: var TParser, filename: string, flags: set[TParserFlag]) =
   # `Exception`); the Pascal name aliases it in the registries
   p.syms.registerClass("PasException", "", true)
   p.syms.addField("PasException", "Message")
-  p.syms.addCtor("PasException", "create")
+  # the Pascal spelling - the ctor registration seeds the names
+  # registry (first declaration wins), and a lowercase `create` here
+  # would leak into every `TStringList.Create` emission
+  p.syms.addCtor("PasException", "Create")
   p.syms.returnsValue["pasexccreate"] = true
   p.syms.names["exception"] = "PasException"
   var excAlias = p.syms.classes.getOrDefault("pasexception")
@@ -331,6 +334,24 @@ proc scanNimExports(ln: string; s: var SymTab) =
         exported = true
       if exported and name notin kws:
         s.declareName(name)
+        if kw == "proc" or kw == "func":
+          # value-returning? walk the param list's parens; a `: Type`
+          # after the depth-0 close means the routine returns a value
+          # (needed for the statement-position discard wrapper)
+          var depth = 0
+          var q = i
+          while q < t.len:
+            if t[q] == '(':
+              inc depth
+            elif t[q] == ')':
+              dec depth
+              if depth == 0:
+                var r = q + 1
+                while r < t.len and t[r] in {' ', '\t'}: inc r
+                if r < t.len and t[r] == ':':
+                  s.returnsValue[name.toLowerAscii] = true
+                break
+            inc q
     break
 
 proc absorbNimModule(p: var TParser, modpath: string) =
@@ -421,6 +442,16 @@ proc parseUsesStmt*(p: var TParser): Node =
       of "math":
         result.add(newIdentNode("pasmath", p.tok.info))
         absorbNimModule(p, "pasmath")
+        any = true
+      of "dateutils":
+        # Delphi DateUtils naming layer over the TDateTime core (M3)
+        result.add(newIdentNode("pasdateutils", p.tok.info))
+        absorbNimModule(p, "pasdateutils")
+        any = true
+      of "classes":
+        # TStringList shim (M3); the rest of Classes is future work
+        result.add(newIdentNode("pasclasses", p.tok.info))
+        absorbNimModule(p, "pasclasses")
         any = true
       of "sysutils", "si_strings", "system":
         # our runtime shim (systempas) provides the Delphi RTL helpers
@@ -2315,6 +2346,14 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
       p.syms.returnsValue[defName.toLowerAscii] = true
     else:
       p.syms.returnsValue[name.toLowerAscii] = true
+  elif kind == pxProcedure:
+    # a void procedure with the same name must clear the flag (the
+    # latest declaration wins; shim units may register value-returning
+    # procs of common names like `add` at the uses clause)
+    if isClassProc and isMethod:
+      p.syms.returnsValue[defName.toLowerAscii] = false
+    else:
+      p.syms.returnsValue[name.toLowerAscii] = false
   if isClassProc and isMethod and kind != pxOperator:
     p.syms.addClassProc(p.classOfProc, name)
   elif isMethod and (isDotted or p.section == seInterface):
@@ -2738,6 +2777,21 @@ proc mapStringBuiltins*(p: var TParser, n: Node): Node =
   of "pos":
     # Pos(sub, s) is 1-based (0 when absent); find is 0-based (-1 absent):
     # find(s, sub) + 1 maps exactly
+    if n.len == 3:
+      let sub = n[1]
+      let str1 = n[2]
+      var call = newNode(nkCall, n.info)
+      call.add(newIdentNode("find", n.info))
+      call.add(str1)
+      call.add(sub)
+      let plus = newNode(nkInfix, n.info)
+      plus.add(newIdentNode("+", n.info))
+      plus.add(call)
+      plus.add(newIntNode(nkIntLit, 1, n.info))
+      return plus
+    return n
+  of "ansipos":
+    # AnsiPos(sub, s) - identical mapping to Pos
     if n.len == 3:
       let sub = n[1]
       let str1 = n[2]
@@ -3406,14 +3460,22 @@ proc parseStmt*(p: var TParser): Node =
         # nested routines see `self` implicitly
         result.add(newIdentNode("self", info))
       if result.kind == nkCall and result.len >= 1 and
-          result[0].kind == nkIdent and
-          p.syms.returnsValue.getOrDefault(result[0].strVal.toLowerAscii,
-              false) and result[0].strVal.toLowerAscii != "inttostr" and
           p.tok.xkind != pxAsgn:
-        # nimony requires discarding unused non-void results
-        let d = newNode(nkDiscardStmt, info)
-        d.add(result)
-        result = d
+        # nimony requires discarding unused non-void results; the
+        # callee may be a bare ident or a dot-call (shim methods like
+        # TStringList.Add return the index)
+        var callee = ""
+        if result[0].kind == nkIdent:
+          callee = result[0].strVal
+        elif result[0].kind == nkDotExpr and result[0].len == 2 and
+            result[0][1].kind == nkIdent:
+          callee = result[0][1].strVal
+        if callee.len > 0 and
+            p.syms.returnsValue.getOrDefault(callee.toLowerAscii,
+                false) and callee.toLowerAscii != "inttostr":
+          let d = newNode(nkDiscardStmt, info)
+          d.add(result)
+          result = d
       p.opt(pxSemiColon)
   skipCom(p)
   if result.kind == nkEmpty:

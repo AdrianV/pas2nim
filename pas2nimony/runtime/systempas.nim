@@ -180,7 +180,7 @@ proc pasExcCreate*(self: PasException; msg: string): PasException =
 # nimony's formatBiggestFloat (rounding may differ from Delphi in the
 # last digit).
 
-import std/os
+import std/[os, dirs]
 
 proc IntToHex*(value: int64; digits: int32): string = toHex(value, int(digits))
 proc IntToHex*(value: int32; digits: int32): string =
@@ -261,6 +261,37 @@ proc AnsiUpperCase*(s: string): string = UpperCase(s)
 proc AnsiLowerCase*(s: string): string = LowerCase(s)
 
 proc FileExists*(path: string): bool = fileExists(path)
+
+proc DeleteFile*(path: string): bool =
+  try:
+    removeFile(path(path))
+    result = true
+  except Exception:
+    result = false
+
+proc DirectoryExists*(path: char): bool =
+  ## 1-char Pascal literals are chars ('.' = the current dir)
+  DirectoryExists($path)
+
+proc DirectoryExists*(path: string): bool =
+  try:
+    result = dirExists(path)
+  except Exception:
+    result = false
+
+proc CreateDir*(path: string): bool =
+  try:
+    createDir(path(path))
+    result = true
+  except Exception:
+    result = false
+
+proc ForceDirectories*(path: string): bool =
+  ## CreateDir already creates the whole chain in nimony's dirs module
+  if path.len == 0:
+    result = false
+  else:
+    result = CreateDir(path)
 
 # --- path functions (pure string re-implementation, both / and \) ---
 
@@ -419,8 +450,20 @@ proc Format*(fmt: string; args: openArray[TVarRec]): string =
         elif v.k == vrInt: f = float64(v.i)
         if typ == 'f' or typ == 'n' or typ == 'm':
           var prec2 = prec
-          if prec2 < 0: prec2 = 2
+          if prec2 < 0:
+            if typ == 'n' or typ == 'm': prec2 = 2 else: prec2 = 2
           piece = formatBiggestFloat(f, ffDecimal, prec2, '.')
+          if typ == 'n':
+            # thousands separators in the integer part
+            let dot = find(piece, ".", 0)
+            if dot > 0:
+              var grouped = ""
+              var k = 0
+              while k < dot:
+                if k > 0 and (dot - k) mod 3 == 0: grouped.add(',')
+                grouped.add(piece[k])
+                inc k
+              piece = grouped & substr(piece, dot, piece.len - 1)
         elif typ == 'g' or typ == 'G':
           piece = $f
         else:

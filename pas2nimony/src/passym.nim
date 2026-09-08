@@ -90,6 +90,14 @@ proc canonical*(t: SymTab; spelling: string): string =
   if rtl.len > 0: return rtl
   return t.names.getOrDefault(key, spelling)
 
+proc canonicalMember*(t: SymTab; spelling: string): string =
+  ## canon for MEMBER names (fields/properties/methods): the type-ish
+  ## RTL map must not win here (`List.Text` is the stringlist
+  ## property, not the Text file type) - only the declaration
+  ## registry applies
+  let key = spelling.toLowerAscii
+  return t.names.getOrDefault(key, spelling)
+
 proc isDeclared*(t: SymTab; spelling: string): bool =
   t.names.hasKey(spelling.toLowerAscii)
 
