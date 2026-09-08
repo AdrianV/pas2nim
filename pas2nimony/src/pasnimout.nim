@@ -97,6 +97,21 @@ proc typeStr(s: var TRendor, n: Node): string
 proc isPlainExpr(n: Node): bool =
   n.kind notin {nkInfix, nkPrefix}
 
+proc inlineLambdaBody(s: var TRendor, d: Node): string =
+  ## a lambda body rendered inline: `stmt` or `(stmt1; stmt2)`
+  let body = d[d.len - 1]
+  if body.kind != nkStmtList:
+    return s.expr(body)
+  if body.len == 0:
+    return "discard"
+  if body.len == 1:
+    return s.expr(body[0])
+  result = "("
+  for i in 0 ..< body.len:
+    if i > 0: result.add("; ")
+    result.add(s.expr(body[i]))
+  result.add(")")
+
 proc expr(s: var TRendor, n: Node): string =
   ## render `n` as an expression (single line, no side effects on indent)
   case n.kind
@@ -189,6 +204,12 @@ proc expr(s: var TRendor, n: Node): string =
     result = s.expr(n[0]) & ".." & s.expr(n[1])
   of nkCast:
     result = "cast[" & s.expr(n[0]) & "](" & s.expr(n[1]) & ")"
+  of nkAsgn:
+    # assignment as an expression (inside lambda bodies)
+    result = s.expr(n[0]) & " = " & s.expr(n[1])
+  of nkProcDef:
+    # anonymous method: proc (x: int32) = (stmts) / = stmt
+    result = "proc" & s.gParams(n[2]) & " = " & s.inlineLambdaBody(n)
   else:
     result = "# unhandled expression kind: " & $n.kind
 
@@ -474,7 +495,17 @@ proc stmt(s: var TRendor, n: Node) =
     if n.strVal.len > 0:
       s.line(n.strVal)
   of nkAsgn:
-    s.line(s.expr(n[0]) & " = " & s.expr(n[1]))
+    if n[1].kind == nkProcDef and n[1][0].kind == nkEmpty:
+      # anonymous method assignment: `F = proc (x: int32) =`
+      # followed by the indented body
+      s.line(s.expr(n[0]) & " = proc" & s.gParams(n[1][2]) & " =")
+      s.indent = s.indent + 1
+      let body = n[1][n[1].len - 1]
+      for st in body.sons:
+        s.stmt(st)
+      s.indent = s.indent - 1
+    else:
+      s.line(s.expr(n[0]) & " = " & s.expr(n[1]))
   of nkIfStmt:
     var first = true
     for branch in n.sons:

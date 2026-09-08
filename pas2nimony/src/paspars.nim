@@ -602,6 +602,45 @@ proc identOrLiteral(p: var TParser): Node =
     getTokP(p)
     result = emptyNode(p.tok.info)
 
+proc parseAnonymousMethod(p: var TParser): Node =
+  ## Delphi anonymous method: `procedure(X: Integer) begin ... end`
+  ## -> lambda (nkProcDef with an empty name); nimony lowers it to a
+  ## closure and captures outer variables by reference
+  let info = p.tok.info
+  getTokP(p)                    # procedure/function
+  skipCom(p)
+  let params = p.parseParamList()
+  p.opt(pxSemiColon)
+  skipCom(p)
+  if p.tok.xkind == pxColon:
+    getTokP(p)
+    skipCom(p)
+    params[0] = parseTypeDesc(p, emptyNode(p.tok.info))
+    skipCom(p)
+  p.eat(pxBegin)
+  skipCom(p)
+  let body = newNodeP(nkStmtList, p)
+  while p.tok.xkind != pxEnd and p.tok.xkind != pxEof:
+    let s = parseStmt(p)
+    if s.kind != nkEmpty: body.add(s)
+    if p.tok.xkind == pxSemiColon:
+      getTokP(p)
+      skipCom(p)
+  p.eat(pxEnd)
+  skipCom(p)
+  var def = newNode(nkProcDef, info)
+  def.add(emptyNode(info))      # anonymous: no name
+  def.add(emptyNode(info))      # typevars
+  var np = newNode(nkFormalParams, info)
+  np.add(params[0])             # return type slot
+  for i in 1 ..< params.len:
+    np.add(params[i])
+  def.add(np)
+  def.add(emptyNode(info))      # pragmas
+  def.add(emptyNode(info))      # exceptions
+  def.add(body)
+  result = def
+
 proc primary(p: var TParser): Node =
   # prefix operators
   if p.tok.xkind in {pxNot, pxMinus, pxPlus}:
@@ -615,6 +654,9 @@ proc primary(p: var TParser): Node =
     getTokP(p)
     result.add(primary(p))
     return
+  elif p.tok.xkind in {pxProcedure, pxFunction}:
+    # Delphi anonymous method literal
+    return parseAnonymousMethod(p)
   result = p.withQualify(identOrLiteral(p))
   while true:
     case p.tok.xkind
@@ -951,7 +993,9 @@ proc parseRoutineType*(p: var TParser): Node =
     getTokP(p)
     skipCom(p)
     let ret = parseTypeDesc(p, emptyNode(p.tok.info))
-    result[0] = ret
+    # the return type lives in the params' slot 0 (the procTy's own
+    # son 0 is the params); overwriting it broke 2-son invariants
+    result[0][0] = ret
   if isClosure:
     let pragmas = newNode(nkPragma, p.tok.info)
     pragmas.add(newIdentNode("closure", p.tok.info))
@@ -1303,6 +1347,16 @@ proc parseTypeDesc*(p: var TParser, definition: Node): Node =
     getTokP(p)
     result = parseTypeDesc(p, emptyNode(p.tok.info))
   else:
+    if p.tok.xkind == pxSymbol and p.tok.ident.toLowerAscii == "reference" and
+        p.peekTok().xkind == pxTo:
+      # `reference to procedure(...)`: a plain nimony proc type; the
+      # closure state lives in nimony's anonymous-proc machinery
+      getTokP(p)
+      p.eat(pxTo)
+      skipCom(p)
+      result = parseRoutineType(p)
+      p.context = oldcontext
+      return
     if p.tok.xkind == pxSymbol and p.tok.ident.toLowerAscii == "specialize":
       # FPC style: `specialize TPair<int, string>`
       getTokP(p)

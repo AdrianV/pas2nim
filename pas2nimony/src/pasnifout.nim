@@ -96,6 +96,18 @@ proc emitCall(e: var NifEmitter; n: Node) =
     for son in n.sons:
       e.emitExpr(son)
 
+proc emitAnonProc(e: var NifEmitter; n: Node) =
+  ## anonymous method value: (proc . . . . (params ...) ret . . (stmts))
+  let i = e.info(n)
+  e.buf.copyInto(globalTags.registerTag("proc"), i):
+    for k in 0 ..< 4:          # name, export, pattern, typevars
+      e.buf.addDotToken(i)
+    e.emitParamList(n[2])
+    e.emitTypeDesc(n[2][0])
+    e.buf.addDotToken(i)       # pragmas
+    e.buf.addDotToken(i)       # effects
+    e.emitStmts(n[n.len - 1])
+
 proc emitExpr(e: var NifEmitter; n: Node) =
   let i = e.info(n)
   case n.kind
@@ -110,6 +122,9 @@ proc emitExpr(e: var NifEmitter; n: Node) =
       e.emitExpr(n[1])
   of nkCall, nkCommand:
     e.emitCall(n)
+  of nkProcDef, nkFuncDef:
+    # anonymous method value
+    e.emitAnonProc(n)
   of nkCurly:
     # set literal: empty sets are the bare (curly) tag
     e.buf.copyInto(globalTags.registerTag("curly"), i):
@@ -604,7 +619,11 @@ proc emitTypeDef(e: var NifEmitter; n: Node; hoisted: var seq[Node]) =
                   e.buf.addDotToken(fi)
                   e.emitTypeDesc(d[d.len - 2])
                   e.buf.addDotToken(fi)
-        e.buf.addDotToken(pi)      # return type
+        # the return type lives in the params' slot 0
+        if params[0].kind != nkEmpty:
+          e.emitTypeDesc(params[0])
+        else:
+          e.buf.addDotToken(pi)
         if ty.len > 1 and ty[1].kind == nkPragma:
           e.buf.copyInto(globalTags.registerTag("pragmas"), pi):
             for pr in ty[1].sons:
