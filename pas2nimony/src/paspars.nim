@@ -290,6 +290,84 @@ proc absorbUnit*(p: var TParser, unitName: string) =
       p.syms.names[k] = v
 
 
+proc scanNimExports(ln: string; s: var SymTab) =
+  ## register the exported identifier at the head of one Nim source
+  ## line (`proc* name`, `proc name*(`, `const name* =`, `Foo* =`)
+  var t = ln
+  var k = 0
+  while k < t.len and t[k] in {' ', '\t'}: inc k
+  if k > 0: t = t[k ..< t.len]
+  if t.len == 0 or t[0] == '#': return
+  # bare exported type/const: `Name* = ...`, `Name* {.p.} = ...`
+  var i = 0
+  var name = ""
+  while i < t.len and t[i] in {'a'..'z', 'A'..'Z', '0'..'9', '_'}:
+    name.add(t[i]); inc i
+  if name.len > 0 and i < t.len and t[i] == '*':
+    var j = i + 1
+    while j < t.len and t[j] in {' ', '\t'}: inc j
+    if j < t.len and t[j] in {'=', '{', '[', '.'}:
+      s.declareName(name)
+      return
+  # declaration keywords: `proc* name` / `proc name*(`
+  const kws = ["proc", "func", "iterator", "template", "converter",
+               "macro", "const", "var", "let"]
+  for kw in kws:
+    if not t.startsWith(kw): continue
+    i = kw.len
+    var kwStar = false
+    if i < t.len and t[i] == '*':
+      inc i
+      kwStar = true
+    while i < t.len and t[i] in {' ', '\t', '*'}:
+      if t[i] == '*': kwStar = true
+      inc i
+    name = ""
+    while i < t.len and t[i] in {'a'..'z', 'A'..'Z', '0'..'9', '_'}:
+      name.add(t[i]); inc i
+    if name.len > 0:
+      var exported = kwStar
+      if i < t.len and t[i] == '*':
+        exported = true
+      if exported and name notin kws:
+        s.declareName(name)
+    break
+
+proc absorbNimModule(p: var TParser, modpath: string) =
+  ## register the exported identifiers of a bridged nimony module
+  ## (`nim.std.strutils`) so call sites can use Pascal casing: the
+  ## scan is a crude line-based pass over the module source, so
+  ## macro-generated exports are missed (they then need the exact
+  ## nimony spelling)
+  var cands: seq[string] = @[]
+  let dir = parentDir(p.lex.filename)
+  if dir.len > 0: cands.add(dir / modpath & ".nim")
+  # the pinned toolchain checkout: <repo>/nimony/lib, anchored at the
+  # compiler binary's location (pas2nimony/bin -> ../..)
+  try:
+    # bin/pas2nimony -> pas2nimony -> repo -> parent: the toolchain
+    # checkout sits beside the repo (same layout as build.sh's
+    # NIMONY=../../nimony/bin/nimony, which is relative to pas2nimony)
+    let appDir = parentDir(parentDir(parentDir(parentDir(getAppFilename()))))
+    if appDir.len > 0:
+      cands.add(appDir / "nimony" / "lib" / modpath & ".nim")
+  except Exception:
+    discard
+  for cand in cands:
+    if fileExists(cand):
+      var contents = ""
+      try:
+        contents = readFile(cand)
+      except Exception:
+        discard
+      var cur = 0
+      while cur < contents.len:
+        var eol = cur
+        while eol < contents.len and contents[eol] != '\n': inc eol
+        scanNimExports(contents[cur ..< eol], p.syms)
+        cur = eol + 1
+      break
+
 proc parseUsesStmt*(p: var TParser): Node =
   result = newNodeP(nkImportStmt, p)
   getTokP(p)                  # skip `uses`
@@ -300,6 +378,7 @@ proc parseUsesStmt*(p: var TParser): Node =
     if p.tok.xkind != pxSymbol:
       parError(p, "identifier expected in uses clause")
     var unitName = p.tok.ident
+    var parts = @[unitName]
     getTokP(p)
     skipCom(p)
     # dotted unit names: keep the last component (System.SysUtils -> sysutils)
@@ -308,30 +387,47 @@ proc parseUsesStmt*(p: var TParser): Node =
       skipCom(p)
       if p.tok.xkind == pxSymbol:
         unitName = p.tok.ident
+        parts.add(unitName)
         getTokP(p)
         skipCom(p)
       else:
         parError(p, "identifier expected after '.' in uses clause")
-    case unitName.toLowerAscii
-    of "strutils":
-      result.add(newIdentNode("std / strutils", p.tok.info))
-      any = true
-    of "math":
-      result.add(newIdentNode("std / math", p.tok.info))
-      any = true
-    of "sysutils", "si_strings", "system":
-      # our runtime shim (systempas) provides the Delphi RTL helpers
-      result.add(newIdentNode("systempas", p.tok.info))
-      any = true
+    if parts[0].toLowerAscii == "nim":
+      # nimony-module bridge: `nim.std.strutils` (or generally
+      # `nim.<package.path>.<mod>`) imports the nimony module directly.
+      # Its API is used as-is, with the exact nimony spellings and no
+      # Delphi fidelity promises.
+      var path = ""
+      for i in 1 ..< parts.len:
+        if i > 1: path.add("/")
+        path.add(parts[i])
+      if path.len == 0:
+        parError(p, "module path expected after `nim.` in uses clause")
+      else:
+        result.add(newIdentNode(path, p.tok.info))
+        absorbNimModule(p, path)
+        any = true
     else:
-      # own unit: absorb its declarations, then import the module
-      absorbUnit(p, unitName)
-      # the import name must match the translated FILE name (Linux is
-      # case-sensitive; Pascal unit/file casing may differ)
-      let canonical = p.unitFiles.getOrDefault(unitName.toLowerAscii,
-          p.syms.canonical(unitName))
-      result.add(newIdentNode(canonical, p.tok.info))
-      any = true
+      case unitName.toLowerAscii
+      of "strutils":
+        result.add(newIdentNode("std/strutils", p.tok.info))
+        any = true
+      of "math":
+        result.add(newIdentNode("std/math", p.tok.info))
+        any = true
+      of "sysutils", "si_strings", "system":
+        # our runtime shim (systempas) provides the Delphi RTL helpers
+        result.add(newIdentNode("systempas", p.tok.info))
+        any = true
+      else:
+        # own unit: absorb its declarations, then import the module
+        absorbUnit(p, unitName)
+        # the import name must match the translated FILE name (Linux is
+        # case-sensitive; Pascal unit/file casing may differ)
+        let canonical = p.unitFiles.getOrDefault(unitName.toLowerAscii,
+            p.syms.canonical(unitName))
+        result.add(newIdentNode(canonical, p.tok.info))
+        any = true
     p.opt(pxComma)
     if p.tok.xkind != pxSymbol: break
   if not any:

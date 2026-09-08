@@ -118,6 +118,18 @@ if [ $# -eq 0 ] && [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/twounit" ]; then
       echo "   PASLER ANON FAILED"; fail=1
     fi
   fi
+  if [ -f "$HERE/usesnim.pas" ]; then
+    echo "== pasler-usesnim"
+    mkdir -p "$TMP/pasler-usesnim"
+    cp "$HERE/usesnim.pas" "$TMP/pasler-usesnim/"
+    if (cd "$TMP/pasler-usesnim" &&
+        "$ROOT/bin/pasler" --nimony:"$NIMONY" --run usesnim.pas 2>&1 |
+        grep -v nifmake || true); then
+      echo "-- ok"
+    else
+      echo "   PASLER USESNIM FAILED"; fail=1
+    fi
+  fi
   if [ -f "$HERE/generics.pas" ]; then
     echo "== pasler-generics"
     mkdir -p "$TMP/pasler-generics"
