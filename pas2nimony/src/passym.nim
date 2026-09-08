@@ -385,6 +385,7 @@ const RtlNames* = [
   ("string", "string"), ("ansistring", "string"), ("widestring", "string"),
   ("unicodestring", "string"), ("shortstring", "string"), ("tstring", "string"),
   ("singlefloat", "float32"), ("tclass", "RootRef"),
+  ("tdatetime", "TDateTime"),
   # builtin routines (pure renames)
   ("ord", "ord"), ("chr", "chr"), ("length", "len"), ("low", "low"),
   ("high", "high"), ("setlength", "setLen"), ("inc", "inc"), ("dec", "dec"),

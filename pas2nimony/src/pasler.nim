@@ -197,24 +197,18 @@ proc main =
   discard parseAndEmit(infile, nimcache, paths, flags, true)
 
   # 4. the runtime module must be resolvable as a plain .nim
-  let syspas = nimcache / "systempas.nim"
+  # the runtime directory (systempas and the shim units) must be
+  # resolvable as plain .nim modules
   let runtime = findSystemPas()
-  var needCopy = not fileExists(syspas)
-  if not needCopy:
-    try:
-      needCopy = getLastModificationTime(syspas) < getLastModificationTime(runtime)
-    except ErrorCode:
-      needCopy = true
-  if needCopy:
-    try:
-      writeFile(syspas, readFile(runtime))
-    except ErrorCode:
-      write(stderr, "pasler: cannot write " & syspas & "\n")
-      quit(1)
+  let runtimeDir = splitFile(runtime).dir
+  if runtimeDir.len == 0:
+    write(stderr, "pasler: cannot locate the runtime directory\n")
+    quit(1)
 
   # 5. hand the main module to the nimony chain
   var cmd = quoteShell(nimonyBin) & " s --nimcache:" & quoteShell(nimcache)
   cmd.add(" --path:" & quoteShell(nimcache))
+  cmd.add(" --path:" & quoteShell(runtimeDir))
   for a in args:
     if a.startsWith("--path:"):
       cmd.add(" " & a)

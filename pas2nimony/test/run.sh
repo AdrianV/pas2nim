@@ -19,8 +19,8 @@ fi
 
 TMP="$HERE/tmp"
 mkdir -p "$TMP"
-# the runtime shim must be importable from the generated modules
-cp -f "$ROOT/runtime/systempas.nim" "$TMP/"
+# the runtime shim units must be importable from the generated modules
+cp -f "$ROOT"/runtime/*.nim "$TMP/"
 
 if [ $# -gt 0 ]; then
   SAMPLES=("$@")
@@ -63,7 +63,7 @@ if [ $# -eq 0 ] && [ -d "$HERE/twounit" ]; then
     "$ROOT/bin/pas2nimony" "$pas" -o:"$TMP/twounit/$n.nim" || {
       echo "   TRANSLATE FAILED"; fail=1; continue; }
   done
-  if (cd "$TMP/twounit" && cp "$ROOT/runtime/systempas.nim" . &&
+  if (cd "$TMP/twounit" && cp "$ROOT"/runtime/*.nim . &&
       "$NIMONY" c --path:. usecounter.nim 2>&1 | grep -v nifmake || true); then
     bin="$(find "$TMP/twounit/nimcache" -name usecounter -type f | head -1)"
     if [ -n "$bin" ]; then
@@ -130,6 +130,20 @@ if [ $# -eq 0 ] && [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/twounit" ]; then
       echo "   PASLER USESNIM FAILED"; fail=1
     fi
   fi
+  for extra in shims datetime; do
+    if [ -f "$HERE/$extra.pas" ]; then
+      echo "== pasler-$extra"
+      mkdir -p "$TMP/pasler-$extra"
+      cp "$HERE/$extra.pas" "$TMP/pasler-$extra/"
+      if (cd "$TMP/pasler-$extra" &&
+          "$ROOT/bin/pasler" --nimony:"$NIMONY" --run $extra.pas 2>&1 |
+          grep -v nifmake || true); then
+        echo "-- ok"
+      else
+        echo "   PASLER $extra FAILED"; fail=1
+      fi
+    fi
+  done
   if [ -f "$HERE/generics.pas" ]; then
     echo "== pasler-generics"
     mkdir -p "$TMP/pasler-generics"

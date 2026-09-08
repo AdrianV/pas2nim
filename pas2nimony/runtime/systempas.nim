@@ -14,6 +14,8 @@
 #    (StrToInt etc. return a fallback instead of raising)
 
 import std/[strutils, syncio]
+import pasdatetime
+export pasdatetime
 
 # ---------------------------------------------------------------------------
 # string operators (Pascal uses + for concatenation)

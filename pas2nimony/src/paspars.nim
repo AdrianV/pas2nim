@@ -342,6 +342,10 @@ proc absorbNimModule(p: var TParser, modpath: string) =
   var cands: seq[string] = @[]
   let dir = parentDir(p.lex.filename)
   if dir.len > 0: cands.add(dir / modpath & ".nim")
+  # our own shim units: <pas2nimony>/runtime/ (bin -> pas2nimony)
+  let rtDir = parentDir(parentDir(getAppFilename()))
+  if rtDir.len > 0:
+    cands.add(rtDir / "runtime" / modpath & ".nim")
   # the pinned toolchain checkout: <repo>/nimony/lib, anchored at the
   # compiler binary's location (pas2nimony/bin -> ../..)
   try:
@@ -410,10 +414,13 @@ proc parseUsesStmt*(p: var TParser): Node =
     else:
       case unitName.toLowerAscii
       of "strutils":
-        result.add(newIdentNode("std/strutils", p.tok.info))
+        # our Delphi-shaped shim unit (M3)
+        result.add(newIdentNode("passtrutils", p.tok.info))
+        absorbNimModule(p, "passtrutils")
         any = true
       of "math":
-        result.add(newIdentNode("std/math", p.tok.info))
+        result.add(newIdentNode("pasmath", p.tok.info))
+        absorbNimModule(p, "pasmath")
         any = true
       of "sysutils", "si_strings", "system":
         # our runtime shim (systempas) provides the Delphi RTL helpers
@@ -3934,6 +3941,10 @@ proc wrapMemberCalls*(p: var TParser, n: Node): Node =
 proc parseUnit*(p: var TParser): Node =
   ## parse a whole unit/program; returns the module statement list with
   ## all post-passes applied
+  # the prelude runtime modules are always importable: register their
+  # exported spellings for case-insensitive resolution
+  absorbNimModule(p, "systempas")
+  absorbNimModule(p, "pasdatetime")
   while p.tok.xkind != pxEof:
     if p.tok.xkind == pxEnd:
       # unit/program terminator: a bare `end.` with no begin-block
