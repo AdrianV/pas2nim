@@ -109,7 +109,23 @@ proc padWidth(s: string; w: int32): string =
 
 proc pasW*(v: int64; w: int32): string = padWidth($v, w)
 
-proc pasW*(v: float64; w: int32): string = padWidth(fpcShortestSci(v), w)
+proc fpcWidthSci*(f: float64; w: int32): string =
+  ## FPC's :width-only float form (probed): sign slot (space for
+  ## non-negatives), mantissa with max(width-8, 1) digits after the
+  ## point, E+-ddd; no truncation below the width
+  var ap = int(w) - 8
+  if ap < 1: ap = 1
+  let body = fpcFormatE(f, ap + 1)
+  if f >= 0:
+    result = padWidth(" " & body, w)
+  else:
+    result = padWidth(body, w)
+
+proc pasW*(v: float64; w: int32): string = fpcWidthSci(v, w)
+
+proc pasW*(v: string; w: int32): string = padWidth(v, w)
+
+proc pasW*(v: char; w: int32): string = padWidth(ChrToStr(v), w)
 
 proc pasW*(v: float64; w: int32; p: int32): string =
   padWidth(fpcFormatF(v, int(p)), w)
@@ -121,6 +137,8 @@ proc Str*(v: int32; s: var string) = s = $v
 proc Str*(v: int64; w: int32; s: var string) = s = padWidth($v, w)
 
 proc Str*(v: int32; w: int32; s: var string) = s = padWidth($v, w)
+
+proc Str*(v: float64; w: int32; s: var string) = s = fpcWidthSci(v, w)
 
 proc Str*(v: float64; w: int32; p: int32; s: var string) =
   s = padWidth(fpcFormatF(v, int(p)), w)
@@ -734,65 +752,6 @@ proc fpcFormatF*(f: float64; prec: int): string =
       outp = substr(digits, 0, point - 1) & "." & substr(digits, point, digits.len - 1)
   if neg: outp = "-" & outp
   result = outp
-
-proc fpcShortestSci*(f: float64): string =
-  ## FPC's :width-only float form: shortest mantissa + E+-ddd
-  ## (2.5 -> "2.5E+000")
-  var s = $f
-  var neg = false
-  if s.len > 0 and s[0] == '-':
-    neg = true
-    s = substr(s, 1, s.len - 1)
-  var digits = ""
-  var point = 0
-  var ep = find(s, "e", 0)
-  if ep < 0: ep = find(s, "E", 0)
-  var mant: string
-  var expPart: string
-  if ep >= 0:
-    mant = substr(s, 0, ep - 1)
-    expPart = substr(s, ep + 1, s.len - 1)
-  else:
-    mant = s
-    expPart = "0"
-  var seenDot = false
-  var k = 0
-  while k < mant.len:
-    if mant[k] == '.':
-      seenDot = true
-      point = k
-    else:
-      digits.add(mant[k])
-    inc k
-  if not seenDot: point = mant.len
-  var exp = 0
-  var q = 0
-  var eneg = false
-  if q < expPart.len and expPart[q] in {'+', '-'}:
-    eneg = expPart[q] == '-'
-    inc q
-  while q < expPart.len and expPart[q] >= '0' and expPart[q] <= '9':
-    exp = exp * 10 + ord(expPart[q]) - ord('0')
-    inc q
-  if eneg: exp = -exp
-  point = point + exp
-  # first significant digit
-  var z = 0
-  while z < digits.len - 1 and digits[z] == '0':
-    inc z
-  var m = ""
-  m.add(digits[z])
-  var frac = substr(digits, z + 1, digits.len - 1)
-  while frac.len > 0 and frac[frac.len - 1] == '0':
-    frac = substr(frac, 0, frac.len - 2)
-  if frac.len > 0: m = m & "." & frac
-  let e10 = point - 1 - z
-  var es = $e10
-  while es.len < 3: es = "0" & es
-  var sign = "+"
-  if e10 < 0: sign = "-"
-  result = m & "E" & sign & es
-  if neg: result = "-" & result
 
 proc fpcSciMantissa(f: float64; afterPoint: int): string =
   ## the mantissa digits FPC prints: C printf rounding at afterPoint

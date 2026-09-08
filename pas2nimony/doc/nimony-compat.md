@@ -476,3 +476,18 @@ oracle - eleven in total, all byte-identical. New fidelity work:
   int/float overloads (nimony resolves ambiguously - use typed
   vars), FPC requires `;overload` on every overload in a unit,
   Succ/Pred past the last enum value is out of range in FPC.
+
+## M5-2b: writeln/write width syntax
+
+The Delphi `e:w[:p]` argument form now works in write and writeln
+(13th oracle sample, byte-identical). The probed FPC semantics:
+
+- ints and strings: right-aligned, space-padded to the width.
+- floats with only `:w`: a SIGN SLOT (a space for non-negatives) +
+  a mantissa with `max(width - 8, 1)` digits after the point +
+  `E+-ddd` (minimum 3 exponent digits). Probed across magnitudes
+  from 1e-10 to 1e15. FPC float LITERALS in these positions are
+  Extended-promoted and render differently - documented divergence,
+  the samples use variables.
+- floats with `:w:p`: fixed-point, rounded shortest-repr half-away
+  (the Str rounding path), left-padded to the width.

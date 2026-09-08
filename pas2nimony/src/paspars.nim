@@ -2875,8 +2875,12 @@ proc fixExit(p: var TParser, n: Node): bool =
   result = false
 
 proc asStrOperand(n: Node): Node =
-  ## `$n` for non-string operands; string literals pass through
+  ## `$n` for non-string operands; string literals pass through;
+  ## pasW calls already produce Pascal-formatted strings
   if n.kind == nkStrLit:
+    return n
+  if n.kind == nkCall and n.len > 0 and n[0].kind == nkIdent and
+      n[0].strVal == "pasW":
     return n
   let dollar = newNode(nkCall, n.info)
   dollar.add(newIdentNode("$", n.info))
