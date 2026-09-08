@@ -825,6 +825,19 @@ proc primary(p: var TParser): Node =
       result = newNode(nkCall, a.info)
       result.add(a)
       exprListAux(p, pxParRi, pxEquals, result)
+      # Delphi class operator Explicit: a type-cast call over a
+      # record argument whose type registered an Explicit to this
+      # target type lowers to the conversion proc
+      if result.len == 2 and result[0].kind == nkIdent and
+          result[1].kind == nkIdent:
+        let argVt = p.varTypes.getOrDefault(
+            result[1].strVal.toLowerAscii)
+        if argVt.startsWith("record:"):
+          let rcls = argVt[7 .. ^1]
+          let targetKey = result[0].strVal.toLowerAscii
+          let op = p.syms.getConvOp(rcls, "explicit", rcls, targetKey)
+          if op.len > 0:
+            result[0] = newIdentNode(op, result[0].info)
       # a 1-char Pascal literal passed to a callee is a string in
       # almost every signature; char-arg procs keep the char
       if result.len > 1 and not (a.kind == nkIdent and
@@ -1162,6 +1175,14 @@ proc parseParamList*(p: var TParser): Node =
           def = sd
       for n in names:
         p.syms.declareName(n)
+        if lastType.kind == nkIdent:
+          let pty = lastType.strVal.toLowerAscii
+          if p.recordTypes.hasKey(pty):
+            p.varTypes[n.toLowerAscii] = "record:" & lastType.strVal
+          else:
+            let rtl = rtlSpelling(pty)
+            if rtl.len > 0:
+              p.varTypes[n.toLowerAscii] = rtl
         let d = newNode(nkIdentDefs, p.tok.info)
         d.add(newIdentNode(n, p.tok.info))
         if isVar:
@@ -2352,6 +2373,7 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
   let oldClass = p.classOfProc
   let oldSelfClass = p.selfClass
   let oldVisibility = p.visibility
+  let oldResultVt = p.varTypes.getOrDefault("result")
   result = newNodeP(nkProcDef, p)
   getTokP(p)
   skipCom(p)
@@ -2398,11 +2420,15 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
   # infix/prefix expression machinery)
   let opSym = if kind == pxOperator: delphiOperatorSymbol(name)
               else: ""
-  if kind == pxOperator and opSym.len == 0:
+  if kind == pxOperator and opSym.len == 0 and
+      name.toLowerAscii notin ["implicit", "explicit", "inc", "dec"]:
     parError(p, "unsupported class operator: " & name &
         " (v1 supports arithmetic, bitwise, comparison and unary " &
         "operators)")
-  let defName = if kind == pxOperator and isClassProc:
+  let defName = if kind == pxOperator and isClassProc and
+      name.toLowerAscii in ["implicit", "explicit", "inc", "dec"]:
+      "op" & name & "_" & p.classOfProc
+    elif kind == pxOperator and isClassProc:
       opSym
     elif isClassProc and isMethod:
       p.syms.classProcName(p.classOfProc, name)
@@ -2442,6 +2468,38 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
     skipCom(p)
     p.opt(pxSemiColon)          # `function Speak: string; virtual;`
     skipCom(p)
+  # `result` carries the routine's return type for conversion
+  # insertion in the body (`result := intExpr` on a float/record
+  # return)
+  if params[0].kind == nkIdent:
+    let retKey = params[0].strVal.toLowerAscii
+    if p.recordTypes.hasKey(retKey):
+      p.varTypes["result"] = "record:" & params[0].strVal
+    else:
+      let rtl = rtlSpelling(retKey)
+      if rtl.len > 0: p.varTypes["result"] = rtl
+  # Delphi conversion/unary class operators (Implicit/Explicit/Inc/
+  # Dec) have no nimony operator symbol: lower to uniquely named
+  # procs keyed by the signature, and register them for call-site
+  # insertion (assignments, casts, Inc/Dec statements)
+  if kind == pxOperator and isClassProc and
+      name.toLowerAscii in ["implicit", "explicit", "inc", "dec"] and
+      params.len >= 2:
+    let cls = p.classOfProc
+    let oname = name.toLowerAscii
+    var mangled = ""
+    if oname in ["inc", "dec"]:
+      mangled = "op" & name & "_" & cls
+      p.syms.addConvOp(cls, oname, "", "", mangled)
+    elif params[1].kind == nkIdentDefs and params[1].len >= 2 and
+        params[1][params[1].len - 2].kind == nkIdent and
+        params[0].kind == nkIdent:
+      let fromTy = params[1][params[1].len - 2].strVal
+      let toTy = params[0].strVal
+      mangled = "op" & name & "_" & fromTy & "_" & toTy
+      p.syms.addConvOp(cls, oname, fromTy, toTy, mangled)
+    if mangled.len > 0:
+      nameNode.strVal = mangled
   # constructors: return the class type (before self-param insertion)
   if kind == pxConstructor and isMethod:
     params[0] = genSelfType(p)
@@ -2549,6 +2607,7 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
       for i in 0 ..< bodyNode.sons.len:
         newSons.add(bodyNode.sons[i])
       bodyNode.sons = newSons
+    p.varTypes["result"] = oldResultVt
     p.outerProcName = oldOuterName
     p.outerIsMethod = oldOuterIsMethod
     p.outerParams = savedOuterParams
@@ -3041,6 +3100,39 @@ proc writelnArg(p: var TParser, n: Node): Node =
         return c
   return n
 
+proc rhsExprType(p: var TParser, n: Node): string =
+  ## best-effort static type of an assignment RHS, used to insert
+  ## Delphi Implicit-conversion calls; "" when unknown
+  case n.kind
+  of nkIntLit, nkCharLit:
+    result = "int32"
+  of nkIdent:
+    result = p.varTypes.getOrDefault(n.strVal.toLowerAscii)
+  of nkDotExpr:
+    if n.len == 2 and n[0].kind == nkIdent and n[1].kind == nkIdent:
+      let rv = p.varTypes.getOrDefault(n[0].strVal.toLowerAscii)
+      if rv.startsWith("record:"):
+        result = p.fieldTypes.getOrDefault(rv[7 .. ^1].toLowerAscii &
+                                           "." &
+                                           n[1].strVal.toLowerAscii)
+      else:
+        result = p.fieldTypes.getOrDefault(n[0].strVal.toLowerAscii &
+                                           "." &
+                                           n[1].strVal.toLowerAscii)
+    else: result = ""
+  of nkInfix:
+    if n.len == 3:
+      let lt = rhsExprType(p, n[1])
+      let rt = rhsExprType(p, n[2])
+      if lt.startsWith("record:"): result = lt
+      elif rt.startsWith("record:"): result = rt
+      elif lt in ["float32", "float64"] or rt in ["float32", "float64"]:
+        result = "float64"
+      elif lt.len > 0 and rt.len > 0: result = "int32"
+      else: result = ""
+    else: result = ""
+  else: result = ""
+
 proc mapBuiltinCall*(p: var TParser, n: Node): Node =
   ## rewrite builtins that need argument changes:
   ## write(x) -> write(stdout, x); writeln(...) -> echo(...);
@@ -3053,6 +3145,20 @@ proc mapBuiltinCall*(p: var TParser, n: Node): Node =
   let name = n[0].strVal.toLowerAscii
   case name
   of "inc", "dec":
+    # Delphi class operator Inc/Dec: a record operand with the
+    # operator registered lowers to `x = opInc_cls(x)`
+    if n.len == 2 and n[1].kind == nkIdent:
+      let vt = p.varTypes.getOrDefault(n[1].strVal.toLowerAscii)
+      if vt.startsWith("record:"):
+        let opName = p.syms.getConvOp(vt[7 .. ^1], name, "", "")
+        if opName.len > 0:
+          let asgn = newNode(nkAsgn, n.info)
+          asgn.add(n[1])
+          let c = newNode(nkCall, n.info)
+          c.add(newIdentNode(opName, n.info))
+          c.add(n[1])
+          asgn.add(c)
+          return asgn
     # nimony's inc/dec require the offset to match the var's type;
     # Pascal offsets are plain int literals -> lower to an
     # assignment `x = x +/- cast` so the types line up
@@ -3670,6 +3776,45 @@ proc parseStmt*(p: var TParser): Node =
           a.strVal.toLowerAscii) == "set" and b.kind == nkBracket:
         # set literal assignment
         b.kind = nkCurly
+      elif a.kind == nkIdent and b.kind in
+          {nkIdent, nkIntLit, nkCharLit, nkInfix, nkPrefix}:
+        # Delphi class operator Implicit: assignments whose sides
+        # have known incompatible types insert the conversion call;
+        # int-typed LHS with pure-literal arithmetic keeps the
+        # width cast below
+        let lhsVt = p.varTypes.getOrDefault(a.strVal.toLowerAscii)
+        let rhsTy = rhsExprType(p, b)
+        var opName = ""
+        if lhsVt.startsWith("record:"):
+          let cls = lhsVt[7 .. ^1]
+          if rhsTy.startsWith("record:"):
+            let rcls = rhsTy[7 .. ^1]
+            if rcls != cls:
+              opName = p.syms.getConvOp(cls, "implicit", rcls, cls)
+          elif rhsTy in ["int8", "uint8", "int16", "uint16", "int32",
+                         "uint32", "int64", "uint64"]:
+            opName = p.syms.getConvOp(cls, "implicit", "integer", cls)
+          elif rhsTy in ["float32", "float64"]:
+            opName = p.syms.getConvOp(cls, "implicit", "float64", cls)
+        elif rhsTy.startsWith("record:") and lhsVt in
+            ["int8", "uint8", "int16", "uint16", "int32", "uint32",
+             "int64", "uint64", "float32", "float64"]:
+          let rcls = rhsTy[7 .. ^1]
+          opName = p.syms.getConvOp(rcls, "implicit", rcls, lhsVt)
+        elif lhsVt in ["float32", "float64"] and rhsTy in
+            ["int8", "uint8", "int16", "uint16", "int32", "uint32",
+             "int64", "uint64"]:
+          # Pascal widens int arithmetic into float targets silently;
+          # nimony needs the explicit conversion
+          let c = newNode(nkCall, b.info)
+          c.add(newIdentNode(lhsVt, b.info))
+          c.add(b)
+          result[1] = c
+        if opName.len > 0:
+          let c = newNode(nkCall, b.info)
+          c.add(newIdentNode(opName, b.info))
+          c.add(b)
+          result[1] = c
       if a.kind == nkIdent and b.kind in {nkInfix, nkCall}:
         # Pascal computes Integer arithmetic in the declared width;
         # nimony types pure-literal arithmetic as int (64), so

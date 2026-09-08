@@ -491,3 +491,37 @@ The Delphi `e:w[:p]` argument form now works in write and writeln
   the samples use variables.
 - floats with `:w:p`: fixed-point, rounded shortest-repr half-away
   (the Str rounding path), left-padded to the width.
+
+## M6-1: Delphi class operators (the deferred set)
+
+Implicit, Explicit, Inc and Dec class operators now work on value
+types (14th oracle sample `operators.pas`, byte-identical):
+
+- `class operator Implicit(a: T1): T2;` / `Explicit` / `Inc` /
+  `Dec` lower to uniquely named procs keyed by the signature
+  (`opImplicit_Integer_TMyInt`), registered in a new SymTab
+  conversion registry. The arithmetic/bitwise/comparison operators
+  keep mapping to nimony operator symbols (`Add` -> `+` and so on).
+- Assignment statements insert Implicit calls when the sides have
+  known incompatible types: record <-> record (different types),
+  record <- int literal/int-typed expression, record <- float,
+  base <- record. A best-effort RHS type guess (varTypes, param
+  types, record field types, literal/infix shapes) drives it.
+  v1: no conversion inside arbitrary expressions, only at
+  assignment targets.
+- `Inc(x)`/`Dec(x)` on a record operand lower to
+  `x = opInc_cls(x)`; int operands keep the typed-offset
+  arithmetic lowering.
+- Type casts over records (`Double(m)`) lower to the registered
+  Explicit proc.
+- Pascal widens int expressions into float assignment targets
+  silently; nimony needs the cast - inserted for float-typed
+  targets (vars, params and `result`).
+- `result` carries the routine's return type during body parsing
+  (converted assignments inside record/float-returning functions
+  work); routine params record their types so `a.Value` resolves.
+- nimony quirk: a record-returning function needs
+  `result = default(T)` before field assignment (init proof) -
+  the parser injects it (already the case for plain functions).
+- Delphi note: `Inc`/`Dec` class operators are unary; the two-arg
+  `Inc(x, n)` statement form stays arithmetic-only.

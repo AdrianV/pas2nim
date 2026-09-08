@@ -69,6 +69,10 @@ type
     rtlUnits*: seq[string]             ## Pascal unit names from `uses`
     returnsValue*: Table[string, bool] ## functions/constructors by lower name
     returnsBool*: Table[string, bool]  ## shim functions returning Boolean
+    convOps*: Table[string, string]
+    ## conversion operator registry: key
+    ## "conv:<cls>:<kind>:<from>:<to>" -> the lowered proc name
+    ## (Delphi class operator Implicit/Explicit/Inc/Dec)
 
 proc initSymTab*(): SymTab =
   result = SymTab()
@@ -164,6 +168,28 @@ proc addField*(t: var SymTab; cls, spelling: string) =
       ci.fieldSet[spelling.toLowerAscii] = true
       t.classes[key] = ci
     t.declareName(spelling)
+
+proc normTyKey(spelling: string): string =
+  ## type keys are normalized through the RTL map so `Integer` and
+  ## `int32` agree at declaration and call sites
+  let lo = spelling.toLowerAscii
+  let rtl = rtlSpelling(lo)
+  if rtl.len > 0: result = rtl else: result = lo
+
+proc addConvOp*(t: var SymTab; cls, kind, fromTy, toTy, procName: string) =
+  ## record a Delphi class conversion operator; kind is implicit/
+  ## explicit/inc/dec
+  var key = "conv:" & cls.toLowerAscii & ":" & kind
+  if fromTy.len > 0:
+    key = key & ":" & normTyKey(fromTy) & ":" & normTyKey(toTy)
+  t.convOps[key] = procName
+  t.declareName(procName)
+
+proc getConvOp*(t: SymTab; cls, kind, fromTy, toTy: string): string =
+  var key = "conv:" & cls.toLowerAscii & ":" & kind
+  if fromTy.len > 0:
+    key = key & ":" & normTyKey(fromTy) & ":" & normTyKey(toTy)
+  result = t.convOps.getOrDefault(key)
 
 proc addRoutine*(t: var SymTab; cls, spelling: string) =
   ## record a member routine of class `cls`
