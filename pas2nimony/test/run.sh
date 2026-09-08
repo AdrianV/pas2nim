@@ -230,6 +230,11 @@ if [ $# -eq 0 ] && [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/twounit" ]; then
   fi
 fi
 
+# M5 oracle: differential testing against real FPC (skips without fpc)
+if ! sh "$HERE/oracle.sh"; then
+  echo "   ORACLE FAILED"; fail=1
+fi
+
 # keep the generated artifacts for inspection, but drop the build cache
 rm -rf "$TMP/nimcache"
 exit $fail

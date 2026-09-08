@@ -383,3 +383,56 @@ and runs it. Current samples:
   initialization), built twice: once as translated `.nim` (twounit
   test) and once through pasler's direct `.p.nif` path with a
   `.p.nif` vendor check (pasler-twounit test).
+## M5: the FPC oracle
+
+`test/oracle.sh` compiles every sample in `test/oracle/` with real
+FPC 3.2.2 (`-Mdelphi`) and with pasler and diffs the outputs
+byte-for-byte. Current samples: strings, formatfloat, formatint,
+strapio (StrUtils), mathfnc, dttime (DateUtils), strlist
+(TStringList), lang (sets/case/records/virtual dispatch/negative
+div-mod/exceptions). All eight are byte-identical today.
+
+Divergences and fidelity fixes the oracle drove:
+
+- FPC float rendering (verified against the variable path, which is
+  what array-of-const always is): `%e` = 16 digits after the point +
+  `E+-ddd`; `%g` = the exact digits, scientific iff `exp >= precision`
+  (default 17), trailing zeros stripped, no plus sign in the exponent;
+  `%f` = C-printf rounding at the requested precision (default 2).
+  FPC *float literals* inside array-of-const are promoted to Extended
+  and round differently (`Format('%.2f', [2.675])` = 2.68 while the
+  same call with a Double variable gives 2.67) - documented v1
+  divergence, we keep Double semantics.
+- `FloatToStr` = FPC's general format with 15 significant digits
+  (2.0 -> "2", 1e15 -> "1E15").
+- `IntToHex` pads but never truncates: `IntToHex(4096, 2)` = "1000".
+- `Format('%x')` prints the full hex digits without padding
+  (255 -> "FF", 10 -> "A").
+- `FormatDateTime(fmt, dt)` - the format string comes first
+  (Delphi/FPC order); our earlier shim had it reversed.
+- `DecodeDate`/`DecodeTime` take `Word` var params (Delphi
+  signature); `DaysInMonth(dt)` vs `DaysInAMonth(y, m)` are distinct.
+- `writeln(bool)` renders TRUE/FALSE. Imported `$` overloads do not
+  resolve across nimony modules (verified), so the writeln lowering
+  converts what the parser can prove: char literals become string
+  literals, bool-typed operands (recorded vars, shim calls that
+  return bool, `in` tests) go through `delphiBool`.
+- `BoolToStr(b, useBoolStrs)` added.
+- Pascal's declared array ranges: nimony honors `array[1..5]`
+  indexing but its runtime check assumes 0-based storage, so both
+  emitters now emit the 0-based size (`array[5, int32]`) and a
+  post-pass (`adjustArrayIndices`) offsets index accesses by the
+  recorded low bound. v1: literal ranges, module-level and local
+  vars only.
+- SplitString treats the delimiter as a character SET (Delphi
+  semantics); FPC splits on the whole substring - oracle samples use
+  single-char delimiters.
+- `raise` is only allowed inside a routine (nimony limit): program
+  bodies must raise from a proc. Our ErrorCode raise machinery works
+  unchanged.
+- Bodiless members of PROGRAM-local classes now register as methods
+  (the parser used to require an interface section), and the `;`
+  between a function's return type and its specifiers is consumed -
+  `function Speak: string; virtual;` finally parses.
+- `IntToStr` had a duplicate int64/int overload (nimony's `int` IS
+  int64) - removed.

@@ -26,7 +26,7 @@ const
 proc IsLeapYear*(year: int32): bool =
   (year mod 4 == 0) and ((year mod 100 != 0) or (year mod 400 == 0))
 
-proc DaysInMonth*(year, month: int32): int32 =
+proc DaysInMonthCore(year, month: int32): int32 =
   case month
   of 1, 3, 5, 7, 8, 10, 12: result = 31
   of 4, 6, 9, 11: result = 30
@@ -34,15 +34,23 @@ proc DaysInMonth*(year, month: int32): int32 =
     if IsLeapYear(year): result = 29 else: result = 28
   else: result = 0
 
+proc DaysInAMonth*(year, month: int32): int32 =
+  ## Delphi/FPC two-argument form
+  DaysInMonthCore(year, month)
+
+proc DaysInMonth*(dt: TDateTime): int32 =
+  ## Delphi/FPC: DaysInMonth takes a TDateTime
+  DaysInMonthCore(YearOf(dt), MonthOf(dt))
+
 proc EncodeDate*(year, month, day: int32): TDateTime =
   ## Delphi EncodeDate; 0.0 for out-of-range input
   if (year < 1) or (year > 9999) or (month < 1) or (month > 12) or
-      (day < 1) or (day > DaysInMonth(year, month)):
+      (day < 1) or (day > DaysInMonthCore(year, month)):
     return 0.0
   var doy = int(day)
   var m = 1
   while m < int(month):
-    doy = doy + int(DaysInMonth(year, int32(m)))
+    doy = doy + int(DaysInMonthCore(year, int32(m)))
     inc m
   let i = int(year) - 1
   result = float64(i * 365 + i div 4 - i div 100 + i div 400 + doy -
@@ -55,7 +63,7 @@ proc EncodeTime*(hour, minute, second, msec: int32): TDateTime =
 proc EncodeDateTime*(year, month, day, hour, minute, second: int32): TDateTime =
   EncodeDate(year, month, day) + EncodeTime(hour, minute, second, 0)
 
-proc DecodeDateCore(dt: TDateTime; year, month, day: var int32) =
+proc DecodeDateCore*(dt: TDateTime; year, month, day: var int32) =
   ## the year/month/day cascade from DateTime.hx decode()
   var t = int(dt) + DateDelta
   if t <= 0:
@@ -85,15 +93,22 @@ proc DecodeDateCore(dt: TDateTime; year, month, day: var int32) =
   y = y + i
   # d is the 0-based day of year; walk the months
   var m = 1
-  while m <= 12 and d >= int(DaysInMonth(int32(y), int32(m))):
-    d = d - int(DaysInMonth(int32(y), int32(m)))
+  while m <= 12 and d >= int(DaysInMonthCore(int32(y), int32(m))):
+    d = d - int(DaysInMonthCore(int32(y), int32(m)))
     inc m
   year = int32(y)
   month = int32(m)
   day = int32(d + 1)
 
-proc DecodeDate*(dt: TDateTime; year, month, day: var int32) =
-  DecodeDateCore(dt, year, month, day)
+proc DecodeDate*(dt: TDateTime; year, month, day: var uint16) =
+  ## Delphi/FPC signature: Word var params
+  var y: int32 = 0
+  var m: int32 = 0
+  var d: int32 = 0
+  DecodeDateCore(dt, y, m, d)
+  year = uint16(y)
+  month = uint16(m)
+  day = uint16(d)
 
 proc YearOf*(dt: TDateTime): int32 =
   var y: int32 = 0
@@ -120,7 +135,7 @@ proc TimeValue*(dt: TDateTime): TDateTime =
   ## the time fraction of the value
   result = dt - float64(int(dt))
 
-proc DecodeTimeCore(dt: TDateTime; hour, minute, second, msec: var int32) =
+proc DecodeTimeCore*(dt: TDateTime; hour, minute, second, msec: var int32) =
   ## the rounding guard from DateTime.hx decodeTime: nudge by half a
   ## step away from the 1.0 boundary before decomposing
   var t = min(1.0 - 0.00005 / 86400.0, TimeValue(dt) + 0.00005 / 86400.0) * 24.0
@@ -136,8 +151,17 @@ proc DecodeTimeCore(dt: TDateTime; hour, minute, second, msec: var int32) =
   second = int32(s)
   msec = int32(ms)
 
-proc DecodeTime*(dt: TDateTime; hour, minute, second, msec: var int32) =
-  DecodeTimeCore(dt, hour, minute, second, msec)
+proc DecodeTime*(dt: TDateTime; hour, minute, second, msec: var uint16) =
+  ## Delphi/FPC signature: Word var params
+  var h: int32 = 0
+  var n: int32 = 0
+  var s: int32 = 0
+  var ms: int32 = 0
+  DecodeTimeCore(dt, h, n, s, ms)
+  hour = uint16(h)
+  minute = uint16(n)
+  second = uint16(s)
+  msec = uint16(ms)
 
 proc HourOf*(dt: TDateTime): int32 =
   var h: int32 = 0
@@ -176,7 +200,7 @@ proc DayOfTheWeek*(dt: TDateTime): int32 =
   result = int32((int(dt) + 5) mod 7 + 1)
 
 proc LastDayOfMonth*(dt: TDateTime): int32 =
-  DaysInMonth(YearOf(dt), MonthOf(dt))
+  DaysInMonthCore(YearOf(dt), MonthOf(dt))
 
 proc MonthDelta*(a, b: TDateTime): int32 =
   ## whole months between a and b
@@ -242,7 +266,7 @@ const
                  "Sep", "Oct", "Nov", "Dec"]
   DayNames* = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
-proc FormatDateTime*(dt: TDateTime; fmt: string): string =
+proc FormatDateTime*(fmt: string; dt: TDateTime): string =
   ## Delphi FormatDateTime common subset: yyyy yy mmmm mmm mm m
   ## dddd ddd dd d hh h nn n ss s zzz am/pm; other characters are
   ## literal. Month/day names are English. h/hh switch to 12-hour
@@ -297,4 +321,4 @@ proc FormatDateTime*(dt: TDateTime; fmt: string): string =
       inc p
 
 proc DateTimeToStr*(dt: TDateTime): string =
-  FormatDateTime(dt, "yyyy-mm-dd hh:nn:ss")
+  FormatDateTime("yyyy-mm-dd hh:nn:ss", dt)

@@ -56,6 +56,15 @@ proc nameOf(e: NifEmitter; n: Node): string =
 # ---------------------------------------------------------------------------
 # expressions
 
+proc arraySizeNode(e: var NifEmitter; rng: Node): Node =
+  ## Pascal `array[lo..hi]` becomes 0-based storage of length hi-lo+1
+  if rng.kind == nkRange and rng.len == 2 and
+      rng[0].kind in {nkIntLit, nkInt64Lit} and
+      rng[1].kind in {nkIntLit, nkInt64Lit}:
+    result = newIntNode(nkIntLit, rng[1].intVal - rng[0].intVal + 1, rng.info)
+  else:
+    result = rng
+
 proc emitExpr(e: var NifEmitter; n: Node)
 
 proc emitAtom(e: var NifEmitter; n: Node) =
@@ -201,10 +210,10 @@ proc emitTypeDesc(e: var NifEmitter; n: Node) =
   of nkIdent:
     e.buf.addIdent(e.nameOf(n), i)
   of nkArrayTy:
-    # (at array len elem)
+    # (at array len elem) - Pascal's lo..hi becomes a 0-based length
     e.buf.copyInto(globalTags.registerTag("at"), i):
       e.buf.addIdent("array", i)
-      e.emitExpr(n[0])
+      e.emitExpr(e.arraySizeNode(n[0]))
       e.emitTypeDesc(n[1])
   of nkSetTy:
     e.buf.copyInto(globalTags.registerTag("at"), i):
@@ -290,7 +299,7 @@ proc emitDefaultInit(e: var NifEmitter; ty: Node; i: NifLineInfo) =
       e.buf.addIdent("default", i)
       e.buf.copyInto(globalTags.registerTag("at"), i):
         e.buf.addIdent("array", i)
-        e.emitExpr(ty[0])
+        e.emitExpr(e.arraySizeNode(ty[0]))
         e.emitTypeDesc(ty[1])
   else:
     e.buf.copyInto(globalTags.registerTag("call"), i):

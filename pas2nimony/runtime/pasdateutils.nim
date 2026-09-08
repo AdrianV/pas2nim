@@ -39,7 +39,7 @@ proc IncMonth*(dt: TDateTime; months: int32 = 1): TDateTime =
   var y: int32 = 0
   var m: int32 = 0
   var d: int32 = 0
-  DecodeDate(dt, y, m, d)
+  DecodeDateCore(dt, y, m, d)
   var mo = int(m) + int(months)
   var yr = int(y)
   while mo > 12:
@@ -51,7 +51,7 @@ proc IncMonth*(dt: TDateTime; months: int32 = 1): TDateTime =
   if yr < 1 or yr > 9999:
     return 0.0
   var dd = d
-  let dim = DaysInMonth(int32(yr), int32(mo))
+  let dim = DaysInAMonth(int32(yr), int32(mo))
   if dd > dim: dd = dim
   EncodeDate(int32(yr), int32(mo), dd) + TimeValue(dt)
 
@@ -103,7 +103,7 @@ proc StartOfTheMonth*(dt: TDateTime): TDateTime =
   EncodeDate(YearOf(dt), MonthOf(dt), 1)
 
 proc EndOfTheMonth*(dt: TDateTime): TDateTime =
-  EncodeDate(YearOf(dt), MonthOf(dt), DaysInMonth(YearOf(dt), MonthOf(dt))) +
+  EncodeDate(YearOf(dt), MonthOf(dt), DaysInAMonth(YearOf(dt), MonthOf(dt))) +
       EndOfDayFrac()
 
 proc StartOfTheYear*(dt: TDateTime): TDateTime =
@@ -116,7 +116,7 @@ proc StartOfAMonth*(year, month: int32): TDateTime =
   EncodeDate(year, month, 1)
 
 proc EndOfAMonth*(year, month: int32): TDateTime =
-  EncodeDate(year, month, DaysInMonth(year, month)) + EndOfDayFrac()
+  EncodeDate(year, month, DaysInAMonth(year, month)) + EndOfDayFrac()
 
 proc StartOfAYear*(year: int32): TDateTime = EncodeDate(year, 1, 1)
 proc EndOfAYear*(year: int32): TDateTime =
@@ -132,7 +132,7 @@ proc RecodeTime*(dt: TDateTime; hour, minute, second, msec: int32): TDateTime =
 
 proc IsValidDate*(year, month, day: int32): bool =
   (year >= 1) and (year <= 9999) and (month >= 1) and (month <= 12) and
-      (day >= 1) and (day <= DaysInMonth(year, month))
+      (day >= 1) and (day <= DaysInAMonth(year, month))
 
 proc IsValidTime*(hour, minute, second, msec: int32): bool =
   (hour >= 0) and (hour <= 23) and (minute >= 0) and (minute <= 59) and

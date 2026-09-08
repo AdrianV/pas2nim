@@ -121,6 +121,13 @@ proc IfThen*(val: bool; trueVal, falseVal: string): string =
 proc IfThen*(val: bool; trueVal, falseVal: int32): int32 =
   if val: trueVal else: falseVal
 
+type
+  TStringArray* = seq[string]   # FPC's SplitString result type
+
+proc SplitString*(s: string; delimiters: char): seq[string] =
+  ## 1-char Pascal literal
+  SplitString(s, $delimiters)
+
 proc SplitString*(s, delimiters: string): seq[string] =
   ## Delphi SplitString: every character of delimiters is a separator
   result = @[]

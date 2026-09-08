@@ -6,7 +6,7 @@ program DateTimeTest;
   the common token subset. Now/Date are UTC (nimony's clock). }
 var
   d: TDateTime;
-  y, m, dd, h, n, s, ms: Integer;
+  y, m, dd, h, n, s, ms: Word;
 begin
   d := EncodeDate(2024, 5, 17);
   DecodeDate(d, y, m, dd);
@@ -14,14 +14,14 @@ begin
   d := EncodeDateTime(2024, 5, 17, 14, 30, 45);
   DecodeTime(d, h, n, s, ms);
   writeln('time=', h, ':', n, ':', s, ' ms=', ms);
-  writeln('fmt=', FormatDateTime(d, 'yyyy-mm-dd hh:nn:ss'));
-  writeln('fmt2=', FormatDateTime(d, 'ddd, d mmm yyyy (am/pm hh:nn)'));
+  writeln('fmt=', FormatDateTime('yyyy-mm-dd hh:nn:ss', d));
+  writeln('fmt2=', FormatDateTime('ddd, d mmm yyyy (am/pm hh:nn)', d));
   writeln('year=', YearOf(d), ' month=', MonthOf(d), ' day=', DayOf(d));
   d := FromUnixTimestamp(1715961045.0);
-  writeln('back=', FormatDateTime(d, 'yyyy-mm-dd hh:nn:ss'));
+  writeln('back=', FormatDateTime('yyyy-mm-dd hh:nn:ss', d));
   writeln('leap=', IsLeapYear(2024), ' ', IsLeapYear(1900));
-  writeln('days=', DaysInMonth(2024, 2), ' ', DaysInMonth(1900, 2), ' ', DaysInMonth(1901, 2));
+  writeln('days=', DaysInAMonth(2024, 2), ' ', DaysInAMonth(1900, 2), ' ', DaysInAMonth(1901, 2), ' dt=', DaysInMonth(EncodeDate(2024, 2, 5)));
   writeln('last=', LastDayOfMonth(EncodeDate(2008, 2, 3)));
-  writeln('arith=', FormatDateTime(EncodeDate(2024, 12, 31) + 1, 'yyyy-mm-dd'));
+  writeln('arith=', FormatDateTime('yyyy-mm-dd', EncodeDate(2024, 12, 31) + 1));
   writeln('week=', ISOWeekNumber(EncodeDate(2024, 1, 1)));
 end.

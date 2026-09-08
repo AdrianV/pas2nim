@@ -35,15 +35,15 @@ begin
   { DateUtils }
   d := EncodeDateTime(2024, 5, 17, 14, 30, 45);
   d2 := IncDay(d, 10);
-  writeln('inc10=', FormatDateTime(d2, 'yyyy-mm-dd'));
-  writeln('incmonth=', FormatDateTime(IncMonth(d, 7), 'yyyy-mm-dd'),
-    ' clamped=', FormatDateTime(IncMonth(EncodeDate(2024, 1, 31), 1), 'yyyy-mm-dd'));
+  writeln('inc10=', FormatDateTime('yyyy-mm-dd', d2));
+  writeln('incmonth=', FormatDateTime('yyyy-mm-dd', IncMonth(d, 7)),
+    ' clamped=', FormatDateTime('yyyy-mm-dd', IncMonth(EncodeDate(2024, 1, 31), 1)));
   writeln('incyear=', YearOf(IncYear(d, 2)));
   writeln('between=', DaysBetween(d2, d), ' hours=', HoursBetween(d2, d));
   writeln('doy=', DayOfTheYear(d), ' week=', WeekOfTheYear(d));
-  writeln('startmonth=', FormatDateTime(StartOfTheMonth(d), 'yyyy-mm-dd'),
-    ' endmonth=', FormatDateTime(EndOfTheMonth(d), 'yyyy-mm-dd hh:nn:ss'));
-  writeln('recode=', FormatDateTime(RecodeDate(d, 2000, 12, 25), 'yyyy-mm-dd'));
+  writeln('startmonth=', FormatDateTime('yyyy-mm-dd', StartOfTheMonth(d)),
+    ' endmonth=', FormatDateTime('yyyy-mm-dd hh:nn:ss', EndOfTheMonth(d)));
+  writeln('recode=', FormatDateTime('yyyy-mm-dd', RecodeDate(d, 2000, 12, 25)));
   writeln('valid=', IsValidDate(2024, 2, 29), ' ', IsValidDate(1900, 2, 29));
 
   { SysUtils file ops + Format %n + Math.SameValue }

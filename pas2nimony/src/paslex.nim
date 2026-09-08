@@ -259,6 +259,15 @@ proc getNumber10(L: var TLexer, tok: var TToken) =
     tok.literal.add('.')
     inc(L.bufpos)
     matchUnderscoreChars(L, tok, {'e', 'E', '+', '-', '0'..'9'})
+  elif (L.buf[L.bufpos] in {'e', 'E'}) and
+      (L.buf[L.bufpos + 1] in {'0'..'9', '+', '-'}):
+    # exponent without a fractional part: 1e20, 1E+20
+    tok.literal.add('e')
+    inc(L.bufpos)
+    if L.buf[L.bufpos] in {'+', '-'}:
+      tok.literal.add(L.buf[L.bufpos])
+      inc(L.bufpos)
+    matchUnderscoreChars(L, tok, {'0'..'9'})
   if isFloatLiteral(tok.literal):
     var f: float = 0.0
     if parseBiggestFloat(tok.literal, f) > 0:

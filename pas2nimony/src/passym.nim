@@ -68,6 +68,7 @@ type
     warned*: Table[string, bool]       ## names we already warned about
     rtlUnits*: seq[string]             ## Pascal unit names from `uses`
     returnsValue*: Table[string, bool] ## functions/constructors by lower name
+    returnsBool*: Table[string, bool]  ## shim functions returning Boolean
 
 proc initSymTab*(): SymTab =
   result = SymTab()

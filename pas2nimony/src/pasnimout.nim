@@ -273,9 +273,19 @@ proc defaultInit(s: var TRendor, ty: Node): string =
   of nkSetTy:
     result = "{}"
   of nkArrayTy:
-    result = "default(array[" & s.expr(ty[0]) & ", " & s.typeStr(ty[1]) & "])"
+    result = "default(array[" & s.arraySize(ty[0]) & ", " & s.typeStr(ty[1]) & "])"
   else:
     result = "default(" & s.typeStr(ty) & ")"
+
+proc arraySize(s: var TRendor, rng: Node): string =
+  ## Pascal arrays keep `array[lo..hi]` syntax but nimony's runtime
+  ## index check assumes 0-based storage of length hi-lo+1
+  if rng.kind == nkRange and rng.len == 2 and
+      rng[0].kind in {nkIntLit, nkInt64Lit} and
+      rng[1].kind in {nkIntLit, nkInt64Lit}:
+    result = $(rng[1].intVal - rng[0].intVal + 1)
+  else:
+    result = s.expr(rng)
 
 proc typeStr(s: var TRendor, n: Node): string =
   ## render a type node
@@ -300,7 +310,7 @@ proc typeStr(s: var TRendor, n: Node): string =
       if i > 0: result.add(", ")
       result.add(s.expr(n[i]))
   of nkArrayTy:
-    result = "array[" & s.expr(n[0]) & ", " & s.typeStr(n[1]) & "]"
+    result = "array[" & s.arraySize(n[0]) & ", " & s.typeStr(n[1]) & "]"
   of nkOpenArrayTy:
     result = "openArray[" & s.typeStr(n[0]) & "]"
   of nkSeqTy:

@@ -44,12 +44,15 @@ proc `+`*(a: char, b: string): string = ChrToStr(a) & b
 
 proc IntToStr*(i: int64): string = $i
 proc IntToStr*(i: int32): string = $i
-proc IntToStr*(i: int): string = $i
 proc IntToStr*(i: uint32): string = $i
 proc IntToStr*(i: uint64): string = $i
 
-proc FloatToStr*(f: float): string = $f
-proc FloatToStr*(f: float32): string = $f
+proc FloatToStr*(f: float): string = fpcFormatG(f, 15)
+proc FloatToStr*(f: float32): string = fpcFormatG(f, 15)
+
+proc StrToIntDef*(s: char; def: int64): int64 =
+  ## 1-char Pascal literal: never parses as a number
+  def
 
 proc StrToIntDef*(s: string; def: int64): int64 =
   ## non-raising parse; returns `def` on failure
@@ -70,6 +73,8 @@ proc StrToIntDef*(s: string; def: int64): int64 =
 
 proc StrToInt*(s: string): int64 = StrToIntDef(s, 0)
 
+proc StrToInt*(s: char): int64 = 0
+
 # ---------------------------------------------------------------------------
 # string helpers (Pascal names map onto strutils)
 
@@ -85,6 +90,18 @@ proc StringOfChar*(c: char; count: int): string = repeat(c, count)
 # I/O shims
 
 proc WriteLn*() = echo ""
+
+proc delphiBool*(b: bool): string =
+  ## writeln(bool) renders TRUE/FALSE like Delphi/FPC
+  if b: result = "TRUE" else: result = "FALSE"
+
+proc BoolToStr*(b: bool; useBoolStrs: bool): string =
+  ## Delphi/FPC: with bool strings 'True'/'False', otherwise '-1'/'0'
+  if useBoolStrs:
+    if b: result = "True" else: result = "False"
+  else:
+    if b: result = "-1" else: result = "0"
+
 proc ReadLn*(): string =
   result = ""
   discard "readline support depends on syncio; extended in tests"
@@ -182,9 +199,19 @@ proc pasExcCreate*(self: PasException; msg: string): PasException =
 
 import std/[os, dirs]
 
-proc IntToHex*(value: int64; digits: int32): string = toHex(value, int(digits))
+proc IntToHex*(value: int64; digits: int32): string =
+  ## Delphi/FPC: pad to `digits`, but never truncate - a value that
+  ## needs more digits prints in full (IntToHex(4096, 2) = "1000")
+  var s = toHex(value, 16)
+  var i = 0
+  while i < s.len - 1 and s[i] == '0':
+    inc i
+  s = substr(s, i, s.len - 1)
+  while s.len < digits:
+    s = "0" & s
+  result = s
 proc IntToHex*(value: int32; digits: int32): string =
-  toHex(int64(value), int(digits))
+  IntToHex(int64(value), digits)
 
 proc StrToFloatDef*(s: string; def: float64): float64 =
   ## non-raising parse of an optional-sign integer/fraction/exponent
@@ -367,6 +394,94 @@ proc vrecToStr(v: TVarRec): string =
   of vrStr: result = v.s
   of vrObj: result = ""
 
+proc fpcSciMantissa(f: float64; afterPoint: int): string =
+  ## the mantissa digits FPC prints: C printf rounding at afterPoint
+  ## digits after the point (verified identical to FPC 3.2.2)
+  formatBiggestFloat(f, ffScientific, int64(afterPoint), '.')
+
+proc fpcFormatE*(f: float64; prec: int): string =
+  ## FPC %e: mantissa + E with a signed 3-digit exponent (1.23E+003).
+  ## prec < 0 = the default (16 after the point = 17 significant);
+  ## an explicit N counts significant digits like Delphi/FPC.
+  var ap = prec
+  if ap < 0: ap = 16
+  else:
+    ap = ap - 1
+    if ap < 1: ap = 1
+  let s = fpcSciMantissa(f, ap)
+  let ep = find(s, "e", 0)
+  let mant = substr(s, 0, ep - 1)
+  var expPart = substr(s, ep + 1, s.len - 1)     # "+00" / "-01"
+  var digits = substr(expPart, 1, expPart.len - 1)
+  while digits.len < 3: digits = "0" & digits
+  result = mant & "E" & substr(expPart, 0, 0) & digits
+
+proc fpcFormatG*(f: float64; prec: int): string =
+  ## FPC %g: the exact value; positional unless exp >= precision
+  ## (default 17), trailing zeros stripped, E-form without plus sign
+  ## or padding (1E20, 1.23E3).
+  var sig = prec
+  if sig <= 0: sig = 17
+  let s = fpcSciMantissa(f, sig - 1)
+  let ep = find(s, "e", 0)
+  var mant = substr(s, 0, ep - 1)
+  # parse the exponent manually
+  var expPart = substr(s, ep + 1, s.len - 1)
+  var eneg = false
+  var q = 0
+  if expPart[q] == '-':
+    eneg = true
+    inc q
+  elif expPart[q] == '+':
+    inc q
+  var exp = 0
+  while q < expPart.len and expPart[q] >= '0' and expPart[q] <= '9':
+    exp = exp * 10 + ord(expPart[q]) - ord('0')
+    inc q
+  if eneg: exp = -exp
+  if exp >= sig:
+    # scientific: strip trailing zeros (and a trailing dot)
+    while mant.len > 0 and mant[mant.len - 1] == '0':
+      mant = substr(mant, 0, mant.len - 2)
+    if mant.len > 0 and mant[mant.len - 1] == '.':
+      mant = substr(mant, 0, mant.len - 2)
+    result = mant & "E" & $exp
+  else:
+    # positional: shift the decimal point from after digit 1
+    var neg = false
+    var digits = ""
+    var k = 0
+    while k < mant.len:
+      if mant[k] == '-':
+        neg = true
+      elif mant[k] != '.':
+        digits.add(mant[k])
+      inc k
+    let pt = 1 + exp
+    var outp = ""
+    if pt <= 0:
+      outp = "0."
+      var z = 0
+      while z < -pt:
+        outp.add('0')
+        inc z
+      outp.add(digits)
+    else:
+      if pt >= digits.len:
+        outp = digits
+        var z = digits.len
+        while z < pt:
+          outp.add('0')
+          inc z
+      else:
+        outp = substr(digits, 0, pt - 1) & "." & substr(digits, pt, digits.len - 1)
+    while outp.len > 1 and outp[outp.len - 1] == '0':
+      outp = substr(outp, 0, outp.len - 2)
+    if outp.len > 0 and outp[outp.len - 1] == '.':
+      outp = substr(outp, 0, outp.len - 2)
+    if neg and outp != "0": outp = "-" & outp
+    result = outp
+
 proc padLeftStr(s: string; width: int; leftAlign: bool): string =
   result = s
   if width > s.len:
@@ -442,17 +557,25 @@ proc Format*(fmt: string; args: openArray[TVarRec]): string =
         else: piece = "0"
       elif typ == 'x' or typ == 'X':
         if v.k == vrInt:
-          piece = toHex(v.i, 1)
+          let full = toHex(v.i, 16)
+          var i = 0
+          while i < full.len - 1 and full[i] == '0':
+            inc i
+          piece = substr(full, i, full.len - 1)
           if typ == 'X': piece = toUpperAscii(piece)
       elif typ == 'e' or typ == 'E' or typ == 'f' or typ == 'g' or typ == 'G' or typ == 'n' or typ == 'm':
         var f = 0.0
         if v.k == vrFloat: f = v.f
         elif v.k == vrInt: f = float64(v.i)
         if typ == 'f' or typ == 'n' or typ == 'm':
+          # FPC's variable path (array-of-const holds Double) rounds like
+          # C printf; FPC's *literal* path promotes to Extended instead -
+          # a v1 divergence documented in doc/nimony-compat.md
           var prec2 = prec
-          if prec2 < 0:
-            if typ == 'n' or typ == 'm': prec2 = 2 else: prec2 = 2
+          if prec2 < 0: prec2 = 2
           piece = formatBiggestFloat(f, ffDecimal, prec2, '.')
+          if prec2 == 0 and piece.len > 0 and piece[piece.len - 1] == '.':
+            piece = substr(piece, 0, piece.len - 2)
           if typ == 'n':
             # thousands separators in the integer part
             let dot = find(piece, ".", 0)
@@ -465,11 +588,9 @@ proc Format*(fmt: string; args: openArray[TVarRec]): string =
                 inc k
               piece = grouped & substr(piece, dot, piece.len - 1)
         elif typ == 'g' or typ == 'G':
-          piece = $f
+          piece = fpcFormatG(f, prec)
         else:
-          var prec2 = prec
-          if prec2 < 0: prec2 = 6
-          piece = formatBiggestFloat(f, ffScientific, prec2, '.')
+          piece = fpcFormatE(f, prec)
       elif typ == 's':
         if v.k == vrStr:
           piece = v.s

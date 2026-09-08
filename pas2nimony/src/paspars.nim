@@ -45,6 +45,7 @@ type
     aheadTok*: TToken
     hasAhead*: bool
     section*: TSection
+    arrayLows*: Table[string, int]   # Pascal 1-based array low bounds
     inParamList*: bool
     context*: TContextKind
     visibility*: TVisibility
@@ -350,6 +351,14 @@ proc scanNimExports(ln: string; s: var SymTab) =
                 while r < t.len and t[r] in {' ', '\t'}: inc r
                 if r < t.len and t[r] == ':':
                   s.returnsValue[name.toLowerAscii] = true
+                  var v = r + 1
+                  while v < t.len and t[v] in {' ', '\t'}: inc v
+                  var ty = ""
+                  while v < t.len and t[v] in {'a'..'z', 'A'..'Z', '0'..'9', '_'}:
+                    ty.add(t[v])
+                    inc v
+                  if ty.toLowerAscii == "bool":
+                    s.returnsBool[name.toLowerAscii] = true
                 break
             inc q
     break
@@ -1188,6 +1197,21 @@ proc parseVarSection*(p: var TParser): Node =
       for i in 0 ..< defs.len - 2:
         if defs[i].kind == nkIdent:
           p.varTypes[defs[i].strVal.toLowerAscii] = "set"
+    elif tyNode.kind == nkIdent and
+        tyNode.strVal.toLowerAscii in ["boolean", "bool"]:
+      for i in 0 ..< defs.len - 2:
+        if defs[i].kind == nkIdent:
+          p.varTypes[defs[i].strVal.toLowerAscii] = "bool"
+    elif tyNode.kind == nkArrayTy and tyNode.len > 0 and
+        tyNode[0].kind == nkRange and tyNode[0].len == 2 and
+        tyNode[0][0].kind in {nkIntLit, nkInt64Lit}:
+      # Pascal arrays keep their declared low bound; nimony's runtime
+      # index check assumes 0-based storage, so index accesses must be
+      # offset (see selfQualifyInPlace)
+      let low = tyNode[0][0].intVal
+      for i in 0 ..< defs.len - 2:
+        if defs[i].kind == nkIdent:
+          p.arrayLows[defs[i].strVal.toLowerAscii] = int(low)
     elif tyNode.kind == nkIdent:
       let tyKey = tyNode.strVal.toLowerAscii
       if p.methodPtrTypes.hasKey(tyKey):
@@ -2265,8 +2289,9 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
   elif p.classOfProc.len > 0 and p.section != seInterface:
     # nested routine inside a method body: it sees `self` implicitly
     isMethod = true
-  elif p.selfClass.len > 0 and p.section == seInterface:
-    # bodiless member declaration inside an interface class body
+  elif p.selfClass.len > 0 and (p.section == seInterface or noBody):
+    # bodiless member declaration inside a class body (interface
+    # sections and program-local classes)
     isMethod = true
     p.classOfProc = p.selfClass
   # name + export marker; class methods lower to module-level names,
@@ -2316,6 +2341,8 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
     let ret = parseTypeDesc(p, emptyNode(p.tok.info))
     params[0] = ret
     skipCom(p)
+    p.opt(pxSemiColon)          # `function Speak: string; virtual;`
+    skipCom(p)
   # constructors: return the class type (before self-param insertion)
   if kind == pxConstructor and isMethod:
     params[0] = genSelfType(p)
@@ -2356,7 +2383,7 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
       p.syms.returnsValue[name.toLowerAscii] = false
   if isClassProc and isMethod and kind != pxOperator:
     p.syms.addClassProc(p.classOfProc, name)
-  elif isMethod and (isDotted or p.section == seInterface):
+  elif isMethod and (isDotted or p.section == seInterface or noBody):
     if kind == pxConstructor or kind == pxDestructor:
       p.syms.addCtor(p.classOfProc, name)
     else:
@@ -2847,6 +2874,34 @@ proc lowerFormatArrayOfConst*(p: var TParser, n: Node): Node =
     n.sons = @[n[0], n[1], lst]
   result = n
 
+proc writelnArg(p: var TParser, n: Node): Node =
+  ## convert writeln operands that need Delphi/FPC rendering
+  if n.kind == nkCharLit:
+    let s = newNode(nkStrLit, n.info)
+    s.strVal = ""
+    s.strVal.add(n.strVal[0])
+    return s
+  if n.kind == nkIdent and
+      p.varTypes.getOrDefault(n.strVal.toLowerAscii, "") == "bool":
+    let c = newNode(nkCall, n.info)
+    c.add(newIdentNode("delphiBool", n.info))
+    c.add(n)
+    return c
+  if n.kind == nkCall and n.len > 0 and n[0].kind == nkIdent and
+      p.syms.returnsBool.getOrDefault(n[0].strVal.toLowerAscii, false):
+    let c = newNode(nkCall, n.info)
+    c.add(newIdentNode("delphiBool", n.info))
+    c.add(n)
+    return c
+  if n.kind == nkInfix and n.len == 3 and n[0].kind == nkIdent and
+      n[0].strVal == "in":
+    # `elem in set` yields a Boolean
+    let c = newNode(nkCall, n.info)
+    c.add(newIdentNode("delphiBool", n.info))
+    c.add(n)
+    return c
+  return n
+
 proc mapBuiltinCall*(p: var TParser, n: Node): Node =
   ## rewrite builtins that need argument changes:
   ## write(x) -> write(stdout, x); writeln(...) -> echo(...);
@@ -2878,6 +2933,13 @@ proc mapBuiltinCall*(p: var TParser, n: Node): Node =
       n.sons = @[n[0], stdoutNode, folded]
     return n
   of "writeln":
+    # Delphi/FPC render booleans TRUE/FALSE and chars bare; imported
+    # `$` overloads do not resolve across nimony modules, so convert
+    # the operand kinds we can detect instead of wrapping in `$`
+    var i = 1
+    while i < n.len:
+      n[i] = writelnArg(p, n[i])
+      inc i
     n[0].strVal = "echo"
     return n
   of "format":
@@ -3604,6 +3666,9 @@ proc selfQualifyInPlace(p: var TParser, n: Node,
     # qualify the receiver, never the selector
     n[0] = selfQualifyInPlace(p, n[0], scope)
     return n
+  of nkIndexExpr:
+    # array-index offsets happen in adjustArrayIndices (one pass)
+    return selfQualifyKids(p, n, scope)
   of nkTypeDef, nkTypeSection, nkImportStmt, nkProcTy, nkRefTy, nkPtrTy,
      nkObjectTy, nkEnumTy, nkArrayTy, nkSetTy, nkOpenArrayTy, nkRangeTy,
      nkFormalParams, nkIdentDefs, nkVarSection, nkConstSection, nkCommentStmt:
@@ -3794,6 +3859,30 @@ proc selfQualifyAll*(p: var TParser, module: Node) =
         for j in 0 ..< body.len:
           body[j] = selfQualifyInPlace(p, body[j], scope)
       p.qualClass = savedClass
+
+proc adjustArrayIndicesInPlace(p: var TParser, n: Node): Node =
+  ## Pascal arrays keep their declared low bound (`array[1..5]`); nimony's
+  ## runtime index check assumes 0-based storage, so every index access
+  ## gets offset by the recorded low bound exactly once
+  if n.kind == nkIndexExpr and n.len == 2:
+    n[0] = adjustArrayIndicesInPlace(p, n[0])
+    n[1] = adjustArrayIndicesInPlace(p, n[1])
+    if n[0].kind == nkIdent:
+      let low = p.arrayLows.getOrDefault(n[0].strVal.toLowerAscii, 0)
+      if low != 0:
+        let minus = newNode(nkInfix, n[1].info)
+        minus.add(newIdentNode("-", n[1].info))
+        minus.add(n[1])
+        minus.add(newIntNode(nkIntLit, int64(low), n[1].info))
+        n[1] = minus
+    return n
+  for i in 0 ..< n.len:
+    n[i] = adjustArrayIndicesInPlace(p, n[i])
+  return n
+
+proc adjustArrayIndices*(p: var TParser, module: Node) =
+  for i in 0 ..< module.len:
+    discard adjustArrayIndicesInPlace(p, module[i])
 
 proc rewriteClassAsgns*(p: var TParser, n: Node) =
   ## upcast assignments between differently typed class variables:
@@ -4125,6 +4214,7 @@ proc parseUnit*(p: var TParser): Node =
   genPropertyAccessors(p, p.module)
   initValueResult(p, p.module)
   selfQualifyAll(p, p.module)
+  adjustArrayIndices(p, p.module)
   classQualifyAll(p, p.module)
   # class vars: hoist the module-level storage after the last type
   # section so routines (declared later) see it
