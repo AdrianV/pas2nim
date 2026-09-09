@@ -2378,6 +2378,18 @@ proc parseRecordOrObject*(p: var TParser, kind: NodeKind,
     record = result
   getTokP(p)                    # skip `class`/`object`
   skipCom(p)
+  if p.tok.xkind == pxOf:
+    # metaclass type: `TPersistentClass = class of TPersistent;` and
+    # `procedure Foo(A: TComponentClass)` - a class-reference type;
+    # v1 has no lowering, so it becomes a comment alias
+    getTokP(p)
+    skipCom(p)
+    let base = parseTypeDesc(p, emptyNode(p.tok.info))
+    p.opt(pxSemiColon)
+    result = newNode(nkCommentStmt, definition.info)
+    result.strVal = "# metaclass: " & definition.strVal & " = class of " &
+                    base.strVal & " (v1 skip)"
+    return
   if p.tok.xkind == pxSemiColon:
     # forward declaration: `Name = class;`
     getTokP(p)
@@ -2531,6 +2543,12 @@ proc parseProperty*(p: var TParser): Node =
       elif word == "readonly" or word == "writeonly":
         # COM automation access specifiers (StdVCL): v1 no-op
         getTokP(p)
+      elif word == "stored" or word == "immutable":
+        # streaming specifiers: `stored False` / bare `stored`
+        getTokP(p)
+        if p.tok.xkind notin {pxSemiColon, pxComma, pxBracketLe} and
+            p.tok.xkind != pxEof:
+          discard parseExpr(p)
       elif word == "dispid":
         # `dispid N` tail: consume the integer
         getTokP(p)
@@ -3081,19 +3099,46 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
     p.eat(pxGt)
     skipCom(p)
   if p.tok.xkind == pxDot:
-    # qualified: `MyClass.doIt`
+    # qualified: `MyClass.doIt`, or an interface-method mapping clause
+    # `function IUnknown.QueryInterface = ObjQueryInterface;`
     let cls = name
     p.removeNextTok()
     skipCom(p)
     if p.tok.xkind != pxSymbol:
       parError(p, "method name expected, got " & $p.tok)
     name = p.tok.ident
+    getTokP(p)
+    skipCom(p)
+    if p.tok.xkind == pxEquals:
+      # mapping clause: `function IIntf.Member = ImplName;` - v1
+      # lowers it to a comment; the implementation keeps its own name
+      var implName = ""
+      if p.tok.xkind == pxParLe:
+        # mapping clauses may repeat the parameter list
+        discard parseParamList(p)
+        skipCom(p)
+      if p.tok.xkind == pxColon:
+        getTokP(p)
+        skipCom(p)
+        discard parseTypeDesc(p, emptyNode(p.tok.info))
+        skipCom(p)
+      if p.tok.xkind == pxEquals:
+        getTokP(p)
+        skipCom(p)
+        if p.tok.xkind == pxSymbol:
+          implName = p.tok.ident
+          getTokP(p)
+          skipCom(p)
+      p.opt(pxSemiColon)
+      skipCom(p)
+      result = newNodeP(nkCommentStmt, p)
+      result.strVal = "# interface method: " & cls & "." & name & " = " &
+                      implName & " (v1: implementation keeps its name)"
+      return
     p.selfClass = cls
     p.classOfProc = cls
     isMethod = true
     isDotted = true
-    getTokP(p)
-    skipCom(p)
   elif p.classOfProc.len > 0 and p.section != seInterface:
     # nested routine inside a method body: it sees `self` implicitly
     isMethod = true
