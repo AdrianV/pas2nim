@@ -585,3 +585,45 @@ Both drivers now speak the nimony CLI:
 - Suite section `pasler-cli` covers define on/off runs and
   `check`; `pasler n` verified manually on the probe (native
   binary produced and runs).
+
+### Why the non-`c` paths go through `.nim` and not the NIF pipeline
+
+Design rationale, probed and fixed in M6-3 - kept here so we do not
+re-derive it:
+
+1. **nimony exposes exactly one entry point into pre-digested NIFs.**
+   `nimony s` takes a `.p.nif` and runs the full buildGraph including
+   link - it is "finish this already-parsed project", not a generic
+   "apply backend X to a NIF". There is no sem-only or
+   backend-pluggable NIF action, so `check` over our NIFs is not even
+   expressible today: the check path starts at `.nim`.
+2. **Backend selection lives at the project-graph level.** `n`/`w`
+   swap in a different stdlib configuration (nimNativeAlloc /
+   nimNativeIo for the libc-free native build, freestanding rules for
+   wasm), a different system module variant, different CC/linker
+   invocations. Those knobs are applied when nimony builds the module
+   graph from sources.
+3. **Our TokenBuf NIFs bake in the default config's world.** The NIF
+   pipeline pre-resolves unit references into hashed module names and
+   shim symbols against the default (C-with-libc) sem world. Probe:
+   `nimony s --native hello.p.nif` -> `undeclared identifier:
+   pasCurrentExc`, while the same shims under `nimony n hello.nim`
+   build and the binary runs, because there nimony parses and
+   semchecks everything itself - including systempas.nim - under one
+   coherent configuration. The breakage is in the pre-resolved NIF
+   graph, not in the shims.
+4. **Delegation is cheap: the artifact already exists.** The `.nim`
+   anchors are phase A of the pipeline we maintain anyway. The cost
+   is a re-parse by nimony's own nifler - irrelevant for the
+   non-hot-path commands - and NIF dialect drift cannot break those
+   paths, since nimony generates its own NIFs from our source.
+5. **It puts future work in the right place.** The `w` failure
+   (`no filesystem on a freestanding target` from std/os.nim) is a
+   shim problem, not an emitter problem. Once the shims are
+   freestanding-safe, `pasler w` works with zero pasler changes.
+
+If we ever want native/wasm on the NIF route, that needs nimony to
+expose backend selection for the NIF entry point plus
+config-agnostic emission on our side. Until then the `.nim`
+delegation is the honest interface, and `c` - the oracle-critical,
+byte-identical path - stays untouched.
