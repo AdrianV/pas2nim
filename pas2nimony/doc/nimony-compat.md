@@ -849,3 +849,75 @@ same round (corpus health: 17 of 41 units translate):
   results (`with Unit.Object.RegisterClass(...) do`), with on fields
   of classes from un-absorbed units, interface impl with a real
   parent, if-header-spanning conditionals.
+
+## M8a: case bodies, routine types, multi-dim arrays (corpus-driven)
+
+- **Case branch bodies keep trailing `;`** (`of 1: Foo();` before the
+  next `of`); **case-`else` takes a statement sequence** until `end`
+  (ObjAuto's `else Result := ...; ... end;`).
+- **Routine types**: `assembler` joins the no-op specifier set;
+  `parseRoutineType` parses the return type before the `of object`
+  marker, so method-pointer types `function(x): WideString of object`
+  parse; keyword-escaped parameter names (`const Operator: TVarOp`)
+  get the `pasX` rename and are accepted as tokens.
+- **Multi-dim static arrays** lower to nested single-dim chains
+  (`array[a..b, c..d] of T` -> `array[a..b] of array[c..d] of T`),
+  including `of const` element tables.
+- **Repeat bodies** consume statement separators; **uses-clause head
+  breaks** on `;`/EOF; empty `while C do ;` bodies tolerated.
+
+## M8b: with on arrays, pointer aliases, open-array params
+
+- `with PWideStrData(Data)^ do` (pointer-cast deref) and `with
+  PExpr^ do` (pointer-alias deref) resolve via a `pointerAliases` map
+  (`P = ^T` element types) registered in the type section.
+- Array variables with class/record elements register their element
+  type (`arrayVarElems`) so `with List[i] do` qualifies; open-array
+  params `const X: array of TRec` register the element likewise.
+- Nested variant records (`case Boolean of True: (...); False: (...)")
+  recurse in the record-case machinery; `implements` lists parse and
+  lower the parent type only (v1).
+
+## M8c: try/except `else`, plain handlers, class casts
+
+- The bare `else` after `on` branches is the `else` **keyword token**,
+  not an identifier; the except-section's else path accepts both
+  spellings (`on EConvertError do <comment> else raise; end;` from
+  IniFiles/Registry).
+- A plain `except <stmts> end` handler (no on/else) parses its body
+  as a statement sequence stored as the branch's third son (the
+  renderer reads the body at index 2; the old `[1] =` write crashed
+  the renderer on every multi-statement handler).
+- `with THashedStringList(expr) do` resolves the cast's class.
+
+## M8d: with on call results
+
+- The parser records each function's return spelling in a
+  `routineReturns` map (bare + class-qualified keys) and the
+  with-expr-class reads it: `with SomeRoutine(...) do` resolves when
+  the routine is known (declared in the unit or an absorbed unit);
+  bare routine calls resolve the same way. The ht-family variant - a
+  call on a unit-level variable from an un-absorbed unit - stays a
+  documented v1 gap.
+
+## M8e: quoted directive bodies, bare raise/property, dispinterface
+
+- The lexer treats old-style `(*$HPPEMIT '...'*)` and curly
+  `{$HPPEMIT '...'}` bodies whose content starts with a quote/char
+  literal as raw text up to the end marker (bodies may contain both
+  quotes and asterisks - StdVCL); the opener token is still delivered
+  and the end marker waits one getTok.
+- Bare `raise` followed by `end`/`finally`/`else` is a re-raise
+  (ZLib's `except ... raise end;`).
+- Bare `property OnProgress;` (re-exposed ancestor property) parses
+  without a type clause; `readonly`/`writeonly`/`dispid N` property
+  tails are consumed as COM plumbing.
+- `X = interface;` forwards and `X = dispinterface ...` bodies lower
+  to comments (no COM dual-interface lowering in v1).
+- Routine-header specifiers tolerate `{$IFDEF} external; {$ENDIF}`
+  wrappers between them, so the Windows-only `external;` dead branch
+  no longer ends the specifier list.
+
+- Pristine-RTL census additions: IniFiles, Registry, ZLib, StdVCL
+  join the translating set (ZLib/StdVCL only as comments-free type
+  shims where COM surfaces were skipped).
