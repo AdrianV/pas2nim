@@ -72,6 +72,7 @@ type
     arrayAliases*: Table[string, string] ## array alias -> element spelling
     arrayVarElems*: Table[string, string] ## array var -> element spelling
     pointerAliases*: Table[string, string] ## P = ^T alias -> element
+    routineReturns*: Table[string, string] ## routine name -> return spelling
     curTypeParams*: seq[string]  ## params of the type being declared
     genericArgDepth*: int  ## > 0 while parsing `<...>` generic args
     withTemps*: seq[string]     ## hidden per-with temporaries by depth
@@ -3115,6 +3116,16 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
     skipCom(p)
     p.opt(pxSemiColon)          # `function Speak: string; virtual;`
     skipCom(p)
+  if params[0].kind == nkIdent:
+    # the routine's return spelling for `with Call(...)` lowering
+    let retSp = params[0].strVal
+    p.routineReturns[name.toLowerAscii] = retSp
+    if p.classOfProc.len > 0:
+      p.routineReturns[p.classOfProc.toLowerAscii & "." &
+                       name.toLowerAscii] = retSp
+    if p.classOfProc.len == 0 and p.selfClass.len > 0:
+      p.routineReturns[p.selfClass.toLowerAscii & "." &
+                       name.toLowerAscii] = retSp
   # `result` carries the routine's return type for conversion
   # insertion in the body (`result := intExpr` on a float/record
   # return)
@@ -4263,6 +4274,16 @@ proc withExprClass(p: var TParser, e: Node): string =
   elif e.kind == nkCall and e.len == 2 and e[0].kind == nkIdent:
     # a type-cast `THashedStringList(expr)`: the cast's class
     return p.syms.classSpelling(e[0].strVal)
+  elif e.kind == nkCall and e.len >= 1 and e[0].kind == nkDotExpr and
+      e[0][0].kind == nkIdent and e[0][1].kind == nkIdent:
+    # `HtScriptGlobal.RegisterClass(...)`: the routine's return type
+    let rk = e[0][1].strVal.toLowerAscii
+    let ck = e[0][0].strVal.toLowerAscii
+    return p.routineReturns.getOrDefault(ck & "." & rk,
+        p.routineReturns.getOrDefault(rk, ""))
+  elif e.kind == nkCall and e.len >= 1 and e[0].kind == nkIdent:
+    # a bare routine call: the routine's return type
+    return p.routineReturns.getOrDefault(e[0].strVal.toLowerAscii, "")
   elif e.kind == nkDotExpr and e.len == 2:
     let baseCls = p.withExprClass(e[0])
     if baseCls.len > 0 and e[1].kind == nkIdent:
