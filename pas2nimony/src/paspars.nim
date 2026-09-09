@@ -1858,6 +1858,12 @@ proc parseInterfaceType(p: var TParser, definition: Node): Node =
       p.opt(pxSemiColon)
       skipCom(p)
       continue
+    if p.tok.xkind == pxIntLit:
+      # `procedure X; dispid 2;` - a trailing dispid tail: consume it
+      getTokP(p)
+      p.opt(pxSemiColon)
+      skipCom(p)
+      continue
     if p.tok.xkind in {pxProcedure, pxFunction}:
       let kind = p.tok.xkind
       getTokP(p)
@@ -3441,17 +3447,29 @@ proc parseTry*(p: var TParser): Node =
       sawOn = true
       let b = newNodeP(nkExceptBranch, p)
       getTokP(p)
-      # `on E: SomeEx do`
-      if p.tok.xkind != pxSymbol:
-        parError(p, "exception variable name expected")
-      let varName = p.tok.ident
-      getTokP(p)
+      # `on E: SomeEx do` or `on SomeEx do` (no variable binding)
+      var varName: string
+      var excTy: Node
+      if p.tok.xkind == pxSymbol and p.peekTok.xkind == pxColon:
+        varName = p.tok.ident
+        getTokP(p)
+        p.eat(pxColon)
+        excTy = qualifiedIdent(p)
+      else:
+        inc p.thunkCounter
+        varName = "pasExc" & $p.thunkCounter
+        excTy = qualifiedIdent(p)
       p.syms.declareName(varName)
-      p.eat(pxColon)
-      let excTy = qualifiedIdent(p)
       skipCom(p)
       p.eat(pxDo)
-      let handler = parseStmt(p)
+      skipCom(p)
+      var handler: Node
+      if p.tok.xkind == pxElse:
+        # `on X do { nothing }; else ...` - an empty on-handler body
+        handler = newNode(nkDiscardStmt, p.tok.info)
+        handler.add(emptyNode(p.tok.info))
+      else:
+        handler = parseStmt(p)
       # map the Delphi exception class to an ErrorCode
       var code: string = ""
       if excTy.kind == nkIdent:
