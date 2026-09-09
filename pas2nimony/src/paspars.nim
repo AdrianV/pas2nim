@@ -3604,7 +3604,8 @@ proc parseTry*(p: var TParser): Node =
       result.add(b)
       p.opt(pxSemiColon)
       skipCom(p)
-    if p.tok.xkind == pxSymbol and p.tok.ident.toLowerAscii == "else":
+    if (p.tok.xkind == pxSymbol and p.tok.ident.toLowerAscii == "else") or
+        p.tok.xkind == pxElse:
       # bare `else` handler for the whole except section
       getTokP(p)
       let b = newNodeP(nkExceptBranch, p)
@@ -3624,12 +3625,18 @@ proc parseTry*(p: var TParser): Node =
       p.opt(pxSemiColon)
       skipCom(p)
     if not sawOn and result.len == 1:
-      # `except <stmts> end` without on/else: plain handler
+      # `except <stmts> end` without on/else: plain handler; the
+      # body is a statement SEQUENCE
       let b = newNodeP(nkExceptBranch, p)
       b.add(emptyNode(info))
       b.add(emptyNode(info))
-      let body2 = parseStmt(p)
-      b[1] = body2
+      let body2 = newNode(nkStmtList, info)
+      while p.tok.xkind notin {pxFinally, pxEnd, pxEof}:
+        let s = parseStmt(p)
+        if s.kind != nkEmpty: body2.add(s)
+        p.opt(pxSemiColon)
+        skipCom(p)
+      b.add(body2)
       result.add(b)
   if p.tok.xkind == pxFinally:
     getTokP(p)
@@ -4253,6 +4260,9 @@ proc withExprClass(p: var TParser, e: Node): string =
       e[0][1].strVal.toLowerAscii == "create":
     # `TSome.Create(...)` evaluates to a TSome instance
     return p.syms.classSpelling(e[0][0].strVal)
+  elif e.kind == nkCall and e.len == 2 and e[0].kind == nkIdent:
+    # a type-cast `THashedStringList(expr)`: the cast's class
+    return p.syms.classSpelling(e[0].strVal)
   elif e.kind == nkDotExpr and e.len == 2:
     let baseCls = p.withExprClass(e[0])
     if baseCls.len > 0 and e[1].kind == nkIdent:
