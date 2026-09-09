@@ -345,6 +345,22 @@ if [ -x "$ROOT/bin/pasler" ] && [ -f "$HERE/shadow.pas" ]; then
   fi
 fi
 
+# ---- private corpus sweep (closed-source compiler food; skipped
+# when test/private/corpus is absent) - reports parse health, only
+# a missing sweep counts as failure ----
+if [ -f "$HERE/private/run.sh" ]; then
+  echo "== private-corpus"
+  sweep="$("$HERE/private/run.sh" 2>&1)"
+  okcount="$(echo "$sweep" | grep -c '=> OK' || true)"
+  errcount="$(echo "$sweep" | grep -c '=> corpus/' || true)"
+  echo "   private corpus: $okcount ok, $errcount with parse errors"
+  if [ "$okcount" -gt 0 ]; then
+    echo "-- ok"
+  else
+    echo "   PRIVATE SWEEP BROKEN (no unit translates)"; fail=1
+  fi
+fi
+
 # M5 oracle: differential testing against real FPC (skips without fpc)
 if ! sh "$HERE/oracle.sh"; then
   echo "   ORACLE FAILED"; fail=1

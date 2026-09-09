@@ -578,6 +578,67 @@ proc absorbNimModule(p: var TParser, modpath: string) =
         cur = eol + 1
       break
 
+proc declDirective(p: var TParser): bool =
+  ## tolerate compiler directives between declarations (type/const/var
+  ## sections, routine local decls, uses clauses, class bodies).
+  ## Conditionals evaluate at parse time, branch by branch: a taken
+  ## branch's tokens flow through the enclosing loop unchanged, a dead
+  ## branch is skipped at the token level, and the trailing `{$else}` /
+  ## `{$endif}` tokens of an already-handled group are consumed here.
+  ## Other directives (EXTERNALSYM, pragmas...) are consumed and
+  ## ignored. true when the loop should continue.
+  if p.tok.xkind notin {pxCurlyDirLe, pxStarDirLe}: return false
+  let endMarker = succ(p.tok.xkind)
+  case p.tok.ident.toLowerAscii
+  of "ifdef", "ifndef", "if":
+    let negate = p.tok.ident.toLowerAscii == "ifndef"
+    getTokP(p)                  # skip the directive name
+    var name = ""
+    if p.tok.xkind == pxSymbol:
+      # `{$IF DEFINED(X)}` - the only supported {$IF} form here
+      if p.tok.ident.toLowerAscii == "defined":
+        getTokP(p)
+        p.eat(pxParLe)
+        name = parseCondName(p)
+        p.eat(pxParRi)
+      else:
+        name = parseCondName(p)
+    else:
+      parError(p, "identifier expected in conditional directive")
+    let defined = p.syms.defines.getOrDefault(name, false)
+    let taken = if negate: not defined else: defined
+    p.eat(endMarker)            # closing brace
+    if taken:
+      # the live branch's tokens flow through the enclosing loop; its
+      # trailing {$else}/{$endif} are handled by the cases below
+      skipCom(p)
+      return true
+    if skipCondBranch(p, endMarker):
+      # the dead branch ran to a {$else}: that branch is LIVE - consume
+      # the directive so its tokens flow through the loop
+      getTokP(p)
+      p.eat(endMarker)
+      skipCom(p)
+    # else: skipCondBranch consumed the {$endif}
+    return true
+  of "else":
+    # the dead alternative of a previously taken branch: consume the
+    # {$else} token, then skipCondBranch runs to the {$endif}
+    getTokP(p)
+    p.eat(endMarker)
+    discard skipCondBranch(p, endMarker)
+    skipCom(p)
+    return true
+  of "endif":
+    # the closing token of a branch whose taken side flowed here
+    getTokP(p)
+    p.eat(endMarker)
+    skipCom(p)
+    return true
+  else:
+    discard parseDirective(p)
+    return true
+
 proc parseUsesStmt*(p: var TParser): Node =
   result = newNodeP(nkImportStmt, p)
   getTokP(p)                  # skip `uses`
@@ -585,6 +646,14 @@ proc parseUsesStmt*(p: var TParser): Node =
   var any = false
   while true:
     if p.tok.xkind == pxEof: break
+    skipCom(p)
+    if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
+      # `{$IFDEF X} Unit, {$ENDIF}` inside the uses clause
+      if declDirective(p): continue
+    if p.tok.xkind == pxComma:
+      # comma-first continuation: `,\n  NextUnit` (Delphi style)
+      getTokP(p)
+      continue
     if p.tok.xkind != pxSymbol:
       parError(p, "identifier expected in uses clause")
     var unitName = p.tok.ident
@@ -654,8 +723,13 @@ proc parseUsesStmt*(p: var TParser): Node =
             p.syms.canonical(unitName))
         result.add(newIdentNode(canonical, p.tok.info))
         any = true
+    # the comma is optional (comma-first continuations exist); the
+    # loop head tolerates directives and further commas. `;` (and
+    # Eof) end the clause - anything else falls to the loop head,
+    # which either consumes a token or errors out.
     p.opt(pxComma)
-    if p.tok.xkind != pxSymbol: break
+    if p.tok.xkind in {pxSemiColon, pxEof}: break
+    continue
   if not any:
     result = newNode(nkCommentStmt, p.tok.info)
     result.strVal = "# no imports"
@@ -995,6 +1069,15 @@ proc primary(p: var TParser): Node =
   elif p.tok.xkind in {pxProcedure, pxFunction}:
     # Delphi anonymous method literal
     return parseAnonymousMethod(p)
+  elif p.tok.xkind == pxInherited:
+    # `Result := inherited Add(x)` - the value form; the statement
+    # form's discard wrapper must be unwrapped
+    result = parseInherited(p)
+    if result.kind == nkDiscardStmt and result.len > 0:
+      result = result[0]
+    if result.kind == nkEmpty:
+      parError(p, "`inherited` expression has no value in this context (v1)")
+    return
   result = p.withQualify(identOrLiteral(p))
   while true:
     case p.tok.xkind
@@ -1449,6 +1532,12 @@ proc parseParamList*(p: var TParser): Node =
       if p.tok.xkind == pxVar:
         isVar = true
         getTokP(p)
+      elif p.tok.xkind == pxOut:
+        # Delphi `out` params: v1 lowers them like `var` - the callee
+        # sees the caller's variable; initialization semantics
+        # (callee must not read before writing) are not modeled
+        isVar = true
+        getTokP(p)
       elif p.tok.xkind == pxConst:
         # treat `const` params as plain params; the mutability distinction
         # does not matter for the generated code
@@ -1585,7 +1674,8 @@ proc parseIdentColonEquals*(p: var TParser; withVis: bool): Node =
     skipCom(p)
   else:
     result.add(emptyNode(p.tok.info))
-  if p.tok.xkind == pxAsgn:
+  if p.tok.xkind == pxEquals:
+    # Delphi var/field default: `var X: T = init;`
     getTokP(p)
     skipCom(p)
     result.add(parseExpr(p))
@@ -1596,7 +1686,14 @@ proc parseVarSection*(p: var TParser): Node =
   result = newNodeP(nkVarSection, p)
   getTokP(p)                    # skip var/threadvar
   skipCom(p)
-  while p.tok.xkind == pxSymbol:
+  while true:
+    if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
+      # conditionals + directives between var declarations
+      if declDirective(p):
+        continue
+      break
+    if p.tok.xkind != pxSymbol:
+      break
     let defs = parseIdentColonEquals(p, false)
     skipCom(p)
     result.add(defs)
@@ -1656,7 +1753,14 @@ proc parseConstSection*(p: var TParser): Node =
   result = newNodeP(nkConstSection, p)
   getTokP(p)                    # skip const/resourcestring
   skipCom(p)
-  while p.tok.xkind == pxSymbol:
+  while true:
+    if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
+      # conditionals + directives between const definitions
+      if declDirective(p):
+        continue
+      break
+    if p.tok.xkind != pxSymbol:
+      break
     let info = p.tok.info
     let name = p.tok.ident
     getTokP(p)
@@ -1987,6 +2091,10 @@ proc parseRecordBody(p: var TParser, result: Node, definition: Node) =
   var body = newNode(nkRecList, p.tok.info)
   while p.tok.xkind != pxEnd and p.tok.xkind != pxEof:
     case p.tok.xkind
+    of pxCurlyDirLe, pxStarDirLe:
+      # conditionals + directives between class members
+      if not declDirective(p):
+        break
     of pxSymbol:
       let defs = parseIdentColonEquals(p, false)
       # register fields for self-qualification
@@ -2536,7 +2644,15 @@ proc parseTypeSection*(p: var TParser): Node =
   result = newNodeP(nkTypeSection, p)
   getTokP(p)                    # skip `type`
   skipCom(p)
-  while p.tok.xkind == pxSymbol:
+  while true:
+    # directives between type definitions ({$EXTERNALSYM ...},
+    # conditionals) must not close the section
+    if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
+      if declDirective(p):
+        continue
+      break
+    if p.tok.xkind != pxSymbol:
+      break
     let def = parseTypeDef(p)
     skipCom(p)
     result.add(def)
@@ -2646,6 +2762,12 @@ proc parseRoutineBody(p: var TParser, result: Node) =
   p.curLabels = @[]
   p.opt(pxSemiColon)
   while true:
+    if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
+      # conditionals between local declarations (Delphi guards a
+      # whole `var` block or single locals this way)
+      if declDirective(p):
+        continue
+      parError(p, "begin expected in routine body, got " & $p.tok)
     case p.tok.xkind
     of pxVar, pxThreadvar:
       stmts.add(parseVarSection(p))
@@ -4032,6 +4154,13 @@ proc parseStmt*(p: var TParser): Node =
     getTokP(p)
     skipCom(p)
     while p.tok.xkind != pxEnd and p.tok.xkind != pxEof:
+      # a conditional may span the begin/end boundary (Delphi guards
+      # parts of one block per target); dead branches skip at the
+      # token level, taken ones flow into the block
+      if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
+        if declDirective(p):
+          continue
+        break
       let s = parseStmt(p)
       if s.kind != nkEmpty: result.add(s)
       if p.tok.xkind == pxSemiColon:
@@ -4048,6 +4177,12 @@ proc parseStmt*(p: var TParser): Node =
       branch.add(parseExpr(p))
       p.eat(pxThen)
       skipCom(p)
+      while p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
+        # `if C then {$IFDEF} ... {$ENDIF} begin` - a conditional
+        # may wrap the statement boundary
+        if declDirective(p):
+          continue
+        break
       branch.add(parseStmt(p))
       result.add(branch)
       skipCom(p)
@@ -4938,6 +5073,12 @@ proc parseUnit*(p: var TParser): Node =
       getTokP(p)
       p.opt(pxDot)
       break
+    if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
+      # directives between unit-level declarations: conditionals
+      # branch at parse time, orphan {$endif}/{$else} of a branch
+      # whose tokens already flowed are consumed, the rest skipped
+      if declDirective(p):
+        continue
     let s = parseStmt(p)
     # a conditional directive's branch statements arrive as an
     # nkStmtList - splice them so unit-level declarations register

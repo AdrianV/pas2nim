@@ -763,3 +763,54 @@ Semantics now:
 - Known v1 divergence: a *further* descendant overriding the new
   slot virtually (`TDog2 overriding TChild.Foo`) lowers statically -
   deep virtual chains through reintroduced slots are not modeled.
+
+## M7: private compiler food + declaration-position directives
+
+### Private corpus structure
+
+Closed-source Delphi sources (stock RTL/VCL, FastScript, FastCube,
+HCL sample units) feed the parser from `test/private/`, which is
+gitignored and never published. `test/private/corpus/` holds the
+units, `test/private/run.sh` sweeps them with FPC-on-Linux target
+defines (`-d:LINUX -d:UNIX -d:POSIX`), and the suite's
+`private-corpus` section reports parse health (skip-safe when the
+corpus is absent). Derived samples for the published test/ tree must
+be minimal reproductions, never copies.
+
+### M7 parser additions
+
+- **Uses-clause conditionals and comma-first continuations**:
+  `{$IFDEF DXE2UP} System.ObjAuto, {$ENDIF}` inside a uses list and
+  the `,
+  NextUnit` continuation style parse. The uses loop is now
+  fully directive-tolerant and ends only at `;`/Eof.
+- **Declaration-position directives**: a shared `declDirective`
+  handles conditionals between type/const/var definitions, routine
+  local decls, uses clauses, class bodies, begin-blocks (including
+  conditionals that span a begin/end boundary), after `then`, and
+  between unit-level declarations. Dead branches skip at the token
+  level; taken branches' tokens flow through the enclosing loop; the
+  trailing `{$else}`/`{$endif}` of a handled group are consumed in
+  statement position. `{$IF DEFINED(X)}` is the only supported
+  `{$IF}` form here.
+- **`{$EXTERNALSYM X}` and friends** between definitions are consumed
+  and ignored (they no longer close a type section).
+- **`array of X` type aliases** work (they already flowed through
+  `parseTypeDesc`; the section-tolerance fix unlocked them).
+- **`out` parameters** lower like `var` (initialization semantics not
+  modeled - documented).
+- **Var/field defaults** `var X: T = init;` (module, local, class
+  fields) parse and render; the former check tested `:=`.
+- **`inherited` in expression position** (`Result :=
+  inherited Add(x)`) unwraps the statement form's discard wrapper;
+  the statement form keeps its old no-op semantics.
+- **Underscore identifiers**: `_FILETIME` and friends lex now.
+
+### Corpus status and remaining gaps
+
+15 of 41 surveyed units translate; the parse-error classes left:
+`with T.Create do` on non-class-variable bases (v1 with-expression
+limit), a class with a real parent implementing an interface,
+`inherited` against shim-parent classes, conditionals spanning an
+if-header (`{$IFDEF} cond1 {$ELSE} cond2 {$ENDIF} begin`), and
+`Types.pas`'s first derail (pointer chains inside wider contexts).
