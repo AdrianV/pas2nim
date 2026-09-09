@@ -70,6 +70,8 @@ type
     classVarHoist*: seq[Node]   ## class var decls hoisted to module level
     recordTypes*: Table[string, bool]  ## lowercase record type names
     arrayAliases*: Table[string, string] ## array alias -> element spelling
+    arrayVarElems*: Table[string, string] ## array var -> element spelling
+    pointerAliases*: Table[string, string] ## P = ^T alias -> element
     curTypeParams*: seq[string]  ## params of the type being declared
     genericArgDepth*: int  ## > 0 while parsing `<...>` generic args
     withTemps*: seq[string]     ## hidden per-with temporaries by depth
@@ -1743,6 +1745,17 @@ proc parseVarSection*(p: var TParser): Node =
       for i in 0 ..< defs.len - 2:
         if defs[i].kind == nkIdent:
           p.arrayLows[defs[i].strVal.toLowerAscii] = int(low)
+      # class/record-element array vars: the element spelling for
+      # `with S[i] do` lowering
+      var elty2 = ""
+      if tyNode.len > 0 and tyNode[tyNode.len - 1].kind == nkIdent:
+        elty2 = tyNode[tyNode.len - 1].strVal
+      if elty2.len > 0:
+        let elKey2 = elty2.toLowerAscii
+        if p.syms.isClass(elKey2) or p.recordTypes.hasKey(elKey2):
+          for i in 0 ..< defs.len - 2:
+            if defs[i].kind == nkIdent:
+              p.arrayVarElems[defs[i].strVal.toLowerAscii] = elty2
     elif tyNode.kind == nkIdent:
       let tyKey = tyNode.strVal.toLowerAscii
       if p.arrayTypeLows.hasKey(tyKey):
@@ -2771,6 +2784,13 @@ proc parseTypeSection*(p: var TParser): Node =
       break
     let def = parseTypeDef(p)
     skipCom(p)
+    # `PRec = ^TRec` alias: track the element for with-deref
+    # resolution (`with PRec(expr)^ do`)
+    if def.len == 3 and def[0].kind == nkIdent and
+        def[2].kind == nkPtrTy and def[2].len > 0 and
+        def[2][def[2].len - 1].kind == nkIdent:
+      p.pointerAliases[def[0].strVal.toLowerAscii] =
+        def[2][def[2].len - 1].strVal
     # `TArr = array of TRec` alias: track the element for with-index
     # resolution (`with propOfTArr do`)
     if def.len == 3 and def[0].kind == nkIdent and
@@ -3246,6 +3266,16 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
             for j in 0 ..< d.len - 2:
               if d[j].kind == nkIdent:
                 p.paramClassTypes[d[j].strVal.toLowerAscii] = pcls
+        # open-array params (`const MaskStates: array of TMaskState`):
+        # the element spelling for `with Param[i] do` lowering
+        if pty.kind in {nkOpenArrayTy, nkSeqTy} and pty.len > 0 and
+            pty[pty.len - 1].kind == nkIdent:
+          let el = pty[pty.len - 1].strVal
+          if p.syms.isClass(el.toLowerAscii) or
+              p.recordTypes.hasKey(el.toLowerAscii):
+            for j in 0 ..< d.len - 2:
+              if d[j].kind == nkIdent:
+                p.arrayVarElems[d[j].strVal.toLowerAscii] = el
           if p.methodPtrTypes.hasKey(pty.strVal.toLowerAscii):
             for j in 0 ..< d.len - 2:
               if d[j].kind == nkIdent:
@@ -4231,6 +4261,17 @@ proc withExprClass(p: var TParser, e: Node): string =
   elif e.kind in {nkIndexExpr, nkBracket} and e.len == 2:
     # `Buckets[i]` / `Slice.Fields[i]`: the element class of an
     # array-typed base (v1: only class/record-element arrays resolve)
+    let r = p.withExprClass(e[0])
+    if r.len > 0: return r
+    if e[0].kind == nkIdent:
+      return p.arrayVarElems.getOrDefault(e[0].strVal.toLowerAscii, "")
+  elif e.kind == nkDeref and e.len == 1:
+    # `PtrExpr^`: the element class/record of a pointer-typed base
+    if e[0].kind == nkCall and e[0].len == 2 and
+        e[0][0].kind == nkIdent:
+      # a pointer-cast `PWideStrData(Data)^`
+      return p.pointerAliases.getOrDefault(
+          e[0][0].strVal.toLowerAscii, "")
     return p.withExprClass(e[0])
   return ""
 
