@@ -1561,9 +1561,14 @@ proc parseParamList*(p: var TParser): Node =
       # names
       var names: seq[string] = @[]
       while true:
-        if p.tok.xkind != pxSymbol:
+        if p.tok.xkind != pxSymbol and p.tok.xkind != pxOperator:
           parError(p, "identifier expected in params, got " & $p.tok)
-        names.add(p.tok.ident)
+        # keyword-escaped param name: `const Operator: TVarOp` - the
+        # nimony spelling escapes the keyword
+        var pname = p.tok.ident
+        if p.tok.xkind == pxOperator:
+          pname = "pas" & pname[0].toUpperAscii & pname[1 .. ^1]
+        names.add(pname)
         getTokP(p)
         skipCom(p)
         if p.tok.xkind == pxComma:
@@ -1638,7 +1643,16 @@ proc parseRoutineType*(p: var TParser): Node =
   result.add(params)
   skipCom(p)
   var isClosure = false
-  # `of object` closure marker
+  # return type
+  if p.tok.xkind == pxColon:
+    getTokP(p)
+    skipCom(p)
+    let ret = parseTypeDesc(p, emptyNode(p.tok.info))
+    # the return type lives in the params' slot 0 (the procTy's own
+    # son 0 is the params); overwriting it broke 2-son invariants
+    result[0][0] = ret
+  # `of object` closure marker - Delphi allows it after the return
+  # type as well: `function: WideString of object` (method pointer)
   if p.tok.xkind == pxOf:
     getTokP(p)
     skipCom(p)
@@ -1648,14 +1662,6 @@ proc parseRoutineType*(p: var TParser): Node =
       skipCom(p)
     else:
       parError(p, "object expected after `of` in procedure type")
-  # return type
-  if p.tok.xkind == pxColon:
-    getTokP(p)
-    skipCom(p)
-    let ret = parseTypeDesc(p, emptyNode(p.tok.info))
-    # the return type lives in the params' slot 0 (the procTy's own
-    # son 0 is the params); overwriting it broke 2-son invariants
-    result[0][0] = ret
   if isClosure:
     let pragmas = newNode(nkPragma, p.tok.info)
     pragmas.add(newIdentNode("closure", p.tok.info))
@@ -2052,16 +2058,37 @@ proc parseTypeDesc*(p: var TParser, definition: Node): Node =
     getTokP(p)
     skipCom(p)
     if p.tok.xkind == pxBracketLe:
-      # static array: array[lo..hi] of T
+      # static array: array[lo..hi] of T; multi-dim dims lower to
+      # nested arrays (v1): array[a..b, c..d] of T is
+      # array[0..n-1] of array[0..m-1] of T
       getTokP(p)
       let idx = rangeExpr(p)
+      var dims: seq[Node] = @[idx]
+      while p.tok.xkind == pxComma:
+        getTokP(p)
+        skipCom(p)
+        dims.add(rangeExpr(p))
       if definition.kind == nkIdent and idx.kind == nkRange and
           idx.len == 2 and idx[0].kind in {nkIntLit, nkInt64Lit}:
         # alias types carry their low bound for var declarations
         p.arrayTypeLows[definition.strVal.toLowerAscii] = int(idx[0].intVal)
       p.eat(pxBracketRi)
       p.syms = p.syms  # no-op; keep table
-      result.add(idx)
+      if dims.len == 1:
+        result.add(idx)
+      else:
+        # keep dims[0] on the outer node; the remaining dims nest
+        # (the innermost link receives the element type later)
+        var prev: Node = result
+        for i in countdown(dims.len - 1, 1):
+          var outer = newNode(nkArrayTy, p.tok.info)
+          outer.add(dims[i])
+          outer.add(emptyNode(p.tok.info))
+          if i == dims.len - 1:
+            result.add(outer)
+          else:
+            prev[1] = outer
+          prev = outer
     elif p.inParamList:
       if p.peekTok.xkind == pxConst:
         # `array of const` -> TArrayOfConst (shim)
@@ -2076,7 +2103,12 @@ proc parseTypeDesc*(p: var TParser, definition: Node): Node =
       result.kind = nkSeqTy
     p.eat(pxOf)
     skipCom(p)
-    result.add(parseTypeDesc(p, emptyNode(p.tok.info)))
+    let elemTy = parseTypeDesc(p, emptyNode(p.tok.info))
+    if result.len == 2 and result[1].kind == nkArrayTy and
+        result[1].len == 2 and result[1][1].kind == nkEmpty:
+      result[1][1] = elemTy
+    else:
+      result.add(elemTy)
   of pxSet:
     result = newNodeP(nkSetTy, p)
     getTokP(p)
@@ -2822,9 +2854,10 @@ proc parseRoutineSpecifiers*(p: var TParser, noBody: var bool,
       # suppresses the hides-virtual warning (Delphi parity)
       sawReintroduce = true
       getTokP(p)
-    of "platform", "experimental":
+    of "platform", "experimental", "assembler":
       # genuine no-ops: documentation annotations with no
-      # nimony-side semantic
+      # nimony-side semantic (assembler marks free-form bodies that
+      # v1 has no backend for)
       getTokP(p)
     of "external":
       # external declarations: skip the string/qualifier
@@ -3412,11 +3445,22 @@ proc parseCase*(p: var TParser): Node =
   result.add(parseExpr(p))
   p.eat(pxOf)
   skipCom(p)
-  while p.tok.xkind != pxEnd and p.tok.xkind != pxEof:
+  while p.tok.xkind != pxEnd and p.tok.xkind != pxParRi and
+      p.tok.xkind != pxEof:
     var b: Node
     if p.tok.xkind == pxElse:
       b = newNodeP(nkElse, p)
       getTokP(p)
+      skipCom(p)
+      # a case-else takes a statement SEQUENCE in Delphi
+      let body2 = newNode(nkStmtList, p.tok.info)
+      while p.tok.xkind != pxEnd and p.tok.xkind != pxEof:
+        body2.add(parseStmt(p))
+        p.opt(pxSemiColon)
+        skipCom(p)
+      b.add(body2)
+      result.add(b)
+      break
     else:
       b = newNodeP(nkOfBranch, p)
       while p.tok.xkind != pxEof and p.tok.xkind != pxColon:
@@ -3426,6 +3470,8 @@ proc parseCase*(p: var TParser): Node =
       p.eat(pxColon)
     skipCom(p)
     b.add(parseStmt(p))
+    p.opt(pxSemiColon)
+    skipCom(p)
     result.add(b)
     if b.kind == nkElse: break
   p.eat(pxEnd)
@@ -3633,7 +3679,11 @@ proc parseRepeat*(p: var TParser): Node =
   result.add(newIdentNode("true", p.tok.info))
   let body = newNodeP(nkStmtList, p)
   while p.tok.xkind != pxEof and p.tok.xkind != pxUntil:
-    body.add(parseStmt(p))
+    let s = parseStmt(p)
+    if s.kind != nkEmpty: body.add(s)
+    if p.tok.xkind == pxSemiColon:
+      getTokP(p)
+      skipCom(p)
   p.eat(pxUntil)
   skipCom(p)
   let a = newNodeP(nkIfStmt, p)
