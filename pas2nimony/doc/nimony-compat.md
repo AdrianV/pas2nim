@@ -814,3 +814,38 @@ limit), a class with a real parent implementing an interface,
 `inherited` against shim-parent classes, conditionals spanning an
 if-header (`{$IFDEF} cond1 {$ELSE} cond2 {$ENDIF} begin`), and
 `Types.pas`'s first derail (pointer chains inside wider contexts).
+
+## M7b: corpus-driven parse fixes
+
+Sweeping the private corpus exposed further parse gaps, fixed the
+same round (corpus health: 17 of 41 units translate):
+
+- **Comments between definitions**: type/const/var section loops now
+  skip comment tokens; a `{...}` banner comment between type aliases
+  no longer closes the section (the follow-up aliases spilled into
+  expression space).
+- **Interface members**: the COM GUID bracket member `['{...}']` and
+  property declarations inside interfaces are consumed (accessor
+  plumbing; method calls through the interface still lower).
+- **Shim-parent inherited**: a class whose declared parent is not in
+  our registry (e.g. `class(TList)` against the TStringList shim)
+  lowers `inherited` to a no-op with a one-time warning (statement
+  form) or `0` (value form). Named calls, array-property getters and
+  `inherited Data[i] := v` assignments are consumed at the token
+  level.
+- **Nested constructor/destructor** declarations are allowed between
+  routine local declarations (like nested procedures).
+- **`asm`-bodied routines**: `function F: T; asm ... end;` - the asm
+  block is the whole body; no begin-block follows (the previous
+  behavior consumed the *next* routine's begin as this routine's
+  body, swallowing every following declaration).
+- **With on array elements**: `with Buckets[i] do` resolves the
+  element class/record of array-typed fields, properties and
+  `array of X` aliases (new `arrayAliases` map); record withs qualify
+  against the original expression text (`Buckets[ABucket].Items`),
+  and record-scope member chains (`with A.B[i] do` through an outer
+  with) resolve through classFieldTypes.
+- Remaining v1 gaps (documented, not fixed): with on arbitrary call
+  results (`with Unit.Object.RegisterClass(...) do`), with on fields
+  of classes from un-absorbed units, interface impl with a real
+  parent, if-header-spanning conditionals.

@@ -69,6 +69,7 @@ type
     intfSigs*: Table[string, seq[Node]]  ## interface key -> base-method defs
     classVarHoist*: seq[Node]   ## class var decls hoisted to module level
     recordTypes*: Table[string, bool]  ## lowercase record type names
+    arrayAliases*: Table[string, string] ## array alias -> element spelling
     curTypeParams*: seq[string]  ## params of the type being declared
     genericArgDepth*: int  ## > 0 while parsing `<...>` generic args
     withTemps*: seq[string]     ## hidden per-with temporaries by depth
@@ -1076,7 +1077,11 @@ proc primary(p: var TParser): Node =
     if result.kind == nkDiscardStmt and result.len > 0:
       result = result[0]
     if result.kind == nkEmpty:
-      parError(p, "`inherited` expression has no value in this context (v1)")
+      # v1: an inherited value against a no-op root (parentless) or an
+      # unknown shim parent has no real target; lower to 0 - the
+      # parseInherited side already warned for the shim-gap case
+      result = newNode(nkIntLit, result.info)
+      result.intVal = BiggestInt(0)
     return
   result = p.withQualify(identOrLiteral(p))
   while true:
@@ -1687,6 +1692,7 @@ proc parseVarSection*(p: var TParser): Node =
   getTokP(p)                    # skip var/threadvar
   skipCom(p)
   while true:
+    skipCom(p)                  # comments between definitions
     if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
       # conditionals + directives between var declarations
       if declDirective(p):
@@ -1754,6 +1760,7 @@ proc parseConstSection*(p: var TParser): Node =
   getTokP(p)                    # skip const/resourcestring
   skipCom(p)
   while true:
+    skipCom(p)                  # comments between definitions
     if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
       # conditionals + directives between const definitions
       if declDirective(p):
@@ -1815,9 +1822,31 @@ proc parseInterfaceType(p: var TParser, definition: Node): Node =
   var ci = p.syms.classes.getOrDefault(defName.toLowerAscii)
   ci.isInterface = true
   p.syms.classes[defName.toLowerAscii] = ci
-  # body: bodiless method declarations (properties rejected below)
+  # body: bodiless method declarations (COM plumbing skipped below)
   while p.tok.xkind != pxEnd and p.tok.xkind != pxEof:
     if p.tok.xkind == pxComment:
+      skipCom(p)
+      continue
+    if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
+      # directives between interface members ({$EXTERNALSYM ...},
+      # conditionals) + the GUID bracket member
+      if declDirective(p):
+        continue
+      break
+    if p.tok.xkind == pxBracketLe:
+      # COM interface GUID member: `['{...}']` - consumed
+      getTokP(p)
+      while p.tok.xkind != pxBracketRi and p.tok.xkind != pxEof:
+        getTokP(p)
+      p.eat(pxBracketRi)
+      p.opt(pxSemiColon)
+      skipCom(p)
+      continue
+    if p.tok.xkind == pxProperty:
+      # COM interface properties are accessors plumbing; v1 skips
+      # them (method calls through the interface still lower)
+      discard parseProperty(p)
+      p.opt(pxSemiColon)
       skipCom(p)
       continue
     if p.tok.xkind == pxSymbol:
@@ -1923,6 +1952,20 @@ proc parseTypeDesc*(p: var TParser, definition: Node): Node =
             if defs[i].kind == nkIdent:
               p.fieldTypes[definition.strVal.toLowerAscii & "." &
                            defs[i].strVal.toLowerAscii] = mty
+        # array-of-class/record fields: element type for with-index
+        if definition.kind == nkIdent:
+          var fel = p.syms.classSpelling(defs[1].strVal)
+          if fel.len == 0 and defs[1].kind == nkIdent:
+            fel = p.arrayAliases.getOrDefault(
+                defs[1].strVal.toLowerAscii, "")
+          if fel.len == 0 and defs[1].kind in {nkArrayTy, nkSeqTy}:
+            if defs[1][defs[1].len - 1].kind == nkIdent:
+              fel = defs[1][defs[1].len - 1].strVal
+          if fel.len > 0:
+            for i in 0 ..< defs.len - 2:
+              if defs[i].kind == nkIdent:
+                p.classFieldTypes[definition.strVal.toLowerAscii & "." &
+                                  defs[i].strVal.toLowerAscii] = fel
         body.add(defs)
         p.opt(pxSemiColon)
         skipCom(p)
@@ -2108,7 +2151,20 @@ proc parseRecordBody(p: var TParser, result: Node, definition: Node) =
             if mty.len > 0:
               p.fieldTypes[p.selfClass.toLowerAscii & "." &
                            defs[i].strVal.toLowerAscii] = mty
-            let fcls = p.syms.classSpelling(defs[1].strVal)
+            var fcls = p.syms.classSpelling(defs[1].strVal)
+            if fcls.len == 0 and defs[1].kind == nkIdent:
+              # array-alias field: `FBuckets: TBucketArray` -> element
+              fcls = p.arrayAliases.getOrDefault(defs[1].strVal.toLowerAscii, "")
+            if fcls.len == 0 and defs[1].kind in {nkArrayTy, nkSeqTy}:
+              # array-of-class/record field: `with Buckets[i] do`
+              # resolves to the ELEMENT type (the index case unwraps
+              # the array)
+              let arr = defs[1]
+              if arr.len > 0 and arr[arr.len - 1].kind == nkIdent:
+                fcls = p.syms.classSpelling(arr[arr.len - 1].strVal)
+                if fcls.len == 0 and
+                    p.recordTypes.hasKey(arr[arr.len - 1].strVal.toLowerAscii):
+                  fcls = arr[arr.len - 1].strVal
             if fcls.len > 0:
               p.classFieldTypes[p.selfClass.toLowerAscii & "." &
                                 defs[i].strVal.toLowerAscii] = fcls
@@ -2348,6 +2404,20 @@ proc parseProperty*(p: var TParser): Node =
   p.eat(pxColon)
   skipCom(p)
   decl.typ = parseTypeDesc(p, emptyNode(p.tok.info))
+  if decl.params == nil and p.selfClass.len > 0:
+    # array-typed property (`property Buckets: TBucketArray ...`):
+    # register the element type so `with Buckets[i] do` resolves
+    var elty = ""
+    if decl.typ.kind in {nkArrayTy, nkSeqTy} and decl.typ.len > 0 and
+        decl.typ[decl.typ.len - 1].kind == nkIdent:
+      elty = decl.typ[decl.typ.len - 1].strVal
+    elif decl.typ.kind == nkIdent:
+      elty = p.arrayAliases.getOrDefault(decl.typ.strVal.toLowerAscii, "")
+    if elty.len > 0:
+      let elKey = elty.toLowerAscii
+      if p.syms.isClass(elKey) or p.recordTypes.hasKey(elKey):
+        p.classFieldTypes[p.selfClass.toLowerAscii & "." &
+                          propName.toLowerAscii] = elty
   if decl.typ.kind == nkIdent and
       p.methodPtrTypes.hasKey(decl.typ.strVal.toLowerAscii):
     p.methodPtrVars[propName.toLowerAscii] =
@@ -2645,6 +2715,7 @@ proc parseTypeSection*(p: var TParser): Node =
   getTokP(p)                    # skip `type`
   skipCom(p)
   while true:
+    skipCom(p)                  # comments between definitions
     # directives between type definitions ({$EXTERNALSYM ...},
     # conditionals) must not close the section
     if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
@@ -2655,6 +2726,15 @@ proc parseTypeSection*(p: var TParser): Node =
       break
     let def = parseTypeDef(p)
     skipCom(p)
+    # `TArr = array of TRec` alias: track the element for with-index
+    # resolution (`with propOfTArr do`)
+    if def.len == 3 and def[0].kind == nkIdent and
+        def[2].kind in {nkArrayTy, nkSeqTy} and def[2].len > 0 and
+        def[2][def[2].len - 1].kind == nkIdent:
+      let el = def[2][def[2].len - 1].strVal.toLowerAscii
+      if p.syms.isClass(el) or p.recordTypes.hasKey(el):
+        p.arrayAliases[def[0].strVal.toLowerAscii] =
+          def[2][def[2].len - 1].strVal
     result.add(def)
 
 # ---------------------------------------------------------------------------
@@ -2788,11 +2868,15 @@ proc parseRoutineBody(p: var TParser, result: Node) =
     of pxBegin:
       break
     of pxAsm:
-      # `function F(...): T; asm ... end;` - no begin; the body is
-      # skipped and left empty (nimony gets the discard-safe empty list)
+      # `function F(...): T; asm ... end;` - no begin-body; the asm
+      # block IS the body, skipped and left empty (nimony gets the
+      # discard-safe empty list)
       skipAsmBlock(p)
-      break
-    of pxProcedure, pxFunction:
+      p.lowerGotos(stmts)
+      p.curLabels = savedLabels
+      result.add(stmts)
+      return
+    of pxProcedure, pxFunction, pxConstructor, pxDestructor:
       let savedLabels = p.curLabels
       p.curLabels = @[]
       let nested = parseRoutine(p, false)
@@ -3162,6 +3246,45 @@ proc parseInherited*(p: var TParser): Node =
   p.eat(pxInherited)
   let parent = p.syms.ancestorSpelling(p.classOfProc)
   if parent.len == 0:
+    # the class HAS a declared parent but it is not in our registry
+    # (a shim/external class like TList): v1 lowers the inherited
+    # call to a no-op with a warning - the registry lacks the target
+    let ci = p.syms.lookupClass(p.classOfProc)
+    if ci.spelling.len > 0 and ci.parent.len > 0:
+      parWarning(p, "shiminherited:" & p.classOfProc & "." & ci.parent &
+          ":" & renderInfo(info),
+          "inherited against unknown parent class '" & ci.parent &
+          "' is lowered to nothing (v1 shim gap)")
+      if p.tok.xkind == pxSemiColon:
+        getTokP(p)
+        p.opt(pxSemiColon)
+        skipCom(p)
+        return newNode(nkEmpty, info)
+      if p.tok.xkind == pxSymbol:
+        getTokP(p)
+        if p.tok.xkind == pxParLe:
+          var depth = 1
+          getTokP(p)
+          while depth > 0 and p.tok.xkind != pxEof:
+            if p.tok.xkind == pxParLe: depth.inc
+            elif p.tok.xkind == pxParRi: depth.dec
+            getTokP(p)
+        elif p.tok.xkind == pxBracketLe:
+          # `inherited Data[i]` / `inherited Data[i] := v`: consume the
+          # index; an assignment form also consumes `:=` + the RHS
+          var depth = 1
+          getTokP(p)
+          while depth > 0 and p.tok.xkind != pxEof:
+            if p.tok.xkind == pxBracketLe: depth.inc
+            elif p.tok.xkind == pxBracketRi: depth.dec
+            getTokP(p)
+          if p.tok.xkind == pxAsgn:
+            getTokP(p)
+            skipCom(p)
+            discard parseExpr(p)
+        p.opt(pxSemiColon)
+        skipCom(p)
+      return newNode(nkEmpty, info)
     # v1: a parentless class inherits TObject; its Create/Destroy
     # are observable no-ops in our model, so bare `inherited`,
     # `inherited Create` and `inherited Destroy` lower to nothing.
@@ -4000,13 +4123,26 @@ proc withExprClass(p: var TParser, e: Node): string =
       var guard = 0
       while c.len > 0 and guard < 100:
         let ci = p.syms.classes.getOrDefault(c)
-        if ci.spelling.len == 0: break
+        if ci.spelling.len == 0:
+          # a record scope: its fields register in classFieldTypes
+          let ft = p.classFieldTypes.getOrDefault(c & "." & k)
+          if ft.len > 0: return ft
+          break
         if ci.fieldSet.hasKey(k):
           let ft = p.classFieldTypes.getOrDefault(c & "." & k)
           if ft.len > 0: return ft
         c = ci.parent
         inc guard
       dec i
+    # a bare field of the enclosing class
+    if p.selfClass.len > 0:
+      let ft = p.classFieldTypes.getOrDefault(
+          p.selfClass.toLowerAscii & "." & k)
+      if ft.len > 0: return ft
+    if p.selfClass.len > 0:
+      let ft = p.classFieldTypes.getOrDefault(
+          p.selfClass.toLowerAscii & "." & k)
+      if ft.len > 0: return ft
   elif e.kind == nkCall and e.len >= 1 and e[0].kind == nkDotExpr and
       e[0][0].kind == nkIdent and e[0][1].kind == nkIdent and
       e[0][1].strVal.toLowerAscii == "create":
@@ -4017,6 +4153,10 @@ proc withExprClass(p: var TParser, e: Node): string =
     if baseCls.len > 0 and e[1].kind == nkIdent:
       return p.classFieldTypes.getOrDefault(
           baseCls.toLowerAscii & "." & e[1].strVal.toLowerAscii)
+  elif e.kind in {nkIndexExpr, nkBracket} and e.len == 2:
+    # `Buckets[i]` / `Slice.Fields[i]`: the element class of an
+    # array-typed base (v1: only class/record-element arrays resolve)
+    return p.withExprClass(e[0])
   return ""
 
 proc unitModuleSpelling(p: TParser, name: string): string =
@@ -4032,6 +4172,23 @@ proc unitModuleSpelling(p: TParser, name: string): string =
   of "sysutils", "si_strings", "system": result = "systempas"
   else:
     result = p.unitFiles.getOrDefault(name.toLowerAscii, name)
+
+proc withBaseText(e: Node): string =
+  ## source-text rendering of a simple with-base (idents, dots,
+  ## indexes, literals) for record-with qualification
+  result = ""
+  case e.kind
+  of nkIdent: result = e.strVal
+  of nkDotExpr:
+    if e.len == 2 and e[0].kind in {nkIdent, nkDotExpr, nkBracket} and
+        e[1].kind == nkIdent:
+      result = withBaseText(e[0]) & "." & e[1].strVal
+  of nkIndexExpr, nkBracket:
+    if e.len >= 2:
+      result = withBaseText(e[0]) & "[" & withBaseText(e[e.len - 1]) & "]"
+  of nkIntLit: result = $e.intVal
+  else: result = ""
+
 
 proc withQualify(p: var TParser, n: Node): Node =
   ## qualify a bare identifier against the active with-scopes
@@ -4081,15 +4238,23 @@ proc parseWith(p: var TParser): Node =
     inc p.withCounter
     let temp = "pasW" & $p.withCounter
     let info = p.tok.info
-    # record variables are qualified DIRECTLY against the original
+    # record withs are qualified DIRECTLY against the original
     # expression: records copy by value, so a hidden temp would
     # receive writes Delphi applies to the original
-    let vt = if e.kind == nkIdent:
-               p.varTypes.getOrDefault(e.strVal.toLowerAscii)
-             else:
-               ""
-    let isRecord = vt.startsWith("record:")
+    var isRecord = p.recordTypes.hasKey(cls.toLowerAscii)
+    # push the scope (fixed-size stack: nimony seqs have no pop);
+    # record withs use the original expression as the qualifier
+    var qualifier = temp
+    if isRecord:
+      # record withs qualify against the original expression text
+      qualifier = withBaseText(e)
+      if qualifier.len == 0:
+        # complex record expression: fall back to the temp (v1:
+        # writes through the with go to the temp, not the original)
+        qualifier = temp
+        isRecord = false
     if not isRecord:
+      # class (or fallback) withs bind a hidden temp var
       let vd = newNode(nkVarSection, info)
       let d = newNode(nkIdentDefs, info)
       d.add(newIdentNode(temp, info))
@@ -4097,9 +4262,6 @@ proc parseWith(p: var TParser): Node =
       d.add(e)
       vd.add(d)
       result.add(vd)
-    # push the scope (fixed-size stack: nimony seqs have no pop);
-    # record withs use the original name as the qualifier
-    let qualifier = if isRecord and e.kind == nkIdent: e.strVal else: temp
     if p.withDepth < p.withTemps.len:
       p.withTemps[p.withDepth] = qualifier
       p.withClasses[p.withDepth] = cls
