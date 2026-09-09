@@ -721,3 +721,15 @@ Routine directives are no longer silently dropped:
   platform/experimental) stays consumed-and-ignored for now.
 - Suite section `pasler-cc`: one warning + correct run by default,
   an error exit under `--strict`.
+
+### Directive-by-directive status (M6-6 follow-up)
+
+| Delphi directive | handling |
+| --- | --- |
+| `inline` | forwarded as `{.inline.}` |
+| `cdecl`, `stdcall` | forwarded as `{.cdecl.}` / `{.stdcall.}` |
+| `deprecated [ 'msg' ]` | forwarded as `{.deprecated.}`; the message is documentation only and is dropped (nimony's NIF pragma-argument form is not reproduced by the hand emitter) |
+| `dynamic` | fulfilled: message-based dispatch lowers to the same virtual model (`isVirtual`) |
+| `abstract` | no body follows (like `forward`); dispatch goes to overriding descendants |
+| `reintroduce`, `platform`, `experimental` | genuine no-ops (Delphi hint suppressors / documentation annotations) - consumed and ignored, no diagnostic |
+| `register`, `pascal`, `safecall` | unfulfillable calling conventions: warning by default, error under `--strict` |

@@ -2586,8 +2586,26 @@ proc parseRoutineSpecifiers*(p: var TParser, noBody: var bool,
     of "forward":
       noBody = true
       getTokP(p)
-    of "reintroduce", "abstract", "dynamic", "deprecated", "platform",
-       "experimental":
+    of "deprecated":
+      # forward as {.deprecated.}; the optional message is
+      # documentation only and is dropped (documented divergence)
+      result.add(newIdentNode("deprecated", p.tok.info))
+      getTokP(p)
+      if p.tok.xkind == pxStrLit:
+        getTokP(p)
+    of "dynamic":
+      # Delphi's message-based dispatch lowers to the same virtual
+      # model: a dynamic method IS virtual in v1
+      isVirtual = true
+      getTokP(p)
+    of "abstract":
+      # no body follows (like forward); the dispatch goes to
+      # overriding descendants
+      noBody = true
+      getTokP(p)
+    of "reintroduce", "platform", "experimental":
+      # genuine no-ops: Delphi hint suppressors / documentation
+      # annotations with no nimony-side semantic
       getTokP(p)
     of "external":
       # external declarations: skip the string/qualifier
