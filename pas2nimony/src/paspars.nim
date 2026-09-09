@@ -114,6 +114,19 @@ proc parError*(p: TParser, msg: string) =
   write(stderr, renderInfo(p.tok.info) & " Error: " & msg & "\n")
   quit(1)
 
+var gWarned: Table[string, bool] = initTable[string, bool]()
+
+proc parWarning(p: var TParser, key, msg: string) =
+  ## non-fatal diagnostic, deduplicated per process (the pipeline
+  ## re-parses sources, so parser-local state would repeat the same
+  ## site); under --strict it escalates to an error
+  if pfStrictDirectives in p.flags:
+    write(stderr, renderInfo(p.tok.info) & " Error: " & msg & "\n")
+    quit(1)
+  if not gWarned.getOrDefault(key, false):
+    gWarned[key] = true
+    write(stderr, renderInfo(p.tok.info) & " Warning: " & msg & "\n")
+
 proc skipCom(p: var TParser) =
   while p.tok.xkind == pxComment:
     getTokP(p)
@@ -2557,13 +2570,24 @@ proc parseRoutineSpecifiers*(p: var TParser, noBody: var bool,
     of "static":
       getTokP(p)
     of "inline":
+      # forward as {.inline.} (both renderers emit the pragma son)
       result.add(newIdentNode("inline", p.tok.info))
+      getTokP(p)
+    of "cdecl", "stdcall":
+      # nimony-fulfillable calling conventions - forward as pragmas
+      result.add(newIdentNode(word, p.tok.info))
+      getTokP(p)
+    of "register", "pascal", "safecall":
+      # no nimony equivalent - warn (default) or error (--strict)
+      parWarning(p, "cc:" & word & ":" & renderInfo(p.tok.info),
+          "calling convention '" & word & "' is not supported by the " &
+          "nimony chain and is ignored")
       getTokP(p)
     of "forward":
       noBody = true
       getTokP(p)
     of "reintroduce", "abstract", "dynamic", "deprecated", "platform",
-       "experimental", "safecall", "pascal", "cdecl", "stdcall", "register":
+       "experimental":
       getTokP(p)
     of "external":
       # external declarations: skip the string/qualifier

@@ -26,6 +26,8 @@ type
     pfNoCaseCanon,      ## disable case canonicalization
     pfNoInit,           ## do not add explicit initializers to Pascal locals
     pfV2                ## emit {.feature: "v2".} instead of lenientnils
+    pfStrictDirectives  ## unfulfillable directives/calling conventions
+                        ## become errors instead of warnings
 
   NodeKind* = enum
     # literals & atoms

@@ -402,6 +402,23 @@ proc renderDef(s: var TRendor, n: Node) =
     s.line(renderDefSig(s, n))
     return
   var sig = renderDefSig(s, n)
+  # forward accepted routine pragmas (inline, cdecl, stdcall);
+  # `raises` is deliberately skipped here - the M4 machinery
+  # pre-stuffs it into the pragma node and containsRaise decides
+  var havePrag = false
+  if n.len >= 4 and n[3].kind == nkPragma:
+    for pi in 0 ..< n[3].len:
+      if n[3][pi].kind == nkIdent and n[3][pi].strVal != "raises":
+        havePrag = true
+  if havePrag:
+    sig.add(" {.")
+    var first = true
+    for pi in 0 ..< n[3].len:
+      if n[3][pi].kind == nkIdent and n[3][pi].strVal != "raises":
+        if not first: sig.add(", ")
+        sig.add(n[3][pi].strVal)
+        first = false
+    sig.add(".}")
   if containsRaise(body):
     # nimony: raising procs must announce it (ErrorCode model)
     sig.add(" {.raises.}")

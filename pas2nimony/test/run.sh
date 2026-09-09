@@ -299,6 +299,33 @@ if [ -x "$ROOT/bin/pasler" ] && [ -f "$HERE/shlshr.pas" ]; then
   fi
 fi
 
+# ---- ccprobe.pas: directive forwarding (inline/cdecl/stdcall as
+# pragmas; register/pascal/safecall warn, error under --strict) ----
+if [ -x "$ROOT/bin/pasler" ] && [ -f "$HERE/ccprobe.pas" ]; then
+  echo "== pasler-cc"
+  mkdir -p "$TMP/pasler-cc"
+  cp "$HERE/ccprobe.pas" "$TMP/pasler-cc/"
+  out="$(cd "$TMP/pasler-cc" && timeout 300 "$ROOT/bin/pasler" \
+      --nimony:"$NIMONY" --run ccprobe.pas 2>&1 | grep -v nifmake)"
+  echo "$out" | tail -1
+  warncount="$(echo "$out" | grep -c "Warning: calling convention" || true)"
+  if echo "$out" | grep -q "2468" && [ "$warncount" = "1" ]; then
+    echo "-- ok"
+  else
+    echo "   CC WARNING/RUN MISMATCH (want one warning + 2468)"; fail=1
+  fi
+  rm -rf nimcache
+  if (cd "$TMP/pasler-cc" && timeout 300 "$ROOT/bin/pasler" --strict \
+      --run ccprobe.pas > /dev/null 2>&1); then
+    echo "   STRICT MODE DID NOT FAIL"; fail=1
+  elif (cd "$TMP/pasler-cc" && timeout 300 "$ROOT/bin/pasler" --strict \
+      --run ccprobe.pas 2>&1 | grep -q "Error: calling convention"); then
+    echo "-- ok2 (strict errors)"
+  else
+    echo "   STRICT MODE MISMATCH"; fail=1
+  fi
+fi
+
 # M5 oracle: differential testing against real FPC (skips without fpc)
 if ! sh "$HERE/oracle.sh"; then
   echo "   ORACLE FAILED"; fail=1

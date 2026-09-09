@@ -552,11 +552,26 @@ proc emitProcDef(e: var NifEmitter; n: Node) =
       e.buf.copyInto(globalTags.registerTag("params"), i):
         discard
       e.buf.addDotToken(i)
-    if n.len > 0 and n[n.len - 1].kind != nkEmpty and
-        containsRaiseNode(n[n.len - 1]):
-      # raising procs announce it (ErrorCode model)
+    var havePrag = false
+    if n.len >= 4 and n[3].kind == nkPragma:
+      for son in n[3].sons:
+        # `raises` is skipped: the M4 machinery pre-stuffs it and
+        # containsRaiseNode decides below
+        if son.kind == nkIdent and son.strVal != "raises":
+          havePrag = true
+    var wantRaise = n.len > 0 and n[n.len - 1].kind != nkEmpty and
+        containsRaiseNode(n[n.len - 1])
+    if havePrag or wantRaise:
+      # forward accepted routine pragmas (inline, cdecl, stdcall) and
+      # the raises announcement in one pragma node
       e.buf.copyInto(globalTags.registerTag("pragmas"), i):
-        e.buf.addIdent("raises", i)
+        if havePrag:
+          for son in n[3].sons:
+            if son.kind == nkIdent and son.strVal != "raises":
+              e.buf.addIdent(son.strVal, e.info(son))
+        if wantRaise:
+          # nimony: raising procs announce it (ErrorCode model)
+          e.buf.addIdent("raises", i)
     else:
       e.buf.addDotToken(i)      # pragmas
     e.buf.addDotToken(i)      # effects

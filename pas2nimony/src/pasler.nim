@@ -61,6 +61,8 @@ Options:
   --no-case-canon    disable case canonicalization
   --no-init          do not add initializers to Pascal locals
   --v2               emit {.feature: "v2".} instead of lenientnils
+  --strict           unfulfillable calling conventions (register,
+                     pascal, safecall) error out instead of warning
   --                 everything after this goes to the built program
   -h, --help         show this help
 Other nimony options (-o:, --cc:, --opt:, --passC:, ...) are
@@ -184,6 +186,9 @@ proc main =
       flags.incl(pfNoInit)
     elif a == "--v2":
       flags.incl(pfV2)
+    elif a == "--strict":
+      # unfulfillable directives/calling conventions become errors
+      flags.incl(pfStrictDirectives)
     elif a.len > 0 and a[0] == '-':
       # any other nimony-shaped option: forward verbatim
       forwardOpts.add(a)

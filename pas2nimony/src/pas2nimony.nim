@@ -50,6 +50,8 @@ Options:
   --no-case-canon    disable case canonicalization
   --no-init          do not add initializers to Pascal locals
   --v2               emit {.feature: "v2".} instead of lenientnils
+  --strict           unfulfillable calling conventions (register,
+                     pascal, safecall) error out instead of warning
   --emit-nif:FILE    emit parsed NIF (<FILE>.p.nif + .p.deps.nif) directly
                      from the Pascal AST, no Nim renderer involved
   -h, --help         show this help
@@ -84,6 +86,8 @@ proc main =
       flags.incl(pfNoInit)
     elif a == "--v2":
       flags.incl(pfV2)
+    elif a == "--strict":
+      flags.incl(pfStrictDirectives)
     elif a.startsWith("--emit-nif:"):
       emitNifPath = a[11..^1]
     elif a.startsWith("-d:"):

@@ -700,3 +700,24 @@ Gaps closed:
 
 Suite section `pasler-shlshr` diffs the 128-line FPC-verified
 expected output (timing line filtered).
+
+## M6-6: routine directive forwarding and directive diagnostics
+
+Routine directives are no longer silently dropped:
+
+- **Forwarded as pragmas**: `inline` (already lexed, now also
+  rendered), plus the nimony-fulfillable calling conventions
+  `cdecl` and `stdcall` (probed: nimony compiles all three and
+  resolves call sites consistently). Both the .nim renderer and
+  the TokenBuf NIF emitter forward the def's pragma son; `raises`
+  is excluded from forwarding (the M4 machinery pre-stuffs it into
+  the pragma node and the raise analysis owns its emission).
+- **Unfulfillable conventions** (`register`, `pascal`, `safecall`)
+  produce a diagnostic: a WARNING by default (deduplicated per
+  process, so the multi-pass pipeline prints each site once) and
+  an **error under `--strict`** (both pasler and pas2nimony),
+  which stops the build.
+- Everything else (reintroduce/abstract/dynamic/deprecated/
+  platform/experimental) stays consumed-and-ignored for now.
+- Suite section `pasler-cc`: one warning + correct run by default,
+  an error exit under `--strict`.
