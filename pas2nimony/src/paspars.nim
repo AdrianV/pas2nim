@@ -953,6 +953,10 @@ proc bracketExprList(p: var TParser, first: Node): Node =
     result[1] = decIndex(p, result[1])
 
 proc identOrLiteral(p: var TParser): Node =
+  while p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
+    # a conditional in expression position: `x = {$IFDEF}#10{$ELSE}#13{$ENDIF}`
+    if not declDirective(p): break
+    skipCom(p)
   case p.tok.xkind
   of pxSymbol:
     result = newIdentNode(p.tok.ident, p.tok.info)
@@ -1019,6 +1023,12 @@ proc identOrLiteral(p: var TParser): Node =
     parError(p, "expression expected, got " & $p.tok)
     getTokP(p)
     result = emptyNode(p.tok.info)
+  # consume the dead alternative / closing marker of the same
+  # conditional: `x = {$IFDEF}#10{$ELSE}#13{$ENDIF}` - the live value
+  # was the literal; the {$else} group and {$endif} end here
+  while p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
+    if declDirective(p): skipCom(p)
+    else: break
 
 proc parseAnonymousMethod(p: var TParser): Node =
   ## Delphi anonymous method: `procedure(X: Integer) begin ... end`
@@ -1968,7 +1978,16 @@ proc parseInterfaceType(p: var TParser, definition: Node): Node =
 proc parseTypeDesc*(p: var TParser, definition: Node): Node =
   let oldcontext = p.context
   p.context = conTypeDesc
+  while p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
+    # `T = {$IFDEF X}{$ELSE}packed{$ENDIF} record` - the conditional
+    # sits between the `=` and the type keyword
+    if not declDirective(p): break
+    skipCom(p)
   if p.tok.xkind == pxPacked: getTokP(p)  # {.packed.} handled by renderer
+  # the live branch's trailing {$endif} comes after the type keyword
+  while p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
+    if not declDirective(p): break
+    skipCom(p)
   case p.tok.xkind
   of pxCommand:
     result = parseDirective(p)
@@ -1986,6 +2005,12 @@ proc parseTypeDesc*(p: var TParser, definition: Node): Node =
     let body = newNode(nkRecList, p.tok.info)
     while p.tok.xkind != pxEnd and p.tok.xkind != pxEof:
       case p.tok.xkind
+      of pxCurlyDirLe, pxStarDirLe:
+        # conditionals between record members
+        # ({$IFDEF X} field {$ELSE} field {$ENDIF})
+        if not declDirective(p):
+          break
+        skipCom(p)
       of pxSymbol:
         let defs = parseIdentColonEquals(p, false)
         # field types for 1-based string indexing (`rec.field[i]`)
@@ -3588,10 +3613,29 @@ proc parseCase*(p: var TParser): Node =
       break
     else:
       b = newNodeP(nkOfBranch, p)
+      var noLabels = false
       while p.tok.xkind != pxEof and p.tok.xkind != pxColon:
+        # branch labels may carry conditionals:
+        # tkInteger, tkClass {$IFDEF FPC} ,tkBool {$ENDIF}:
+        if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
+          if not declDirective(p):
+            noLabels = true
+            break
+          skipCom(p)
+          if p.tok.xkind in {pxEnd, pxParRi, pxElse, pxEof}:
+            # the conditional closed the branch; the case loop
+            # re-checks (the branch's labels+body were spliced in)
+            noLabels = true
+            break
+        if p.tok.xkind == pxComma:
+          getTokP(p)
+          skipCom(p)
+        if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}: continue
         b.add(rangeExpr(p))
         p.opt(pxComma)
         skipCom(p)
+      if noLabels:
+        continue
       p.eat(pxColon)
     skipCom(p)
     b.add(parseStmt(p))
@@ -3745,6 +3789,8 @@ proc parseTry*(p: var TParser): Node =
         for k in 0 ..< s.len: fin.add(s[k])
       else:
         fin.add(s)
+      p.opt(pxSemiColon)
+      skipCom(p)
     result.add(fin)
   p.eat(pxEnd)
 
@@ -3811,11 +3857,23 @@ proc parseRepeat*(p: var TParser): Node =
   result.add(newIdentNode("true", p.tok.info))
   let body = newNodeP(nkStmtList, p)
   while p.tok.xkind != pxEof and p.tok.xkind != pxUntil:
+    if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
+      # a conditional wrapping the `until` condition:
+      # {$IFDEF A} until X {$ELSE} until Y {$ENDIF}
+      if declDirective(p):
+        skipCom(p)
+        continue
+      break
     let s = parseStmt(p)
     if s.kind != nkEmpty: body.add(s)
     if p.tok.xkind == pxSemiColon:
       getTokP(p)
       skipCom(p)
+  # the `until` condition may carry the conditional:
+  # {$IFDEF A} until X {$ELSE} until Y {$ENDIF}
+  while p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
+    if not declDirective(p): break
+    skipCom(p)
   p.eat(pxUntil)
   skipCom(p)
   let a = newNodeP(nkIfStmt, p)
@@ -4544,8 +4602,15 @@ proc parseStmt*(p: var TParser): Node =
   of pxCurlyDirLe, pxStarDirLe:
     if isHandledDirective(p):
       result = parseDirective(p)
+    elif declDirective(p):
+      # a trailing {$else}/{$endif} of a live branch: zero statements
+      # at this position; the following statement (if any) takes the
+      # slot, so `while ... do {$ENDIF} Inc(x);` keeps Inc inside
+      if p.tok.xkind in {pxEnd, pxEof, pxSemiColon, pxElse, pxUntil}:
+        result = emptyNode(p.tok.info)
+      else:
+        result = parseStmt(p)
     else:
-      parError(p, p.tok.ident & " not allowed here")
       result = emptyNode(p.tok.info)
   of pxBegin:
     result = newNodeP(nkStmtList, p)
@@ -4581,9 +4646,19 @@ proc parseStmt*(p: var TParser): Node =
         if declDirective(p):
           continue
         break
-      branch.add(parseStmt(p))
-      result.add(branch)
+      if p.tok.xkind == pxElse:
+        # `then <comment-only>` - the branch body is empty
+        branch.add(emptyNode(p.tok.info))
+        result.add(branch)
+      else:
+        branch.add(parseStmt(p))
+        result.add(branch)
       skipCom(p)
+      while p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
+        # a conditional wrapping the else chain:
+        # if A then B {$IFDEF X} else if C then {$ELSE} else if ... {$ENDIF}
+        if not declDirective(p): break
+        skipCom(p)
       if p.tok.xkind == pxElse:
         getTokP(p)
         skipCom(p)
