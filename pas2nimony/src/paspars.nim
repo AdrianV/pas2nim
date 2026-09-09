@@ -655,6 +655,8 @@ proc parseUsesStmt*(p: var TParser): Node =
       # comma-first continuation: `,\n  NextUnit` (Delphi style)
       getTokP(p)
       continue
+    if p.tok.xkind in {pxSemiColon, pxEof}:
+      break
     if p.tok.xkind != pxSymbol:
       parError(p, "identifier expected in uses clause")
     var unitName = p.tok.ident
@@ -4365,6 +4367,18 @@ proc parseStmt*(p: var TParser): Node =
     result.add(parseExpr(p))
     p.eat(pxDo)
     skipCom(p)
+    if p.tok.xkind in {pxComment, pxSemiColon}:
+      # `while C do { nothing };` / `while C do;` - an empty body
+      # (skipCom has usually consumed the comment already)
+      skipCom(p)
+      if p.tok.xkind == pxSemiColon:
+        getTokP(p)
+        p.opt(pxSemiColon)
+        skipCom(p)
+        var d = newNode(nkDiscardStmt, p.tok.info)
+        d.add(emptyNode(p.tok.info))
+        result.add(d)
+        return
     result.add(parseStmt(p))
   of pxRepeat:
     result = parseRepeat(p)
