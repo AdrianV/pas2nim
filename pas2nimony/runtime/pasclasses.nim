@@ -19,12 +19,29 @@ import std/[strutils, syncio, os]
 import systempas
 
 type
+  TOperation* = enum
+    opInsert, opRemove             # Delphi order (opRemove = 1)
+
+  TListNotification* = enum
+    lnAdded, lnDeleted, lnExtracted  # Delphi order
+
+  TList* {.inheritable.} = ref object of RootRef
+    fItems*: seq[RootRef]
+
+  TStrings* {.inheritable.} = ref object of RootRef
+  TStream* {.inheritable.} = ref object of RootRef
+  TPersistent* {.inheritable.} = ref object of RootRef
+  TComponent* {.inheritable.} = ref object of TPersistent
+
+  # Delphi's Classes-side exception class (Contnrs raises it)
+  EListError* = ref object of PasException
+
   TDuplicates* = enum
     dupError, dupIgnore, dupAccept   # Delphi order; 0 = dupError so a
                                      # zero-initialized field errors (v1:
                                      # treated like accept, no exception)
 
-  TStringList* = ref object of RootRef
+  TStringList* = ref object of TStrings
     fLines*: seq[string]
     fSorted*: bool
     fCaseSensitive*: bool
@@ -201,3 +218,87 @@ proc LoadFromFile*(self: TStringList; path: string) =
     if cur.len > 0: self.fLines.add(cur)
   except Exception:
     discard
+# TList - the pointer-list container (v1: items ride RootRef; the
+# corpus only stores/reads TObject references through it)
+proc Create*(self: typedesc[TList]): TList =
+  var r = TList()
+  r.fItems = @[]
+  result = r
+
+proc Add*(self: TList; item: RootRef): int32 =
+  self.fItems.add(item)
+  result = int32(self.fItems.len - 1)   # Delphi returns the index
+
+proc Count*(self: TList): int32 =
+  int32(self.fItems.len)
+
+proc `[]`*(self: TList; i: int32): RootRef =
+  self.fItems[i]
+
+proc `[]=`*(self: TList; i: int32; v: RootRef) =
+  self.fItems[i] = v
+
+# Delphi TList.First: the first item (v1: nil on an empty list)
+proc First*(self: TList): RootRef =
+  result = nil
+  if self.fItems.len > 0:
+    result = self.fItems[0]
+
+# Delphi TList.Extract: removes and returns the item (the v1 shim
+# keeps the value, list mutation follows the Delphi contract shape)
+proc Extract*(self: TList; item: RootRef): RootRef =
+  result = nil
+  var idx = -1
+  for i in 0 ..< self.fItems.len:
+    if self.fItems[i] == item:
+      idx = i
+      break
+  if idx >= 0:
+    self.fItems.delete(idx)
+    result = item
+
+# TStrings: the abstract list base (v1: empty shell - the corpus only
+# passes TStrings values between declarations; the concrete work goes
+# through TStringList)
+proc Create*(self: typedesc[TStrings]): TStrings =
+  var r = TStrings()
+  result = r
+
+proc Count*(self: TStrings): int32 =
+  0
+
+proc `[]`*(self: TStrings; i: int32): string =
+  ""
+
+proc Delete*(self: TStrings; i: int32) =
+  discard
+
+proc Clear*(self: TStrings) =
+  discard
+
+proc Add*(self: TStrings; s: string): int32 =
+  0
+
+# TStringList property accessors: `List.Sorted := True` lowers to the
+# Sorted= setter (nimony derives field assignments, not properties)
+proc Sorted*(self: TStringList): bool =
+  self.fSorted
+
+proc `Sorted=`*(self: TStringList; v: bool) =
+  self.fSorted = v
+
+# TStringList.CommaText: the corpus only moves the value through the
+# property setter (and reads it back); v1 joins with commas
+proc CommaText*(self: TStringList): string =
+  self.fLines.join(",")
+
+proc `CommaText=`*(self: TStringList; v: string) =
+  self.fLines = v.split(",")
+
+
+# EListError.CreateFmt: the corpus's raise sites only use the
+# message-formatting ctor
+proc CreateFmt*(self: typedesc[EListError]; msg: string;
+    args: TArrayOfConst): EListError =
+  var r = EListError(Message: Format(msg, args))
+  result = r

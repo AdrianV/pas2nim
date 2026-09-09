@@ -83,6 +83,9 @@ if [ $# -eq 0 ] && [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/twounit" ]; then
   echo "== pasler-twounit"
   mkdir -p "$TMP/pasler"
   cp "$HERE"/twounit/*.pas "$TMP/pasler/"
+  # pasler resolves shim imports from its own directory
+  cp -f "$ROOT"/runtime/*.nim "$TMP/pasler/"
+  rm -f "$TMP/pasler"/nimcache/*.nim
   if (cd "$TMP/pasler" && "$ROOT/bin/pasler" --nimony:"$NIMONY" --run usecounter.pas 2>&1 | grep -v nifmake || true); then
     # nifler must not have touched the Pascal-derived NIFs
     if grep -lq 'vendor "pasler"' "$TMP/pasler"/nimcache/*.p.nif 2>/dev/null; then
@@ -98,6 +101,9 @@ if [ $# -eq 0 ] && [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/twounit" ]; then
     echo "== pasler-events"
     mkdir -p "$TMP/pasler-events"
     cp "$HERE/events.pas" "$TMP/pasler-events/"
+    # pasler resolves shim imports from its own directory
+    cp -f "$ROOT"/runtime/*.nim "$TMP/pasler-events/"
+    rm -f "$TMP/pasler-events"/nimcache/*.nim
     if (cd "$TMP/pasler-events" &&
         "$ROOT/bin/pasler" --nimony:"$NIMONY" --run events.pas 2>&1 |
         grep -v nifmake || true); then
@@ -110,6 +116,9 @@ if [ $# -eq 0 ] && [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/twounit" ]; then
     echo "== pasler-anon"
     mkdir -p "$TMP/pasler-anon"
     cp "$HERE/anonmeth.pas" "$TMP/pasler-anon/"
+    # pasler resolves shim imports from its own directory
+    cp -f "$ROOT"/runtime/*.nim "$TMP/pasler-anon/"
+    rm -f "$TMP/pasler-anon"/nimcache/*.nim
     if (cd "$TMP/pasler-anon" &&
         "$ROOT/bin/pasler" --nimony:"$NIMONY" --run anonmeth.pas 2>&1 |
         grep -v nifmake || true); then
@@ -122,6 +131,9 @@ if [ $# -eq 0 ] && [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/twounit" ]; then
     echo "== pasler-usesnim"
     mkdir -p "$TMP/pasler-usesnim"
     cp "$HERE/usesnim.pas" "$TMP/pasler-usesnim/"
+    # pasler resolves shim imports from its own directory
+    cp -f "$ROOT"/runtime/*.nim "$TMP/pasler-usesnim/"
+    rm -f "$TMP/pasler-usesnim"/nimcache/*.nim
     if (cd "$TMP/pasler-usesnim" &&
         "$ROOT/bin/pasler" --nimony:"$NIMONY" --run usesnim.pas 2>&1 |
         grep -v nifmake || true); then
@@ -135,6 +147,10 @@ if [ $# -eq 0 ] && [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/twounit" ]; then
       echo "== pasler-$extra"
       mkdir -p "$TMP/pasler-$extra"
       cp "$HERE/$extra.pas" "$TMP/pasler-$extra/"
+      # pasler resolves shim imports from its own directory; the
+      # nimcache's stale module copies must not shadow them
+      cp -f "$ROOT"/runtime/*.nim "$TMP/pasler-$extra/"
+      rm -f "$TMP/pasler-$extra"/nimcache/*.nim
       if (cd "$TMP/pasler-$extra" &&
           "$ROOT/bin/pasler" --nimony:"$NIMONY" --run $extra.pas 2>&1 |
           grep -v nifmake || true); then
@@ -148,6 +164,9 @@ if [ $# -eq 0 ] && [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/twounit" ]; then
     echo "== pasler-generics"
     mkdir -p "$TMP/pasler-generics"
     cp "$HERE/generics.pas" "$TMP/pasler-generics/"
+    # pasler resolves shim imports from its own directory
+    cp -f "$ROOT"/runtime/*.nim "$TMP/pasler-generics/"
+    rm -f "$TMP/pasler-generics"/nimcache/*.nim
     if (cd "$TMP/pasler-generics" &&
         "$ROOT/bin/pasler" --nimony:"$NIMONY" --run generics.pas 2>&1 |
         grep -v nifmake || true); then
@@ -160,6 +179,9 @@ if [ $# -eq 0 ] && [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/twounit" ]; then
     echo "== pasler-op"
     mkdir -p "$TMP/pasler-op"
     cp "$HERE/opover.pas" "$TMP/pasler-op/"
+    # pasler resolves shim imports from its own directory
+    cp -f "$ROOT"/runtime/*.nim "$TMP/pasler-op/"
+    rm -f "$TMP/pasler-op"/nimcache/*.nim
     if (cd "$TMP/pasler-op" &&
         "$ROOT/bin/pasler" --nimony:"$NIMONY" --run opover.pas 2>&1 |
         grep -v nifmake || true); then
@@ -172,6 +194,9 @@ if [ $# -eq 0 ] && [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/twounit" ]; then
     echo "== pasler-cm"
     mkdir -p "$TMP/pasler-cm"
     cp "$HERE/classmeth.pas" "$TMP/pasler-cm/"
+    # pasler resolves shim imports from its own directory
+    cp -f "$ROOT"/runtime/*.nim "$TMP/pasler-cm/"
+    rm -f "$TMP/pasler-cm"/nimcache/*.nim
     if (cd "$TMP/pasler-cm" &&
         "$ROOT/bin/pasler" --nimony:"$NIMONY" --run classmeth.pas 2>&1 |
         grep -v nifmake || true); then
@@ -184,6 +209,9 @@ if [ $# -eq 0 ] && [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/twounit" ]; then
     echo "== pasler-intf"
     mkdir -p "$TMP/pasler-intf"
     cp "$HERE/intf.pas" "$TMP/pasler-intf/"
+    # pasler resolves shim imports from its own directory
+    cp -f "$ROOT"/runtime/*.nim "$TMP/pasler-intf/"
+    rm -f "$TMP/pasler-intf"/nimcache/*.nim
     if (cd "$TMP/pasler-intf" &&
         "$ROOT/bin/pasler" --nimony:"$NIMONY" --run intf.pas 2>&1 |
         grep -v nifmake || true); then
@@ -196,6 +224,9 @@ if [ $# -eq 0 ] && [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/twounit" ]; then
     echo "== pasler-cast"
     mkdir -p "$TMP/pasler-cast"
     cp "$HERE/cast.pas" "$TMP/pasler-cast/"
+    # pasler resolves shim imports from its own directory
+    cp -f "$ROOT"/runtime/*.nim "$TMP/pasler-cast/"
+    rm -f "$TMP/pasler-cast"/nimcache/*.nim
     if (cd "$TMP/pasler-cast" &&
         "$ROOT/bin/pasler" --nimony:"$NIMONY" --run cast.pas 2>&1 |
         grep -v nifmake || true); then
@@ -208,6 +239,9 @@ if [ $# -eq 0 ] && [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/twounit" ]; then
     echo "== pasler-goto"
     mkdir -p "$TMP/pasler-goto"
     cp "$HERE/goto.pas" "$TMP/pasler-goto/"
+    # pasler resolves shim imports from its own directory
+    cp -f "$ROOT"/runtime/*.nim "$TMP/pasler-goto/"
+    rm -f "$TMP/pasler-goto"/nimcache/*.nim
     if (cd "$TMP/pasler-goto" &&
         "$ROOT/bin/pasler" --nimony:"$NIMONY" --run goto.pas 2>&1 |
         grep -v nifmake || true); then
@@ -220,6 +254,9 @@ if [ $# -eq 0 ] && [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/twounit" ]; then
     echo "== pasler-with"
     mkdir -p "$TMP/pasler-with"
     cp "$HERE/with.pas" "$TMP/pasler-with/"
+    # pasler resolves shim imports from its own directory
+    cp -f "$ROOT"/runtime/*.nim "$TMP/pasler-with/"
+    rm -f "$TMP/pasler-with"/nimcache/*.nim
     if (cd "$TMP/pasler-with" &&
         "$ROOT/bin/pasler" --nimony:"$NIMONY" --run with.pas 2>&1 |
         grep -v nifmake || true); then
@@ -235,6 +272,9 @@ if [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/clitest" ]; then
   echo "== pasler-cli"
   mkdir -p "$TMP/pasler-cli"
   cp "$HERE"/clitest/*.pas "$TMP/pasler-cli/"
+  # pasler resolves shim imports from its own directory
+  cp -f "$ROOT"/runtime/*.nim "$TMP/pasler-cli/"
+  rm -f "$TMP/pasler-cli"/nimcache/*.nim
   cp -r "$HERE"/clitest/units "$TMP/pasler-cli/units"
   out="$(cd "$TMP/pasler-cli" && timeout 300 "$ROOT/bin/pasler" \
       --nimony:"$NIMONY" --path:units -d:CLI_FLAG --run cond.pas 2>&1 |
@@ -269,6 +309,9 @@ if [ -x "$ROOT/bin/pasler" ] && [ -f "$HERE/happy.pas" ]; then
   echo "== pasler-happy"
   mkdir -p "$TMP/pasler-happy"
   cp "$HERE/happy.pas" "$TMP/pasler-happy/"
+  # pasler resolves shim imports from its own directory
+  cp -f "$ROOT"/runtime/*.nim "$TMP/pasler-happy/"
+  rm -f "$TMP/pasler-happy"/nimcache/*.nim
   out="$(cd "$TMP/pasler-happy" && timeout 300 "$ROOT/bin/pasler" \
       --nimony:"$NIMONY" --run happy.pas 2>&1 | grep -v nifmake |
       grep 'Found' || true)"
@@ -288,6 +331,9 @@ if [ -x "$ROOT/bin/pasler" ] && [ -f "$HERE/shlshr.pas" ]; then
   echo "== pasler-shlshr"
   mkdir -p "$TMP/pasler-shlshr"
   cp "$HERE/shlshr.pas" "$TMP/pasler-shlshr/"
+  # pasler resolves shim imports from its own directory
+  cp -f "$ROOT"/runtime/*.nim "$TMP/pasler-shlshr/"
+  rm -f "$TMP/pasler-shlshr"/nimcache/*.nim
   timeout 300 bash -c "cd '$TMP/pasler-shlshr' &&
       '$ROOT/bin/pasler' --nimony:'$NIMONY' --run shlshr.pas 2>&1 |
       grep -v nifmake | grep -v 'time = ' > shlshr.out" || true
@@ -305,6 +351,9 @@ if [ -x "$ROOT/bin/pasler" ] && [ -f "$HERE/ccprobe.pas" ]; then
   echo "== pasler-cc"
   mkdir -p "$TMP/pasler-cc"
   cp "$HERE/ccprobe.pas" "$TMP/pasler-cc/"
+  # pasler resolves shim imports from its own directory
+  cp -f "$ROOT"/runtime/*.nim "$TMP/pasler-cc/"
+  rm -f "$TMP/pasler-cc"/nimcache/*.nim
   out="$(cd "$TMP/pasler-cc" && timeout 300 "$ROOT/bin/pasler" \
       --nimony:"$NIMONY" --run ccprobe.pas 2>&1 | grep -v nifmake)"
   echo "$out" | tail -1
@@ -333,6 +382,9 @@ if [ -x "$ROOT/bin/pasler" ] && [ -f "$HERE/shadow.pas" ]; then
   echo "== pasler-shadow"
   mkdir -p "$TMP/pasler-shadow"
   cp "$HERE/shadow.pas" "$TMP/pasler-shadow/"
+  # pasler resolves shim imports from its own directory
+  cp -f "$ROOT"/runtime/*.nim "$TMP/pasler-shadow/"
+  rm -f "$TMP/pasler-shadow"/nimcache/*.nim
   out="$(cd "$TMP/pasler-shadow" && timeout 300 "$ROOT/bin/pasler" \
       --nimony:"$NIMONY" --run shadow.pas 2>&1 | grep -v nifmake)"
   echo "$out" | head -3

@@ -301,6 +301,12 @@ proc typeStr(s: var TRendor, n: Node): string =
       result = "ref " & s.typeStr(n[0])
   of nkPtrTy:
     result = "ptr " & s.typeStr(n[0])
+  of nkDotExpr:
+    # a unit-qualified alias target (`System.PLongint`): the unit
+    # qualifier drops - systempas re-exports the system tier
+    let member = if s.syms != nil: s.syms[].canonicalMember(n[1].strVal)
+                 else: n[1].strVal
+    result = member
   of nkObjectTy:
     # anonymous object
     result = "object"
@@ -320,8 +326,13 @@ proc typeStr(s: var TRendor, n: Node): string =
   of nkRangeTy:
     result = "range[" & s.expr(n[0][0]) & ".." & s.expr(n[0][1]) & "]"
   of nkIndexExpr:
-    # generic instantiation in a type position
-    result = s.typeStr(n[0]) & "["
+    # `string[N]` (Pascal short string): the length prefix has no
+    # nimony model - keep the unbounded string (documented divergence)
+    if n[0].kind == nkIdent and n[0].strVal.toLowerAscii == "string":
+      result = "string"
+    else:
+      # generic instantiation in a type position
+      result = s.typeStr(n[0]) & "["
     for i in 1 ..< n.len:
       if i > 1: result.add(", ")
       result.add(s.typeStr(n[i]))
@@ -341,7 +352,16 @@ proc typeStr(s: var TRendor, n: Node): string =
     if params[0].kind != nkEmpty:
       result.add(": " & s.typeStr(params[0]))
     if n.len > 1 and n[1].kind == nkPragma:
-      result.add(" {.closure.}")
+      # method-pointer shapes carry their own record conversion; a
+      # plain proc type forwards the real conventions (stdcall)
+      var cc = ""
+      for pi in 0 ..< n[1].len:
+        if n[1][pi].kind == nkIdent and
+            n[1][pi].strVal.toLowerAscii in ["stdcall", "cdecl"]:
+          if cc.len > 0: cc.add(", ")
+          cc.add(n[1][pi].strVal)
+      if cc.len > 0:
+        result.add(" {." & cc & ".}")
   of nkVarTy:
     result = "var " & s.typeStr(n[0])
   else:
@@ -351,13 +371,27 @@ proc emitBranchBody(s: var TRendor, n: Node) =
   ## render a branch body (one statement or a list) one level deeper
   s.indent = s.indent + 1
   if n.kind == nkStmtList:
-    if n.len == 0:
+    # a body of only comments/empties is an EMPTY block to nimony
+    # ("nestable statement requires indentation") - emit a discard
+    # first, then any comments
+    var anyReal = false
+    for c in n.sons:
+      if c.kind != nkEmpty and c.kind != nkCommentStmt:
+        anyReal = true
+        break
+    if not anyReal:
       s.line("discard")
-    else:
-      for c in n.sons:
-        s.stmt(c)
+    for c in n.sons:
+      s.stmt(c)
   else:
-    s.stmt(n)
+    # a single-statement body that is only a comment is likewise
+    # an empty block (nimony needs a real statement)
+    if n.kind == nkEmpty or n.kind == nkCommentStmt:
+      s.line("discard")
+      if n.kind == nkCommentStmt and n.strVal.len > 0:
+        s.line(n.strVal)
+    else:
+      s.stmt(n)
   s.indent = s.indent - 1
 
 proc typeParamsSuffix(s: var TRendor, d: Node): string =
@@ -507,10 +541,33 @@ proc renderTypeDef(s: var TRendor, def: Node, hoisted: var seq[Node]) =
         line1.add(s.defName(ty[i]))
     s.line(line1)
   else:
-    var line1 = s.canon(nameNode.strVal)
-    if exported: line1.add("*")
-    line1.add(" = " & s.typeStr(ty))
-    s.line(line1)
+    if ty.kind == nkSetTy and ty[0].kind == nkEnumTy:
+      # `TMaskDirectives = set of (mdReverseDir, ...)` - the anonymous
+      # enum hoists to its own named type so the set has an ordinal
+      # base (nimony has no anonymous enum in a set position)
+      let enumName = "pas_" & s.canon(nameNode.strVal) & "Ty"
+      var line1 = enumName
+      if exported: line1.add("*")
+      line1.add(" = enum ")
+      let ety = ty[0]
+      for i in 0 ..< ety.len:
+        if i > 0: line1.add(", ")
+        if ety[i].kind == nkEnumFieldDef:
+          line1.add(s.canon(ety[i][0].strVal) & " = " & s.expr(ety[i][1]))
+        else:
+          # members travel with the exported enum type (no per-member
+          # `*` - nimony rejects it on enum fields)
+          line1.add(s.canon(ety[i].strVal))
+      s.line(line1)
+      var line2 = s.canon(nameNode.strVal)
+      if exported: line2.add("*")
+      line2.add(" = set[" & enumName & "]")
+      s.line(line2)
+    else:
+      var line1 = s.canon(nameNode.strVal)
+      if exported: line1.add("*")
+      line1.add(" = " & s.typeStr(ty))
+      s.line(line1)
 
 proc stmt(s: var TRendor, n: Node) =
   ## render one statement at the current indent

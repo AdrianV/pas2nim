@@ -397,6 +397,17 @@ type
 
   TArrayOfConst* = seq[TVarRec]
 
+  # Delphi System-unit pointer aliases (Types.pas re-exports these)
+  PLongint* = ptr int32
+  PInteger* = ptr int32
+  PSmallInt* = ptr int16
+  PDouble* = ptr float64
+  PByte* = ptr uint8
+
+  # SysUtils multi-byte classification (MaskUtils uses ByteType); the
+  # v1 model treats every byte as a single byte (ASCII divergence)
+  TMbcsByteType* = enum mbSingleByte, mbLeadByte, mbTrailByte
+
 proc toVrec*(x: int64): TVarRec = TVarRec(k: vrInt, i: x)
 proc toVrec*(x: int32): TVarRec = TVarRec(k: vrInt, i: int64(x))
 proc toVrec*(x: int8): TVarRec = TVarRec(k: vrInt, i: int64(x))
@@ -409,6 +420,25 @@ proc toVrec*(x: float32): TVarRec = TVarRec(k: vrFloat, f: float64(x))
 proc toVrec*(x: char): TVarRec = TVarRec(k: vrChar, c: x)
 proc toVrec*(x: bool): TVarRec = TVarRec(k: vrBool, b: x)
 proc toVrec*(x: string): TVarRec = TVarRec(k: vrStr, s: x)
+
+proc ByteType*(s: string; index: int32): TMbcsByteType =
+  ## SysUtils multi-byte byte classification; v1 ASCII model
+  result = mbSingleByte
+
+proc Len32*(s: string): int32 =
+  ## Pascal Length(string) = Integer (int32); nimony's len is int64
+  result = int32(len(s))
+
+proc Len32*[T](x: openArray[T]): int32 =
+  ## Pascal Length(array) = Integer (int32)
+  result = int32(len(x))
+
+# SysUtils locale separators (v1 constants - locale read/write is a
+# documented divergence)
+var TimeSeparator*: char = ':'
+var DateSeparator*: char = '/'
+var DecimalSeparator*: char = '.'
+var ThousandSeparator*: char = ','
 # ---------------------------------------------------------------------------
 # Pascal for-loops
 #
@@ -445,6 +475,61 @@ type
     Message*: string
 
 var pasCurrentExc*: PasException = PasException(Message: "")
+
+# Delphi TObject.Destroy: the root destructor. Classes whose parent
+# chain declares no destructor (`inherited Destroy` from
+# TSynchroObject) dispatch through this root method.
+method Destroy*(self: RootRef) =
+  discard
+
+# TObject.ClassType: the v1 shell hands back the instance (the corpus
+# only compares class references)
+proc ClassType*(self: RootRef): RootRef =
+  result = self
+
+# TObject.InheritsFrom: v1 accepts everything (single-threaded
+# front-end, no RTTI dispatch exercised)
+proc InheritsFrom*(self: RootRef; cls: RootRef): bool =
+  result = true
+
+# SysUtils.RaiseLastOSError: the v1 shim is single-threaded and every
+# WaitFor path returns a real result, so the v1 stub is a no-op
+# (documented divergence - the error is neither captured nor raised).
+proc RaiseLastOSError*() =
+  discard
+
+# Delphi Variant (v1): a boxed-any placeholder. The corpus only moves
+# Variant values between declarations (TypInfo property accessors,
+# fcCustomFormat's format callback) - no arithmetic or conversion is
+# exercised, so one concrete shape keeps every signature type-checking.
+# A real VarData model is a documented next tier.
+type
+  Variant* = TVarRec
+
+  # System's TMethod (Delphi's method-pointer pair): the v1 shell keeps
+  # the field names; Code stays a pointer (no nimony model for a
+  # proc-typed record field shared across signatures)
+  TMethod* = object
+    Code*: pointer
+    Data*: RootRef
+
+  # System's TPoint
+  TPoint* = object
+    X*: int32
+    Y*: int32
+
+  # System's COM interface root: the v1 shell keeps the spelling
+  # (TypInfo's interface accessors only move values)
+  IInterface* = RootRef
+
+  # SysUtils's conversion exception
+  EConvertError* = ref object of PasException
+  TVarData* {.inheritable.} = ref object of RootRef
+    VType*: int32
+    VString*: string
+    VInteger*: int32
+    VDouble*: float64
+    VBoolean*: bool
 
 # Delphi `x as T`: nil stays nil, a failed checked cast yields nil.
 # (The raising variant would mark every transitive caller {.raises.};
@@ -981,3 +1066,30 @@ proc Format*(fmt: string; args: openArray[TVarRec]): string =
 
 proc Format*(fmt: string): string =
   Format(fmt, [])
+
+const
+  Maxint* = 0x7FFFFFFF'i32
+
+# EConvertError.Create (the raise sites' only ctor)
+proc Create*(self: typedesc[EConvertError]; msg: string): EConvertError =
+  var r = EConvertError(Message: msg)
+  result = r
+
+# SysUtils date parsing: the corpus only exercises the `on
+# EConvertError` path, so the v1 stub raises (the handler swallows it)
+proc StrToDate*(s: string): TDateTime {.raises.} =
+  pasCurrentExc = EConvertError.Create("StrToDate: v1 unimplemented")
+  raise ValueError
+
+proc StrToDateTime*(s: string): TDateTime {.raises.} =
+  result = StrToDate(s)
+
+proc StrToTime*(s: string): TDateTime {.raises.} =
+  pasCurrentExc = EConvertError.Create("StrToTime: v1 unimplemented")
+  raise ValueError
+
+# Variants' custom-variant base (the corpus's TypInfo only inherits
+# the spelling; no variant dispatch is exercised)
+type
+  TInvokeableVariantType* {.inheritable.} = ref object of RootRef
+  EVariantError* = ref object of PasException

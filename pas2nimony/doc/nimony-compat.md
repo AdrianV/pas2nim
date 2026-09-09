@@ -953,3 +953,58 @@ same round (corpus health: 17 of 41 units translate):
 - Keyword-escaped parameter names work in expression position too
   (`case Operator of` on `const Operator: TVarOp`).
 - **The whole pristine rtl/common directory (28 units) translates.**
+
+## M10: nimony compile-health tier (corpus .nim builds)
+
+The compile tier asks a second question per corpus unit: does the
+generated `.nim` actually build under the nimony chain
+(`nimony c --path:.` in `test/tmp/pc`, with the runtime shims and the
+placeholder shims copied in)? `test/private/compile.sh` and
+`compile-errors.sh` sweep all 39 units; baseline 3/39 -> **11/39
+compile-clean**.
+
+Emitter and shim layers this milestone:
+
+- Shim absorb: units with no `.pas` source are scanned from
+  `runtime/` and the new `runtime/placeholders/` shims
+  (`absorbNimModule`), so zero-arg shim routines seed the paren-less
+  call machinery and shim methods register per-class member sets
+  (`s.addRoutine(cty, name)`) for bare-call self-qualification.
+- `Libc.nim` is a real shim now: `TSemaphore`/`TRTLCriticalSection`,
+  the `sem_*` family (RtlNames-mapped to semInit/semWait/...),
+  CriticalSection stubs, and the Win32 compat surface with exact
+  widths (`QS_*`/`PM_REMOVE` `'i32`, `WAIT_*`/`INFINITE` `'u32`),
+  `FARPROC` proc type, `GetModuleHandle`/`GetProcAddress` stubs.
+- Plain proc-type aliases register via `procTyTypes`; `Assigned(x)` on
+  a proc var lowers to `x != nil`; calling conventions on proc-type
+  aliases render as real cc pragmas (matching the callee signatures).
+- Delphi `var X;` untyped var params emit `var pointer` stand-ins
+  (nimony rejects `var untyped` everywhere, including proc types).
+- Exception handlers bind through `pasAs[T](pasCurrentExc)` (nimony
+  rejects bare downcasts between ref types); `raise` keeps the
+  ErrorCode model from M9d.
+- `result`'s varTypes slot resets on class returns (a stale width from
+  the previous routine cast the next body's result asgn to int32).
+- Cross-type literal assignments: char literal -> string target
+  ("" & ch), empty string -> char target (cast[char](0)), narrow
+  ord() call args at int32-param call boundaries.
+- Runtime shells: root `Destroy` method, `ClassType`/`InheritsFrom`,
+  `RaiseLastOSError`, `Maxint`, `TMethod`/`TPoint`/`IInterface`,
+  `Variant`/`TVarData`, `TInvokeableVariantType`/`EVariantError`;
+  `TStringList` inherits `TStrings`; TList member shims
+  (Add/Count/`[]`/`[]=`/Extract/First/Clear/Delete), TStringList
+  Sorted/CommaText accessors; `StrToDate`/`StrToDateTime`/`StrToTime`
+  raise stubs; `EConvertError` + Create.
+- The suite's pasler blocks now copy the runtime shims into their own
+  directories and clear stale nimcache module copies (the pasler
+  pipeline resolves imports from its own dir; leftover copies
+  shadowed fresh shims and broke the suite).
+
+Remaining compile-tier census (each is its own machinery layer):
+default array properties render wrong inside for loops
+(`Items[Index]`/`Format[i]` -> mangled calls, Contnrs/fcCustomFormat),
+enum-set const literals (`tkAny - tkMethods`), narrow-width call args
+beyond `ord()` (IniFiles), `SyncObjs` corpus MSWINDOWS-only bodies
+under LINUX defines, and the VCL tier (`TFrame`/`TForm`/`Menus`) plus
+the ht-family adapter units. FPC cannot compile SyncObjs on Linux
+either (it needs Kyrix's Libc); the frames are a VCL shim tier.

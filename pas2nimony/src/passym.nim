@@ -95,13 +95,24 @@ proc declareName*(t: var SymTab; spelling: string) =
   if key.len > 0 and not t.names.hasKey(key):
     t.names[key] = spelling
 
+proc escapeNimonyName*(spelling: string): string =
+  ## nimony rejects identifiers starting or ending with `_`
+  ## (underscore-leading Delphi names like `_FILETIME` and
+  ## trailing-underscore locals like `str_`); escape both with the
+  ## keyword style
+  result = spelling
+  if result.len > 0 and result[^1] == '_':
+    result = result[0 .. ^2] & "_pas"
+  if result.len > 0 and result[0] == '_':
+    result = "pas" & result
+
 proc canonical*(t: SymTab; spelling: string): string =
   ## the spelling to use for `spelling`: the RTL map wins, then the
   ## declaration registry, then the input spelling itself.
   let key = spelling.toLowerAscii
   let rtl = rtlSpelling(key)
   if rtl.len > 0: return rtl
-  return t.names.getOrDefault(key, spelling)
+  result = escapeNimonyName(t.names.getOrDefault(key, spelling))
 
 proc canonicalMember*(t: SymTab; spelling: string): string =
   ## canon for MEMBER names (fields/properties/methods): the type-ish
@@ -109,7 +120,7 @@ proc canonicalMember*(t: SymTab; spelling: string): string =
   ## property, not the Text file type) - only the declaration
   ## registry applies
   let key = spelling.toLowerAscii
-  return t.names.getOrDefault(key, spelling)
+  result = escapeNimonyName(t.names.getOrDefault(key, spelling))
 
 proc isDeclared*(t: SymTab; spelling: string): bool =
   t.names.hasKey(spelling.toLowerAscii)
@@ -444,7 +455,7 @@ const RtlNames* = [
   ("singlefloat", "float32"), ("tclass", "RootRef"),
   ("tdatetime", "TDateTime"),
   # builtin routines (pure renames)
-  ("ord", "ord"), ("chr", "chr"), ("length", "len"), ("low", "low"),
+  ("ord", "ord"), ("chr", "chr"), ("low", "low"),
   ("high", "high"), ("setlength", "setLen"), ("inc", "inc"), ("dec", "dec"),
   ("succ", "succ"), ("pred", "pred"), ("abs", "abs"), ("odd", "Odd"),
   ("round", "round"), ("trunc", "trunc"), ("sizeof", "sizeof"),
@@ -466,6 +477,14 @@ const RtlNames* = [
   ("sameText", "SameText"), ("comparetext", "CompareText"),
   ("stringofchar", "StringOfChar"), ("ansipos", "Pos"),
   ("strtofloatdef", "StrToFloatDef"), ("even", "Even"),
+  # POSIX semaphore names from SyncObjs's LINUX branch; the Libc shim
+  # registers the Pascal-cased spellings (nimony forbids trailing
+  # underscore idents, so the raw spellings cannot survive)
+  ("sem_init", "semInit"), ("sem_wait", "semWait"),
+  ("sem_post", "semPost"), ("sem_getvalue", "semGetValue"),
+  ("sem_trywait", "semTryWait"),
+  # the 64-bit integer alias keeps its nimony spelling
+  ("int64", "int64"),
 ]
 
 proc rtlSpelling*(lowercaseName: string): string =

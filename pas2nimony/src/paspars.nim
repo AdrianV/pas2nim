@@ -69,10 +69,16 @@ type
     intfSigs*: Table[string, seq[Node]]  ## interface key -> base-method defs
     classVarHoist*: seq[Node]   ## class var decls hoisted to module level
     recordTypes*: Table[string, bool]  ## lowercase record type names
+    setTypes*: Table[string, bool]  ## lowercase set-alias type names
     arrayAliases*: Table[string, string] ## array alias -> element spelling
     arrayVarElems*: Table[string, string] ## array var -> element spelling
     pointerAliases*: Table[string, string] ## P = ^T alias -> element
     routineReturns*: Table[string, string] ## routine name -> return spelling
+    routineParams*: Table[string, seq[string]] ## routine name -> param spellings
+    routineParamDefaults*: Table[string, seq[Node]]
+    ## interface-declared default param values by `class.name:argc` -
+    ## the implementation redeclaration repeats them so nimony merges
+    ## the pair instead of seeing two distinct overloads
     curTypeParams*: seq[string]  ## params of the type being declared
     genericArgDepth*: int  ## > 0 while parsing `<...>` generic args
     withTemps*: seq[string]     ## hidden per-with temporaries by depth
@@ -80,6 +86,8 @@ type
     withDepth*: int             ## active with-scope count
     withCounter*: int           ## unique temp-name source
     methodPtrTypes*: Table[string, Node] ## method-ptr type name -> its formal params
+    procTyTypes*: Table[string, bool] ## plain proc-type aliases (Assigned lowers to != nil)
+    procVarTypes*: Table[string, bool] ## vars/fields of plain proc type
     methodPtrVars*: Table[string, Node] ## var/field/param/prop name -> its formal params
     thunkCounter*: int                 ## synthesized event-thunk serial
     absorbed*: UnitSet               ## shared unit-absorption cycle guard
@@ -489,6 +497,10 @@ proc scanNimExports(ln: string; s: var SymTab) =
             while v < t.len and t[v] in {' ', '\t'}: inc v
             while v < t.len and t[v] in {'a'..'z', 'A'..'Z', '0'..'9', '_'}:
               cty.add(t[v]); inc v
+          if cty.len > 0:
+            # the shim method rides the declaring class's registry so
+            # bare member calls inside methods self-qualify
+            s.addRoutine(cty, name)
           # parameter count (top-level `;`-separated params, shim
           # style) - a 0 entry enables the paren-less call rule
           var argc = 0
@@ -552,10 +564,12 @@ proc absorbNimModule(p: var TParser, modpath: string) =
   var cands: seq[string] = @[]
   let dir = parentDir(p.lex.filename)
   if dir.len > 0: cands.add(dir / modpath & ".nim")
-  # our own shim units: <pas2nimony>/runtime/ (bin -> pas2nimony)
+  # our own shim units: <pas2nimony>/runtime/ (bin -> pas2nimony);
+  # placeholder companions live in runtime/placeholders/
   let rtDir = parentDir(parentDir(getAppFilename()))
   if rtDir.len > 0:
     cands.add(rtDir / "runtime" / modpath & ".nim")
+    cands.add(rtDir / "runtime" / "placeholders" / modpath & ".nim")
   # the pinned toolchain checkout: <repo>/nimony/lib, anchored at the
   # compiler binary's location (pas2nimony/bin -> ../..)
   try:
@@ -713,7 +727,7 @@ proc parseUsesStmt*(p: var TParser): Node =
         result.add(newIdentNode("pasclasses", p.tok.info))
         absorbNimModule(p, "pasclasses")
         any = true
-      of "sysutils", "si_strings", "system", "windows":
+      of "sysutils", "si_strings", "system", "windows", "variants":
         # our runtime shim (systempas) provides the Delphi RTL helpers;
         # `windows` resolves there too for the handful of API procs the
         # shim implements (GetTickCount) - the rest fails loudly at
@@ -723,6 +737,11 @@ proc parseUsesStmt*(p: var TParser): Node =
       else:
         # own unit: absorb its declarations, then import the module
         absorbUnit(p, unitName)
+        if not p.unitFiles.hasKey(unitName.toLowerAscii):
+          # no Pascal source: a runtime/ or placeholder shim .nim may
+          # provide the unit (its exports seed routineArgs for the
+          # paren-less 0-arg call machinery)
+          absorbNimModule(p, unitName)
         # the import name must match the translated FILE name (Linux is
         # case-sensitive; Pascal unit/file casing may differ)
         let canonical = p.unitFiles.getOrDefault(unitName.toLowerAscii,
@@ -1125,14 +1144,38 @@ proc primary(p: var TParser): Node =
           if op.len > 0:
             result[0] = newIdentNode(op, result[0].info)
       # a 1-char Pascal literal passed to a callee is a string in
-      # almost every signature; char-arg procs keep the char
+      # almost every signature; char-arg procs keep the char. The
+      # callee's declared param types win over the default.
       if result.len > 1 and not (a.kind == nkIdent and
           a.strVal.toLowerAscii in ["stringofchar", "ord", "chr"]):
+        var argTypes: seq[string] = @[]
+        if a.kind == nkIdent:
+          argTypes = p.routineParams.getOrDefault(a.strVal.toLowerAscii)
+        elif a.kind == nkDotExpr and a[1].kind == nkIdent:
+          argTypes = p.routineParams.getOrDefault(a[1].strVal.toLowerAscii)
+          if argTypes.len == 0 and a[0].kind == nkIdent:
+            argTypes = p.routineParams.getOrDefault(
+              a[0].strVal.toLowerAscii & "." & a[1].strVal.toLowerAscii)
         for ai in 1 ..< result.len:
           if result[ai].kind == nkCharLit:
+            if ai - 1 < argTypes.len and
+                argTypes[ai - 1].toLowerAscii in ["char", "ansichar", "widechar"]:
+              continue
             let sd = newNode(nkStrLit, result[ai].info)
             sd.strVal = result[ai].strVal
             result[ai] = sd
+          elif result[ai].kind == nkCall and result[ai].len == 2 and
+              result[ai][0].kind == nkIdent and
+              result[ai][0].strVal.toLowerAscii == "ord" and
+              ai - 1 < argTypes.len and
+              argTypes[ai - 1].toLowerAscii in
+                  ["int8", "uint8", "int16", "uint16", "int32", "uint32"]:
+            # nimony's ord() types wide (int64 for a bool); a narrow
+            # declared param needs the width cast at the call boundary
+            let wc = newNode(nkCall, result[ai].info)
+            wc.add(newIdentNode(argTypes[ai - 1], result[ai].info))
+            wc.add(result[ai])
+            result[ai] = wc
       if a.kind == nkIdent and a.strVal in p.nestedProcs:
         # nested routines see `self` implicitly
         result.add(newIdentNode("self", a.info))
@@ -1408,6 +1451,21 @@ proc parseExprStmt*(p: var TParser): Node =
     getTokP(p)
     skipCom(p)
     let b = parseExpr(p)
+    # an empty `[]` assigned to a set-typed target is the empty SET
+    # (nimony's `[]` is an auto array literal that will not coerce);
+    # the renderer keeps plain empty `[]` for openArray call args
+    if b.kind == nkBracket and b.len == 0:
+      var lhs = a
+      if lhs.kind == nkDotExpr and lhs.len == 2:
+        lhs = lhs[1]
+      if lhs.kind == nkIdent:
+        let vt = p.varTypes.getOrDefault(lhs.strVal.toLowerAscii)
+        if vt == "set" or vt.startsWith("set:"):
+          result = newNode(nkAsgn, info)
+          result.add(a)
+          let curly = newNode(nkCurly, b.info)
+          result.add(curly)
+          return
     result = newNode(nkAsgn, info)
     result.add(a)
     result.add(b)
@@ -1628,7 +1686,11 @@ proc parseParamList*(p: var TParser): Node =
         if isVar:
           let vt = newNode(nkVarTy, p.tok.info)
           if lastType.kind != nkEmpty: vt.add(lastType)
-          else: vt.add(newIdentNode("untyped", p.tok.info))
+          else:
+            # Delphi `var X;` (untyped buffer param): nimony rejects
+            # untyped params outside macros, so a concrete stand-in
+            # keeps calls chaining (v1 divergence, see docs)
+            vt.add(newIdentNode("pointer", p.tok.info))
           d.add(vt)
         elif lastType.kind != nkEmpty:
           # Delphi value params are locally mutable; a method-pointer
@@ -1784,6 +1846,10 @@ proc parseVarSection*(p: var TParser): Node =
           if defs[i].kind == nkIdent:
             p.methodPtrVars[defs[i].strVal.toLowerAscii] =
               p.methodPtrTypes.getOrDefault(tyKey)
+      if p.procTyTypes.hasKey(tyKey):
+        for i in 0 ..< defs.len - 2:
+          if defs[i].kind == nkIdent:
+            p.procVarTypes[defs[i].strVal.toLowerAscii] = true
       if p.syms.isClass(tyKey):
         for i in 0 ..< defs.len - 2:
           if defs[i].kind == nkIdent:
@@ -2837,13 +2903,43 @@ proc parseTypeDef*(p: var TParser): Node =
       result.add(parseTypeDesc(p, nameNode))
     # `procedure of object` -> method-pointer record (evProc/evObj)
     if result.len == 3 and result[2].kind == nkProcTy and
-        result[2].len > 1 and result[2][1].kind == nkPragma:
+        result[2].len > 1 and result[2][1].kind == nkPragma and
+        result[2][1].len > 0 and result[2][1][0].kind == nkIdent and
+        result[2][1][0].strVal == "closure":
       result[2] = p.methodPtrRecord(result[0], result[2])
+    elif result.len == 3 and result[2].kind == nkProcTy:
+      # plain proc-type alias: Assigned(x) lowers to `x != nil`
+      p.procTyTypes[name.toLowerAscii] = true
   else:
     result.add(emptyNode(nameInfo))
   if p.tok.xkind == pxSemiColon:
     getTokP(p)
     skipCom(p)
+  # a calling convention after a proc-type alias: `TFoo = function
+  # (...): HRESULT; stdcall;` - stdcall/cdecl forward as pragmas on
+  # the proc type (nimony's proc pragma must match the callee's);
+  # register/pascal/safecall have no nimony model and are consumed
+  while p.tok.xkind == pxSymbol and p.tok.ident.toLowerAscii in
+      ["stdcall", "cdecl", "register", "pascal", "safecall"]:
+    let ccName = p.tok.ident.toLowerAscii
+    getTokP(p)
+    skipCom(p)
+    if ccName in ["stdcall", "cdecl"] and result.len == 3 and
+        result[2].kind == nkProcTy:
+      var pr = newNode(nkPragma, p.tok.info)
+      if result[2].len > 1 and result[2][1].kind == nkPragma:
+        pr = result[2][1]
+      pr.add(newIdentNode(ccName, p.tok.info))
+      if result[2].len > 1:
+        result[2][1] = pr
+      else:
+        result[2].add(pr)
+    if p.tok.xkind == pxSemiColon:
+      getTokP(p)
+      skipCom(p)
+  # a `set of X` alias is remembered for set-literal assignment
+  if result.len == 3 and result[2].kind == nkSetTy:
+    p.setTypes[name.toLowerAscii] = true
   # a `specialize` alias is a first-class class type
   if result.len == 3 and result[2].kind == nkIndexExpr:
     p.syms.registerSpecializedAlias(result[2][0].strVal, name)
@@ -3230,10 +3326,51 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
     skipCom(p)
     p.opt(pxSemiColon)          # `function Speak: string; virtual;`
     skipCom(p)
+  # interface defaults must repeat on the implementation redeclaration
+  # (constructors have an empty params[0]: the return rides the class
+  # registry, so this runs before the return-slot registration)
+  var pspD = 0
+  var pdef: seq[Node] = @[]
+  for piD in 1 ..< params.len:
+    let dD = params[piD]
+    if dD.kind == nkIdentDefs:
+      pspD = pspD + 1
+      pdef.add(dD[dD.len - 1])
+  if p.section != seInterface and p.classOfProc.len > 0 and pspD > 0:
+    # implementation header: splice the interface's defaults (Delphi
+    # defaults live on the interface header only; nimony treats a
+    # missing default as a distinct overload - ambiguous calls)
+    let dkey = p.classOfProc.toLowerAscii & "." & name.toLowerAscii & ":" & $pspD
+    let defs = p.routineParamDefaults.getOrDefault(dkey)
+    if defs.len > 0:
+      var pi2 = 1
+      var di = 0
+      while pi2 < params.len and di < defs.len:
+        let d2 = params[pi2]
+        if d2.kind == nkIdentDefs:
+          if d2[d2.len - 1].kind == nkEmpty and defs[di].kind != nkEmpty:
+            d2[d2.len - 1] = defs[di]
+          inc di
+        inc pi2
+  elif p.section == seInterface and p.classOfProc.len > 0 and pspD > 0:
+    p.routineParamDefaults[p.classOfProc.toLowerAscii & "." &
+                           name.toLowerAscii & ":" & $pspD] = pdef
   if params[0].kind == nkIdent:
     # the routine's return spelling for `with Call(...)` lowering
     let retSp = params[0].strVal
     p.routineReturns[name.toLowerAscii] = retSp
+    # the param spellings for char-arg call-site decisions
+    var psp: seq[string] = @[]
+    for pi in 1 ..< params.len:
+      let d = params[pi]
+      if d.kind == nkIdentDefs and d[d.len - 2].kind == nkIdent:
+        psp.add(d[d.len - 2].strVal)
+    if psp.len > 0:
+      p.routineParams[name.toLowerAscii] = psp
+      if p.classOfProc.len > 0:
+        p.routineParams[p.classOfProc.toLowerAscii & "." & name.toLowerAscii] = psp
+      if p.selfClass.len > 0:
+        p.routineParams[p.selfClass.toLowerAscii & "." & name.toLowerAscii] = psp
     if p.classOfProc.len > 0:
       p.routineReturns[p.classOfProc.toLowerAscii & "." &
                        name.toLowerAscii] = retSp
@@ -3247,9 +3384,16 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
     let retKey = params[0].strVal.toLowerAscii
     if p.recordTypes.hasKey(retKey):
       p.varTypes["result"] = "record:" & params[0].strVal
+    elif p.setTypes.hasKey(retKey):
+      p.varTypes["result"] = "set"
+    elif p.syms.isClass(retKey):
+      # a class return must reset the slot: the stale previous
+      # routine's width would cast the next body's result asgn
+      p.varTypes["result"] = "class:" & params[0].strVal
     else:
       let rtl = rtlSpelling(retKey)
       if rtl.len > 0: p.varTypes["result"] = rtl
+      else: p.varTypes["result"] = "unknown" 
   # Delphi conversion/unary class operators (Implicit/Explicit/Inc/
   # Dec) have no nimony operator symbol: lower to uniquely named
   # procs keyed by the signature, and register them for call-site
@@ -3713,11 +3857,16 @@ proc parseTry*(p: var TParser): Node =
       let vd = newNode(nkIdentDefs, info)
       vd.add(newIdentNode(varName, info))
       vd.add(excTy)
-      # the ErrorCode filter cannot prove the instance class: downcast
-      let instCast = newNode(nkCast, info)
+      # the ErrorCode filter cannot prove the instance class: the
+      # pasAs checked-cast (nil on mismatch - Delphi `as` semantics;
+      # nimony rejects a bare downcast between ref types)
+      let instCast = newNode(nkIndexExpr, info)
+      instCast.add(newIdentNode("pasAs", info))
       instCast.add(excTy)
-      instCast.add(newIdentNode("pasCurrentExc", info))
-      vd.add(instCast)
+      let instCall = newNode(nkCall, info)
+      instCall.add(instCast)
+      instCall.add(newIdentNode("pasCurrentExc", info))
+      vd.add(instCall)
       varDecl.add(vd)
       var body = handler
       if body.kind != nkStmtList:
@@ -3837,11 +3986,26 @@ proc parseFor*(p: var TParser): Node =
       parError(p, "to/downto expected in for loop, got " & $p.tok)
     skipCom(p)
     let b = parseExpr(p)
+    # nimony var params match exactly (no implicit widening): a
+    # non-literal bound of a wider integer type (len(...) is int64)
+    # must cast to the declared loop variable's width
+    let vt = p.varTypes.getOrDefault(forLoopVarName.toLowerAscii)
+    var bounds = @[a, b]
+    if vt in ["int8", "int16", "int32", "int64", "uint8", "uint16",
+              "uint32", "uint64"]:
+      for bi in 0 ..< bounds.len:
+        let bound = bounds[bi]
+        if bound.kind notin {nkIntLit, nkInt64Lit, nkCharLit} and
+            bound.kind != nkCast:
+          let cn = newNode(nkCast, bound.info)
+          cn.add(newIdentNode(vt, bound.info))
+          cn.add(bound)
+          bounds[bi] = cn
     let iter = newNode(nkCall, b.info)
     iter.add(newIdentNode(if down: "pforDownto" else: "pforTo", b.info))
     iter.add(newIdentNode(forLoopVarName, result[0].info))
-    iter.add(a)
-    iter.add(b)
+    iter.add(bounds[0])
+    iter.add(bounds[1])
     result.add(iter)
   elif p.tok.xkind == pxIn:
     # for x in items do
@@ -3915,6 +4079,16 @@ proc mapStringBuiltins*(p: var TParser, n: Node): Node =
   if n.kind != nkCall or n.len == 0: return n
   if n[0].kind != nkIdent: return n
   case n[0].strVal.toLowerAscii
+  of "length":
+    # Pascal Length() returns Integer (int32); nimony's len returns
+    # int64. Route through the int32-returning shim (a local variable
+    # named Len must not hijack the builtin's spelling)
+    if n.len == 2:
+      var lc = newNode(nkCall, n.info)
+      lc.add(newIdentNode("Len32", n.info))
+      lc.add(n[1])
+      return lc
+    return n
   of "assigned":
     # Assigned(ev) -> ev.evProc != nil for method pointers
     if n.len == 2:
@@ -3923,6 +4097,14 @@ proc mapStringBuiltins*(p: var TParser, n: Node): Node =
         var ne = newNode(nkInfix, n.info)
         ne.add(newIdentNode("!=", n.info))
         ne.add(newDotP(n[1], "evProc"))
+        ne.add(newNode(nkNilLit, n.info))
+        return ne
+      # plain proc vars: nimony has no assigned() builtin
+      if n[1].kind == nkIdent and
+          p.procVarTypes.hasKey(n[1].strVal.toLowerAscii):
+        var ne = newNode(nkInfix, n.info)
+        ne.add(newIdentNode("!=", n.info))
+        ne.add(n[1])
         ne.add(newNode(nkNilLit, n.info))
         return ne
     return n
@@ -4935,6 +5117,45 @@ proc parseStmt*(p: var TParser): Node =
           castN.add(newIdentNode(lhsTy, b.info))
           castN.add(b)
           result[1] = castN
+      # Delphi's literal cross-type assignments: `s := 'x'` (a char
+      # literal into a string target) and `c := ''` (empty into char)
+      if a.kind == nkIdent or (a.kind == nkDotExpr and a.len == 2):
+        var lhsKey = ""
+        var lhsTy2 = ""
+        if a.kind == nkIdent:
+          lhsTy2 = p.varTypes.getOrDefault(a.strVal.toLowerAscii)
+          if lhsTy2.len == 0 and p.selfClass.len > 0:
+            # a bare class-field target inside a method: the mapped
+            # field types are keyed by the declaring class
+            lhsTy2 = p.fieldTypes.getOrDefault(
+                p.selfClass.toLowerAscii & "." & a.strVal.toLowerAscii)
+            if lhsTy2.len == 0:
+              lhsTy2 = p.classFieldTypes.getOrDefault(
+                  p.selfClass.toLowerAscii & "." & a.strVal.toLowerAscii)
+        else:
+          if a[0].kind == nkIdent and a[1].kind == nkIdent:
+            lhsTy2 = p.fieldTypes.getOrDefault(
+                a[0].strVal.toLowerAscii & "." & a[1].strVal.toLowerAscii)
+            if lhsTy2.len == 0:
+              lhsTy2 = p.classFieldTypes.getOrDefault(
+                  a[0].strVal.toLowerAscii & "." & a[1].strVal.toLowerAscii)
+        if lhsTy2.len == 0 and a.kind == nkIdent:
+          lhsTy2 = p.varTypes.getOrDefault(a.strVal.toLowerAscii)
+        let l2 = lhsTy2.toLowerAscii
+        if b.kind == nkCharLit and l2 == "string":
+          let cat = newNode(nkInfix, b.info)
+          cat.add(newIdentNode("&", b.info))
+          cat.add(newNode(nkStrLit, b.info))
+          cat.add(b)
+          result[1] = cat
+        elif b.kind == nkStrLit and b.strVal.len == 0 and
+            l2 in ["char", "ansichar", "widechar"]:
+          let cc = newNode(nkCast, b.info)
+          cc.add(newIdentNode("char", b.info))
+          let zero = newNode(nkIntLit, b.info)
+          zero.strVal = "0"
+          cc.add(zero)
+          result[1] = cc
       p.opt(pxSemiColon)
     elif a.kind == nkIdent and a.strVal.toLowerAscii == "exit":
       # bare `Exit;` statement
@@ -4982,6 +5203,12 @@ proc parseStmt*(p: var TParser): Node =
         elif callee.len > 0:
           retFlag = p.syms.returnsValue.getOrDefault(callee.toLowerAscii,
               false)
+        if callee.len > 0 and not retFlag:
+          # the RTL spelling map may have renamed the callee
+          # (sem_wait -> semInit-style shim spellings); the shim's
+          # returnsValue entry uses the mapped spelling
+          retFlag = p.syms.returnsValue.getOrDefault(
+              p.syms.canonical(callee).toLowerAscii, false)
 
         if callee.len > 0 and retFlag and
             callee.toLowerAscii != "inttostr":
@@ -5109,6 +5336,20 @@ proc selfQualifyInPlace(p: var TParser, n: Node,
     var qualCallee = not n.noQualCallee
     if n.len >= 1 and qualCallee:
       n[0] = selfQualifyInPlace(p, n[0], scope)
+      # an unqualified constructor call inside a method binds the
+      # implicit self as the first argument (Delphi semantics:
+      # `Create(attrs, ...)` in a ctor body calls TEvent.Create(6))
+      if n[0].kind == nkIdent and p.qualClass.len > 0 and
+          isCtorName(p, p.qualClass, n[0].strVal):
+        var nc = newNode(nkCall, n.info)
+        nc.noQualCallee = n.noQualCallee
+        nc.add(n[0])
+        nc.add(newIdentNode("self", n.info))
+        for i in 1 ..< n.len:
+          nc.add(n[i])
+        for i in 2 ..< nc.len:
+          nc[i] = selfQualifyInPlace(p, nc[i], scope)
+        return nc
     for i in 1 ..< n.len:
       n[i] = selfQualifyInPlace(p, n[i], scope)
     return n
