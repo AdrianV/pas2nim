@@ -958,6 +958,11 @@ proc identOrLiteral(p: var TParser): Node =
     if not declDirective(p): break
     skipCom(p)
   case p.tok.xkind
+  of pxOperator:
+    # a keyword-escaped parameter name used in an expression
+    # (`case Operator of` on `const Operator: TVarOp`)
+    result = newIdentNode(p.tok.ident, p.tok.info)
+    getTokP(p)
   of pxSymbol:
     result = newIdentNode(p.tok.ident, p.tok.info)
     getTokP(p)
@@ -4705,6 +4710,13 @@ proc parseStmt*(p: var TParser): Node =
       # stash the instance in the current-exception slot, then raise
       # the mapped ErrorCode (nimony raise only transports ErrorCode)
       let e = parseExpr(p)
+      if p.tok.xkind == pxSymbol and p.tok.ident.toLowerAscii == "at":
+        # `raise E at ErrorAddr;` - the raise location; v1 keeps the
+        # plain raise and consumes the qualifier
+        getTokP(p)
+        skipCom(p)
+        discard parseExpr(p)
+        skipCom(p)
       var code = ""
       if e.kind == nkCall and e.len >= 1 and e[0].kind == nkDotExpr and
           e[0][1].kind == nkIdent and
