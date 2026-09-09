@@ -1852,6 +1852,13 @@ proc parseInterfaceType(p: var TParser, definition: Node): Node =
   var ci = p.syms.classes.getOrDefault(defName.toLowerAscii)
   ci.isInterface = true
   p.syms.classes[defName.toLowerAscii] = ci
+  if p.tok.xkind == pxSemiColon:
+    # forward declaration `IProvider = interface;` - no body follows
+    getTokP(p)
+    skipCom(p)
+    result = newNodeP(nkCommentStmt, p)
+    result.strVal = "# interface forward: " & definition.strVal
+    return result
   # body: bodiless method declarations (COM plumbing skipped below)
   while p.tok.xkind != pxEnd and p.tok.xkind != pxEof:
     if p.tok.xkind == pxComment:
@@ -2143,7 +2150,17 @@ proc parseTypeDesc*(p: var TParser, definition: Node): Node =
     getTokP(p)
     result = parseTypeDesc(p, emptyNode(p.tok.info))
   else:
-    if p.tok.xkind == pxSymbol and p.tok.ident.toLowerAscii == "reference" and
+    if p.tok.xkind == pxSymbol and p.tok.ident.toLowerAscii == "dispinterface":
+      # `X = dispinterface;` (forward) or a full body: a COM dual
+      # automation interface - v1 has no lowering, skip it
+      getTokP(p)
+      skipCom(p)
+      p.opt(pxSemiColon)
+      result = newNodeP(nkCommentStmt, p)
+      result.strVal = "# dispinterface: " & definition.strVal & " (v1 skip)"
+      p.context = oldcontext
+      return
+    elif p.tok.xkind == pxSymbol and p.tok.ident.toLowerAscii == "reference" and
         p.peekTok().xkind == pxTo:
       # `reference to procedure(...)`: a plain nimony proc type; the
       # closure state lives in nimony's anonymous-proc machinery
@@ -2460,6 +2477,13 @@ proc parseProperty*(p: var TParser): Node =
       skipCom(p)
     p.eat(pxBracketRi)
     decl.params = params
+  # a bare `property Name;` re-exposes the ancestor's property: no
+  # type clause follows (ZLib's `property OnProgress;`)
+  if p.tok.xkind == pxSemiColon:
+    getTokP(p)
+    skipCom(p)
+    result.strVal = "# property re-exposed: " & propName
+    return
   p.eat(pxColon)
   skipCom(p)
   decl.typ = parseTypeDesc(p, emptyNode(p.tok.info))
@@ -2504,6 +2528,14 @@ proc parseProperty*(p: var TParser): Node =
           decl.isDefault = true
       elif word == "nodefault":
         getTokP(p)
+      elif word == "readonly" or word == "writeonly":
+        # COM automation access specifiers (StdVCL): v1 no-op
+        getTokP(p)
+      elif word == "dispid":
+        # `dispid N` tail: consume the integer
+        getTokP(p)
+        if p.tok.xkind in {pxIntLit, pxMinus, pxPlus}:
+          getTokP(p)
       else:
         parError(p, "unexpected token in property: " & p.tok.ident)
     else:
@@ -2819,6 +2851,13 @@ proc parseRoutineSpecifiers*(p: var TParser, noBody: var bool,
   sawReintroduce = false
   result = newNodeP(nkPragma, p)
   while true:
+    if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
+      # `function F(...): T; {$IFDEF} external; {$ENDIF}` - the
+      # conditional may wrap the specifiers; dead branches skip at
+      # the token level, live ones flow back into the loop
+      if not declDirective(p):
+        break
+      continue
     if p.tok.xkind != pxSymbol and p.tok.xkind != pxInline:
       # calling convention directives come as commands (e.g. {$X+}) - skip
       break
@@ -4536,7 +4575,7 @@ proc parseStmt*(p: var TParser): Node =
   of pxRaise:
     getTokP(p)
     skipCom(p)
-    if p.tok.xkind != pxSemiColon:
+    if p.tok.xkind notin {pxSemiColon, pxEnd, pxFinally, pxElse, pxEof}:
       # `raise SomeExc.Create(args)` / `raise excInstance`:
       # stash the instance in the current-exception slot, then raise
       # the mapped ErrorCode (nimony raise only transports ErrorCode)

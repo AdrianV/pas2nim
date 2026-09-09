@@ -77,6 +77,10 @@ type
 
   TLexer* = object of BaseLexer
     filename*: string
+    pendingDirRi*: int ## 1 = old-style `*)`, 2 = curly `}`: the
+                       ## opener token was returned with its quoted
+                       ## body already skipped; the next getTok emits
+                       ## just the end marker
 
 proc getTok*(L: var TLexer, tok: var TToken)
 
@@ -291,6 +295,28 @@ proc handleCRLF(L: var TLexer, pos: int): int =
   of '\l': result = lexbase.handleLF(L, pos)
   else: result = pos
 
+proc opaqueDirectiveBody(L: var TLexer, tok: var TToken, closeCurly: bool) =
+  ## the directive body continues with a quoted literal (`{$HPPEMIT
+  ## 'don''t'}`): lex it as raw text up to the end marker - Pascal
+  ## string tokenization would end the literal at the first interior
+  ## quote and then see an unterminated string. The opener token is
+  ## still delivered; the end marker waits in `pendingDirRi`.
+  while L.bufpos < L.buf.len:
+    if closeCurly:
+      if L.buf[L.bufpos] == '}': break
+    else:
+      # old-style: the body may itself contain `*`; only `*)` closes
+      if L.buf[L.bufpos] == '*' and L.bufpos + 1 < L.buf.len and
+          L.buf[L.bufpos + 1] == ')': break
+    inc(L.bufpos)
+  if not closeCurly and L.buf[L.bufpos] == '*' and
+      L.bufpos + 1 < L.buf.len and L.buf[L.bufpos + 1] == ')':
+    inc(L.bufpos, 2)
+    L.pendingDirRi = 1
+  elif closeCurly and L.buf[L.bufpos] == '}':
+    inc(L.bufpos)
+    L.pendingDirRi = 2
+
 proc getString(L: var TLexer, tok: var TToken) =
   var xi: int
   var pos = L.bufpos
@@ -448,6 +474,18 @@ proc skip(L: var TLexer, tok: var TToken) =
   L.bufpos = pos
 
 proc getTok*(L: var TLexer, tok: var TToken) =
+  if L.pendingDirRi != 0:
+    let kind = if L.pendingDirRi == 1: pxStarDirRi else: pxCurlyDirRi
+    L.pendingDirRi = 0
+    tok.xkind = pxInvalid
+    tok.iNumber = 0
+    tok.fNumber = 0.0
+    tok.literal = ""
+    tok.ident = ""
+    tok.base = base10
+    tok.xkind = kind
+    tok.info = curInfo(L)
+    return
   tok.xkind = pxInvalid
   tok.iNumber = 0
   tok.fNumber = 0.0
@@ -483,6 +521,9 @@ proc getTok*(L: var TLexer, tok: var TToken) =
           skip(L, tok)
           getSymbol(L, tok)
           tok.xkind = pxStarDirLe
+          while L.buf[L.bufpos] == ' ': inc(L.bufpos)
+          if L.buf[L.bufpos] in {'\'', '#'}:
+            opaqueDirectiveBody(L, tok, closeCurly = false)
         else:
           inc(L.bufpos)
           scanStarComment(L, tok)
@@ -519,6 +560,10 @@ proc getTok*(L: var TLexer, tok: var TToken) =
         skip(L, tok)
         getSymbol(L, tok)
         tok.xkind = pxCurlyDirLe
+        # quoted directive body: opaque to the end marker
+        while L.buf[L.bufpos] == ' ': inc(L.bufpos)
+        if L.buf[L.bufpos] in {'\'', '#'}:
+          opaqueDirectiveBody(L, tok, closeCurly = true)
       of '&':
         inc(L.bufpos)
         tok.xkind = pxAmp
