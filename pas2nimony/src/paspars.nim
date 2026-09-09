@@ -4416,11 +4416,12 @@ proc parseWith(p: var TParser): Node =
   var pushed = 0
   while true:
     let e = parseExpr(p)
-    let cls = p.withExprClass(e)
+    var cls = p.withExprClass(e)
     if cls.len == 0:
-      parError(p, "cannot determine the class of a with expression; " &
-        "assign it to a variable first (v1 supports class-typed " &
-        "variables, self and constructor calls)")
+      # unresolvable class (a call on a unit-level variable of an
+      # un-absorbed unit): lower to a hidden temp with an inferred
+      # type; the body's members stay unqualified (v1)
+      cls = "" 
     inc p.withCounter
     let temp = "pasW" & $p.withCounter
     let info = p.tok.info
@@ -4440,11 +4441,15 @@ proc parseWith(p: var TParser): Node =
         qualifier = temp
         isRecord = false
     if not isRecord:
-      # class (or fallback) withs bind a hidden temp var
+      # class (or fallback) withs bind a hidden temp var; an unknown
+      # class emits no type node so the type is inferred
       let vd = newNode(nkVarSection, info)
       let d = newNode(nkIdentDefs, info)
       d.add(newIdentNode(temp, info))
-      d.add(newIdentNode(cls, info))
+      if cls.len > 0:
+        d.add(newIdentNode(cls, info))
+      else:
+        d.add(emptyNode(info))
       d.add(e)
       vd.add(d)
       result.add(vd)
