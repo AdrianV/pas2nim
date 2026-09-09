@@ -281,6 +281,24 @@ if [ -x "$ROOT/bin/pasler" ] && [ -f "$HERE/happy.pas" ]; then
   fi
 fi
 
+# ---- shlshr.pas: real-world sample (shift/div semantics, widths,
+# Format, GetTickCount timing) - expected output verified against
+# FPC 3.2.2 (-Mdelphi); the timing line is filtered
+if [ -x "$ROOT/bin/pasler" ] && [ -f "$HERE/shlshr.pas" ]; then
+  echo "== pasler-shlshr"
+  mkdir -p "$TMP/pasler-shlshr"
+  cp "$HERE/shlshr.pas" "$TMP/pasler-shlshr/"
+  timeout 300 bash -c "cd '$TMP/pasler-shlshr' &&
+      '$ROOT/bin/pasler' --nimony:'$NIMONY' --run shlshr.pas 2>&1 |
+      grep -v nifmake | grep -v 'time = ' > shlshr.out" || true
+  if diff -q "$HERE/shlshr.expected" "$TMP/pasler-shlshr/shlshr.out" \
+      > /dev/null 2>&1; then
+    echo "-- ok"
+  else
+    echo "   SHLSHR OUTPUT MISMATCH"; fail=1
+  fi
+fi
+
 # M5 oracle: differential testing against real FPC (skips without fpc)
 if ! sh "$HERE/oracle.sh"; then
   echo "   ORACLE FAILED"; fail=1

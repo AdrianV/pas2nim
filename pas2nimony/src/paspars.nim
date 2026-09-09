@@ -624,8 +624,11 @@ proc parseUsesStmt*(p: var TParser): Node =
         result.add(newIdentNode("pasclasses", p.tok.info))
         absorbNimModule(p, "pasclasses")
         any = true
-      of "sysutils", "si_strings", "system":
-        # our runtime shim (systempas) provides the Delphi RTL helpers
+      of "sysutils", "si_strings", "system", "windows":
+        # our runtime shim (systempas) provides the Delphi RTL helpers;
+        # `windows` resolves there too for the handful of API procs the
+        # shim implements (GetTickCount) - the rest fails loudly at
+        # semcheck, which is honest for a Linux front-end
         result.add(newIdentNode("systempas", p.tok.info))
         any = true
       else:
@@ -1157,18 +1160,42 @@ proc lowestExprAux(p: var TParser, v: var Node, limit: int): TTokKind =
     of pxNeq:
       opNode.strVal = "!="
     of pxShr:
-      # FPC's shr is LOGICAL (zero fill); nimony's is arithmetic -
-      # route through the shim so negative left operands match
-      node.kind = nkCall
-      node.sons = @[]
-      node.add(newIdentNode("delphiShr", node.info))
-      node.add(v)
-      node.add(emptyNode(node.info))
+      # FPC/Delphi shr is LOGICAL (zero fill) in the operand's own
+      # width; nimony's shr is arithmetic - shift the unsigned twin at
+      # the declared width, then restore the Pascal result type. The
+      # delphiShr shim remains the fallback for untyped operands.
       skipCom(p)
       var v2s = emptyNode(p.tok.info)
       discard lowestExprAux(p, v2s, opPred)
-      node[2] = v2s
-      v = node
+      let lhsTy = rhsExprType(p, v)
+      if lhsTy in ["int8", "uint8", "int16", "uint16", "int32",
+                   "uint32", "int64", "uint64"]:
+        let uw = if lhsTy.startsWith("u"): lhsTy
+                 else: "u" & lhsTy
+        let inner = newNode(nkInfix, node.info)
+        inner.add(newIdentNode("shr", node.info))
+        let cv = newNode(nkCall, node.info)
+        cv.add(newIdentNode(uw, node.info))
+        cv.add(v)
+        let cw = newNode(nkCall, v2s.info)
+        cw.add(newIdentNode(uw, v2s.info))
+        cw.add(v2s)
+        inner.add(cv)
+        inner.add(cw)
+        if lhsTy == uw:
+          v = inner
+        else:
+          let outer = newNode(nkCall, node.info)
+          outer.add(newIdentNode(lhsTy, node.info))
+          outer.add(inner)
+          v = outer
+      else:
+        node.kind = nkCall
+        node.sons = @[]
+        node.add(newIdentNode("delphiShr", node.info))
+        node.add(v)
+        node.add(v2s)
+        v = node
       op = p.tok.xkind
       opPred = getPrecedence(op)
       continue
@@ -2513,10 +2540,11 @@ proc parseRoutineSpecifiers*(p: var TParser, noBody: var bool,
   ## parses `virtual; override; overload; forward; static; inline;` etc.
   result = newNodeP(nkPragma, p)
   while true:
-    if p.tok.xkind != pxSymbol:
+    if p.tok.xkind != pxSymbol and p.tok.xkind != pxInline:
       # calling convention directives come as commands (e.g. {$X+}) - skip
       break
-    let word = p.tok.ident.toLowerAscii
+    let word = if p.tok.xkind == pxInline: "inline"
+               else: p.tok.ident.toLowerAscii
     case word
     of "virtual":
       isVirtual = true
@@ -2548,6 +2576,16 @@ proc parseRoutineSpecifiers*(p: var TParser, noBody: var bool,
     p.opt(pxSemiColon)
     skipCom(p)
 
+proc skipAsmBlock(p: var TParser) =
+  ## Delphi `asm ... end;` - the body is free-form assembler; v1 has
+  ## no backend for it, so the block is skipped at the token level
+  getTokP(p)                    # `asm`
+  while p.tok.xkind != pxEnd and p.tok.xkind != pxEof:
+    getTokP(p)
+  p.eat(pxEnd)
+  p.opt(pxSemiColon)
+  skipCom(p)
+
 proc parseRoutineBody(p: var TParser, result: Node) =
   ## local decls + begin/end of a routine with a body
   var stmts = newNodeP(nkStmtList, p)
@@ -2574,6 +2612,11 @@ proc parseRoutineBody(p: var TParser, result: Node) =
     of pxComment:
       skipCom(p)
     of pxBegin:
+      break
+    of pxAsm:
+      # `function F(...): T; asm ... end;` - no begin; the body is
+      # skipped and left empty (nimony gets the discard-safe empty list)
+      skipAsmBlock(p)
       break
     of pxProcedure, pxFunction:
       let savedLabels = p.curLabels
@@ -3061,7 +3104,12 @@ proc parseTry*(p: var TParser): Node =
   skipCom(p)
   let body = newNodeP(nkStmtList, p)
   while not (p.tok.xkind in {pxFinally, pxExcept, pxEof, pxEnd}):
-    body.add(parseStmt(p))
+    # a compound-statement body (for/begin..end) leaves its trailing
+    # `;` unconsumed - eat it between statements
+    let s = parseStmt(p)
+    if s.kind != nkEmpty: body.add(s)
+    p.opt(pxSemiColon)
+    skipCom(p)
   result.add(body)
   if p.tok.xkind == pxExcept:
     getTokP(p)
@@ -4021,8 +4069,10 @@ proc parseStmt*(p: var TParser): Node =
       result = emptyNode(p.tok.info)
     p.opt(pxSemiColon)
   of pxAsm:
-    parError(p, "`asm` blocks are not supported by pas2nimony")
-    result = emptyNode(p.tok.info)
+    # inline assembler has no v1 backend: skip the block, keep parsing
+    skipAsmBlock(p)
+    result = newNode(nkCommentStmt, p.tok.info)
+    result.strVal = "# asm skipped"
   of pxLabel:
     # module level: labels of the program main body
     parseLabelSection(p)
@@ -4166,7 +4216,9 @@ proc parseStmt*(p: var TParser): Node =
           c.add(newIdentNode(opName, b.info))
           c.add(b)
           result[1] = c
-      if a.kind == nkIdent and b.kind in {nkInfix, nkCall}:
+      if a.kind == nkIdent and b.kind in {nkInfix, nkCall, nkPrefix}:
+        # (nkPrefix: a negative literal like `-512` types as int in
+        # nimony - an int32 target needs the width cast too)
         # Pascal computes Integer arithmetic in the declared width;
         # nimony types pure-literal arithmetic as int (64), so
         # `x = 21 * 2` on an int32 x needs an explicit cast

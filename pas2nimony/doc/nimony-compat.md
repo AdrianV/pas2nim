@@ -654,3 +654,49 @@ Three language gaps closed while compiling a real 45-line program
 The run is byte-identical to FPC on the deterministic line:
 `Found 4816030 tickets.` (the msec timing is wall-clock, not
 comparable). Suite section `pasler-happy` guards the count.
+
+## M6-5: real-world sample TestSHL_SHR (derived)
+
+Adrian's own Delphi shift-semantics investigation program (102
+lines: shl/shr vs div, int8/16/32 width functions, Format,
+GetTickCount benchmark). The derived sample drops the two inline
+x86 `asm` bodies (no v1 backend; the block skipper keeps other
+programs parsing) and the blocking `Read`. The run is identical to
+FPC 3.2.2 on all 128 deterministic lines (`time =` filtered);
+FPC on Linux needs a 5-line `windows.pas` stub unit for the
+comparison (`uses SysUtils, Windows` is kept as the real-world
+shape).
+
+Gaps closed:
+
+- **`inline;` routine directive**: lexes as its own `pxInline`
+  token, which `parseRoutineSpecifiers` never accepted (it looked
+  for `pxSymbol` words only). The directive is accepted and
+  ignored (nimony's default call convention is nimcall anyway).
+- **`asm ... end;` blocks**: skipped at the token level - as a
+  routine body (no `begin`) or as a statement - with an "# asm
+  skipped" comment in the output. The body's assembler semantics
+  are a documented non-goal for v1.
+- **`Windows.GetTickCount`**: `uses Windows` resolves to
+  systempas (like SysUtils); the shim computes epoch milliseconds
+  (divergence: no boot-time origin, no 49.7-day wrap - programs
+  use deltas).
+- **`E.Classname`**: exception shim method returning
+  "Exception" (the shim keeps one canonical runtime type -
+  subclasses do not report their own name).
+- **Negative-literal width casts**: `A := -512` on an int32 now
+  casts (`-512` types as int64 in nimony); nkPrefix joined the
+  width-cast set.
+- **Width-correct shr**: the old delphiShr shim shifted in 64-bit
+  width, so `int32(-512) shr 1` truncated wrong (-256 instead of
+  FPC's 2147483392). The parser now emits the unsigned twin at the
+  operand's declared width (`int32(uint32(a) shr uint32(b))`),
+  falling back to the shim only for untyped operands.
+- **toVrec overloads** for the small integer widths (the Format
+  array-of-const slots rejected uint32 subtractions).
+- **try-body statement separators**: a compound statement
+  (for/begin..end) leaves its `;` unconsumed; the try body loop
+  now eats it between statements.
+
+Suite section `pasler-shlshr` diffs the 128-line FPC-verified
+expected output (timing line filtered).

@@ -13,8 +13,15 @@
 #    callable raising routines impossible, so error handling is lossy
 #    (StrToInt etc. return a fallback instead of raising)
 
-import std/[strutils, syncio]
+import std/[strutils, syncio, times]
 import pasdatetime
+
+proc GetTickCount*(): uint32 =
+  ## Delphi Windows.GetTickCount - milliseconds since boot. Shimmed
+  ## over the epoch clock (documented divergence: no boot-time origin,
+  ## no 49.7-day wrap); translated programs use deltas.
+  let t = getTime()
+  result = uint32(t.seconds * 1000'i64 + int64(t.nanosecond) div 1_000_000)
 export pasdatetime
 
 # ---------------------------------------------------------------------------
@@ -392,6 +399,11 @@ type
 
 proc toVrec*(x: int64): TVarRec = TVarRec(k: vrInt, i: x)
 proc toVrec*(x: int32): TVarRec = TVarRec(k: vrInt, i: int64(x))
+proc toVrec*(x: int8): TVarRec = TVarRec(k: vrInt, i: int64(x))
+proc toVrec*(x: int16): TVarRec = TVarRec(k: vrInt, i: int64(x))
+proc toVrec*(x: uint8): TVarRec = TVarRec(k: vrInt, i: int64(x))
+proc toVrec*(x: uint16): TVarRec = TVarRec(k: vrInt, i: int64(x))
+proc toVrec*(x: uint32): TVarRec = TVarRec(k: vrInt, i: int64(x))
 proc toVrec*(x: float64): TVarRec = TVarRec(k: vrFloat, f: x)
 proc toVrec*(x: float32): TVarRec = TVarRec(k: vrFloat, f: float64(x))
 proc toVrec*(x: char): TVarRec = TVarRec(k: vrChar, c: x)
@@ -450,6 +462,12 @@ proc pasExcCreate*(self: PasException; msg: string): PasException =
   ## Delphi Exception.Create: stash the message, return the instance
   self.Message = msg
   result = self
+
+proc Classname*(self: PasException): string =
+  ## Delphi TObject.ClassName (a class function). The exception shim
+  ## keeps one canonical runtime type, so the spelling is a constant -
+  ## documented divergence: subclasses do not report their own name.
+  result = "Exception"
 
 # ---------------------------------------------------------------------------
 # SysUtils core (M3-2): conversions, string helpers, path functions,
