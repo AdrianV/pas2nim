@@ -945,3 +945,11 @@ same round (corpus health: 17 of 41 units translate):
   separators, and expression positions
   (`x = {$IFDEF}#10{$ELSE}#13{$ENDIF}`). Corpus 36->**39/39 - the
   private sweep is complete**.
+
+## M9d: raise-at, operator identifiers; pristine census complete
+
+- `raise E at ErrorAddr;` keeps the plain raise and consumes the
+  location qualifier (v1 has no raise-location lowering).
+- Keyword-escaped parameter names work in expression position too
+  (`case Operator of` on `const Operator: TVarOp`).
+- **The whole pristine rtl/common directory (28 units) translates.**
