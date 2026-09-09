@@ -1462,7 +1462,8 @@ proc parseRecordCase*(p: var TParser): Node =
   result.add(disc)
   p.eat(pxOf)
   skipCom(p)
-  while p.tok.xkind != pxEnd and p.tok.xkind != pxEof:
+  while p.tok.xkind != pxEnd and p.tok.xkind != pxParRi and
+      p.tok.xkind != pxEof:
     var branch: Node
     if p.tok.xkind == pxElse:
       branch = newNodeP(nkElse, p)
@@ -1481,6 +1482,13 @@ proc parseRecordCase*(p: var TParser): Node =
       getTokP(p)
       let body = newNode(nkRecList, p.tok.info)
       while p.tok.xkind != pxParRi and p.tok.xkind != pxEof:
+        if p.tok.xkind == pxCase:
+          # a nested variant case inside the branch body
+          let nested = parseRecordCase(p)
+          for s in nested.sons: body.add(s)
+          p.opt(pxSemiColon)
+          skipCom(p)
+          continue
         let defs = parseIdentColonEquals(p, false)
         body.add(defs)
         p.opt(pxSemiColon)
@@ -2331,16 +2339,13 @@ proc parseRecordOrObject*(p: var TParser, kind: NodeKind,
         interfaces.add(itfTy.strVal)
     let ofInh = newNode(nkOfInherit, parentTy.info)
     if interfaces.len > 0:
-      # v1: exactly one interface; TInterfacedObject counts as empty
-      # plumbing and dissolves into the interface's generated class
-      if interfaces.len > 1:
-        parError(p, "multiple interfaces on one class not supported (v1)")
+      # v1: the implements list is plumbing - the class body declares
+      # the interface methods itself, so the lowering keeps exactly
+      # the parent type. TInterfacedObject dissolves into the first
+      # interface's generated class (the parentless-interface case).
       if parent.toLowerAscii == "tinterfacedobject" or parent.len == 0:
         parent = interfaces[0]
-        ofInh.add(newIdentNode(parent, parentTy.info))
-      else:
-        parError(p, "a class with a real parent cannot implement an " &
-            "interface yet (v1)")
+      ofInh.add(newIdentNode(parent, parentTy.info))
     else:
       ofInh.add(parentTy)
     record.add(ofInh)
