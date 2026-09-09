@@ -73,6 +73,9 @@ type
     ## conversion operator registry: key
     ## "conv:<cls>:<kind>:<from>:<to>" -> the lowered proc name
     ## (Delphi class operator Implicit/Explicit/Inc/Dec)
+    routineArgs*: Table[string, int]
+    ## parameter counts of known routines (lowercase name); a 0-arg
+    ## entry enables Delphi's paren-less call in expression position
     defines*: Table[string, bool]
     ## conditional-compilation symbols: CLI -d: defines seed it and
     ## {$define}/{$undef} mutate it; {$ifdef}/{$ifndef} evaluate at

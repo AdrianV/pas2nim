@@ -471,6 +471,26 @@ proc scanNimExports(ln: string; s: var SymTab) =
             while v < t.len and t[v] in {' ', '\t'}: inc v
             while v < t.len and t[v] in {'a'..'z', 'A'..'Z', '0'..'9', '_'}:
               cty.add(t[v]); inc v
+          # parameter count (top-level `;`-separated params, shim
+          # style) - a 0 entry enables the paren-less call rule
+          var argc = 0
+          var pdepth = 0
+          var sawParam = false
+          var pq = i
+          while pq < t.len:
+            if t[pq] == '(':
+              inc pdepth
+            elif t[pq] == ')':
+              dec pdepth
+              if pdepth == 0: break
+            elif pdepth == 1:
+              if t[pq] == ';':
+                inc argc
+              elif t[pq] notin {' ', '\t'} and not sawParam:
+                sawParam = true
+            inc pq
+          if sawParam: inc argc
+          s.routineArgs[name.toLowerAscii] = argc
           # value-returning? walk the param list's parens; a `: Type`
           # after the depth-0 close means the routine returns a value
           # (needed for the statement-position discard wrapper)
@@ -997,7 +1017,16 @@ proc primary(p: var TParser): Node =
     of pxDot:
       let a = result
       result = newNode(nkDotExpr, a.info)
-      result.add(a)
+      # a unit-qualified name (`DateUtils.Now`) must spell the module
+      # the way the uses clause imported it
+      if a.kind == nkIdent:
+        let mapped = p.unitModuleSpelling(a.strVal)
+        if mapped == a.strVal:
+          result.add(a)
+        else:
+          result.add(newIdentNode(mapped, a.info))
+      else:
+        result.add(a)
       getTokP(p)               # skip '.'
       skipCom(p)
       if p.tok.xkind == pxSymbol:
@@ -1021,6 +1050,88 @@ proc primary(p: var TParser): Node =
     of pxBracketLe:
       result = bracketExprList(p, result)
     else: break
+  # Delphi calls parameterless functions without parentheses in
+  # expression position (`d1 := Now`); a known 0-arg routine that was
+  # not followed by `(` or a procedural context becomes a call. A
+  # variable of the same name shadows the routine (locals resolve
+  # first in Delphi).
+  if result.kind == nkIdent or (result.kind == nkDotExpr and
+      result.len == 2 and result[1].kind == nkIdent):
+    var callee = ""
+    if result.kind == nkIdent:
+      callee = result.strVal
+    else:
+      callee = result[1].strVal
+    if callee.len > 0 and
+        p.syms.routineArgs.getOrDefault(callee.toLowerAscii, -1) == 0 and
+        not p.varTypes.hasKey(callee.toLowerAscii):
+      let c = newNode(nkCall, result.info)
+      c.add(result)
+      result = c
+
+proc inSetLiteralElems(n: Node): bool =
+  ## every element of the set constructor is an ordinal literal or a
+  ## range over ordinal literals
+  result = true
+  for s in n.sons:
+    case s.kind
+    of nkIntLit, nkCharLit: discard
+    of nkPrefix:
+      result = result and s.len == 2 and s[1].kind in {nkIntLit, nkCharLit}
+    of nkRange:
+      for r in s.sons:
+        if r.kind notin {nkIntLit, nkCharLit} and
+            not (r.kind == nkPrefix and r.len == 2 and
+                r[1].kind in {nkIntLit, nkCharLit}):
+          return false
+    else: return false
+
+proc buildInComparisons(p: var TParser, x, setN: Node): Node =
+  ## `x in [a..b, c, ...]` with an all-literal set lowers to a
+  ## comparison chain - avoids nimony's set typing (a set over int
+  ## literals would be set[int] and int is too wide for a set element)
+  result = emptyNode(setN.info)
+  if setN.len == 0:
+    result = newIdentNode("false", setN.info)
+    return
+  var acc = emptyNode(setN.info)
+  for s in setN.sons:
+    var one = emptyNode(s.info)
+    if s.kind == nkRange:
+      one = newNodeP(nkInfix, p)
+      let ge = newNodeP(nkInfix, p)
+      ge.add(newIdentNode(">=", s.info))
+      ge.add(x)
+      ge.add(s[0])
+      let le = newNodeP(nkInfix, p)
+      le.add(newIdentNode("<=", s.info))
+      le.add(x)
+      le.add(s[1])
+      let pg = newNode(nkPar, s.info)
+      pg.add(ge)
+      let pl = newNode(nkPar, s.info)
+      pl.add(le)
+      one.add(newIdentNode("and", s.info))
+      one.add(pg)
+      one.add(pl)
+    else:
+      one = newNodeP(nkInfix, p)
+      one.add(newIdentNode("==", s.info))
+      one.add(x)
+      one.add(s)
+    if acc.kind == nkEmpty:
+      acc = one
+    else:
+      let o = newNodeP(nkInfix, p)
+      o.add(newIdentNode("or", s.info))
+      let pa = newNode(nkPar, acc.info)
+      pa.add(acc)
+      let pb = newNode(nkPar, s.info)
+      pb.add(one)
+      o.add(pa)
+      o.add(pb)
+      acc = o
+  result = acc
 
 proc lowestExprAux(p: var TParser, v: var Node, limit: int): TTokKind =
   v = primary(p)
@@ -1107,6 +1218,12 @@ proc lowestExprAux(p: var TParser, v: var Node, limit: int): TTokKind =
           c.add(newIdentNode("float64", v.info))
           c.add(v)
           v = c
+      if op == pxIn and v2.kind == nkCurly and inSetLiteralElems(v2):
+        # membership over a literal set -> comparisons (no set typing)
+        v = buildInComparisons(p, v, v2)
+        op = nextop
+        opPred = getPrecedence(nextop)
+        continue
       node.add(opNode)
       node.add(v)
       if op == pxSlash:
@@ -2686,6 +2803,14 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
   let pragmas = parseRoutineSpecifiers(p, noBody, isVirtual)
   result.add(pragmas)
   result.add(emptyNode(nameInfo))  # exceptions (unused)
+  # register the parameter count (the paren-less call rule consults
+  # it in expression position); parseParamList gives one IdentDefs
+  # group per Pascal parameter (names, type, optional default)
+  block:
+    var argc = 0
+    for gi in 1 ..< params.len:
+      if params[gi].kind == nkIdentDefs: inc argc
+    p.syms.routineArgs[defName.toLowerAscii] = argc
   # register the routine name
   if kind in {pxFunction, pxConstructor}:
     if isClassProc and isMethod:
@@ -3649,6 +3774,20 @@ proc withExprClass(p: var TParser, e: Node): string =
       return p.classFieldTypes.getOrDefault(
           baseCls.toLowerAscii & "." & e[1].strVal.toLowerAscii)
   return ""
+
+proc unitModuleSpelling(p: TParser, name: string): string =
+  ## the module spelling a uses-clause unit name maps to, for
+  ## unit-qualified calls like `DateUtils.Now` (mirrors the uses
+  ## clause's shim mapping)
+  result = name
+  case name.toLowerAscii
+  of "strutils": result = "passtrutils"
+  of "math": result = "pasmath"
+  of "dateutils": result = "pasdateutils"
+  of "classes": result = "pasclasses"
+  of "sysutils", "si_strings", "system": result = "systempas"
+  else:
+    result = p.unitFiles.getOrDefault(name.toLowerAscii, name)
 
 proc withQualify(p: var TParser, n: Node): Node =
   ## qualify a bare identifier against the active with-scopes

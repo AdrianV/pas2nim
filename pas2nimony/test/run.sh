@@ -263,6 +263,24 @@ local on" ]; then
   fi
 fi
 
+# ---- happy.pas: real-world sample (nested loops, set membership,
+# paren-less calls, DateUtils) ----
+if [ -x "$ROOT/bin/pasler" ] && [ -f "$HERE/happy.pas" ]; then
+  echo "== pasler-happy"
+  mkdir -p "$TMP/pasler-happy"
+  cp "$HERE/happy.pas" "$TMP/pasler-happy/"
+  out="$(cd "$TMP/pasler-happy" && timeout 300 "$ROOT/bin/pasler" \
+      --nimony:"$NIMONY" --run happy.pas 2>&1 | grep -v nifmake |
+      grep 'Found' || true)"
+  echo "$out"
+  if [ "$out" = "Found 4816030 tickets. Elapsed time, msec: 0" ] ||
+     echo "$out" | grep -q "Found 4816030 tickets"; then
+    echo "-- ok"
+  else
+    echo "   HAPPY TICKET COUNT MISMATCH"; fail=1
+  fi
+fi
+
 # M5 oracle: differential testing against real FPC (skips without fpc)
 if ! sh "$HERE/oracle.sh"; then
   echo "   ORACLE FAILED"; fail=1

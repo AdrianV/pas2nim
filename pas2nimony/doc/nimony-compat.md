@@ -627,3 +627,30 @@ expose backend selection for the NIF entry point plus
 config-agnostic emission on our side. Until then the `.nim`
 delegation is the honest interface, and `c` - the oracle-critical,
 byte-identical path - stays untouched.
+
+## M6-4: real-world sample happy.pas (lucky-ticket counter)
+
+Three language gaps closed while compiling a real 45-line program
+(nested loops over a triangle of digit sums, `x in [0..9]`,
+`TDateTime`/`Now`/`MilliSecondsBetween`):
+
+- **Paren-less calls**: Delphi calls parameterless functions without
+  parentheses in expression position (`d1 := Now`). The parser now
+  tracks known routines' parameter counts (shim sources via
+  scanNimExports, user routines via parseRoutine) and a bare
+  identifier resolving to a 0-arg routine - not shadowed by a
+  variable - becomes a call. Statement position already called.
+- **`in` over a literal set**: `x in [0..9]` lowers to a comparison
+  chain (`(x >= 0) and (x <= 9)`; singleton -> `==`; several elements
+  -> an or-chain; empty -> false). nimony types a `{0..9}` set as
+  set[int] and rejects int64 as a set element, so the set-typed
+  emission could not work; comparisons match Delphi semantics for
+  scalar membership exactly. Non-literal set operands keep the set
+  emission (future set-type support).
+- **Unit-qualified calls**: `DateUtils.MilliSecondsBetween(...)` now
+  spells the module the way the uses clause imported it
+  (pasdateutils), mirroring the shim mapping.
+
+The run is byte-identical to FPC on the deterministic line:
+`Found 4816030 tickets.` (the msec timing is wall-clock, not
+comparable). Suite section `pasler-happy` guards the count.
