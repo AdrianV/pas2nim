@@ -921,3 +921,27 @@ same round (corpus health: 17 of 41 units translate):
 - Pristine-RTL census additions: IniFiles, Registry, ZLib, StdVCL
   join the translating set (ZLib/StdVCL only as comments-free type
   shims where COM surfaces were skipped).
+
+## M9: with fallback, metaclasses, mapping clauses, full corpus
+
+- **With on unknown class** lowers to a hidden temp with an empty
+  type node (type inferred from the initializer); the body's members
+  stay unqualified (a call on a unit-level variable of an
+  un-absorbed unit, e.g. the ht family). Corpus 25->28.
+- **`class of T` metaclasses** (`TPersistentClass = class of
+  TPersistent;`) lower to a comment alias in parseRecordOrObject's
+  head - v1 has no class-reference lowering. **Interface-method
+  mapping clauses** (`function IUnknown.QueryInterface =
+  ObjQueryInterface;`) lower to a comment; the implementation keeps
+  its own name. Property `stored <expr>` / `immutable` streaming
+  specifiers are consumed. Corpus 28->35; Classes.pas and the COM
+  family translate.
+- **Conditionals in expression, case-label and loop positions**: the
+  type header (`T = {$IFDEF X}{$ELSE}packed{$ENDIF} record`),
+  anonymous record members, the repeat body's until, the if's else
+  chain, empty then-bodies, case branch labels
+  (`tkInteger, tkClass {$IFDEF FPC} ,tkBool {$ENDIF}:`), conditional
+  wraps around whole case branches and case-else, finally body
+  separators, and expression positions
+  (`x = {$IFDEF}#10{$ELSE}#13{$ENDIF}`). Corpus 36->**39/39 - the
+  private sweep is complete**.
