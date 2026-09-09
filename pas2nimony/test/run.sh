@@ -326,6 +326,25 @@ if [ -x "$ROOT/bin/pasler" ] && [ -f "$HERE/ccprobe.pas" ]; then
   fi
 fi
 
+# ---- shadow.pas: method hiding semantics (reintroduce vs override;
+# a descendant virtual over an ancestor method is a NEW slot, a
+# base-typed reference keeps dispatching to the ancestor) ----
+if [ -x "$ROOT/bin/pasler" ] && [ -f "$HERE/shadow.pas" ]; then
+  echo "== pasler-shadow"
+  mkdir -p "$TMP/pasler-shadow"
+  cp "$HERE/shadow.pas" "$TMP/pasler-shadow/"
+  out="$(cd "$TMP/pasler-shadow" && timeout 300 "$ROOT/bin/pasler" \
+      --nimony:"$NIMONY" --run shadow.pas 2>&1 | grep -v nifmake)"
+  echo "$out" | head -3
+  if echo "$out" | grep -q "child-newslot" && echo "$out" | grep -q "^base$" \
+      && echo "$out" | grep -q "child2"; then
+    echo "-- ok"
+  else
+    echo "   SHADOW DISPATCH MISMATCH (want child-newslot, base, child2)"
+    fail=1
+  fi
+fi
+
 # M5 oracle: differential testing against real FPC (skips without fpc)
 if ! sh "$HERE/oracle.sh"; then
   echo "   ORACLE FAILED"; fail=1

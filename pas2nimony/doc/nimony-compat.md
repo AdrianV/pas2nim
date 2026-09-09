@@ -733,3 +733,33 @@ Routine directives are no longer silently dropped:
 | `abstract` | no body follows (like `forward`); dispatch goes to overriding descendants |
 | `reintroduce`, `platform`, `experimental` | genuine no-ops (Delphi hint suppressors / documentation annotations) - consumed and ignored, no diagnostic |
 | `register`, `pascal`, `safecall` | unfulfillable calling conventions: warning by default, error under `--strict` |
+
+### Method hiding: `reintroduce` vs `override` (M6-6c)
+
+The v1 dispatch model previously conflated a descendant's `virtual`
+with `override`: both became nimony `method` defs, so a base-typed
+reference dispatched to the descendant's redeclaration - diverging
+from Delphi, where a descendant `virtual` (no `override`) introduces
+a **new slot** and a base-typed reference keeps dispatching to the
+ancestor's method.
+
+Semantics now:
+
+- `procedure Foo; reintroduce; virtual;` (or plain `virtual` over an
+  ancestor's same-name method) lowers as a **static per-class
+  routine** - the per-class call resolution plays the new slot; a
+  base-typed reference stays on the ancestor's method (FPC-verified:
+  shadow.pas prints child-newslot / base / child2 in both).
+- `override` keeps nimony `method` dispatch (same slot) - unchanged.
+- Hiding **without** `reintroduce` produces the Delphi-parity warning
+  "method 'Foo' hides virtual method of ancestor type - add
+  reintroduce to acknowledge" (deduplicated per process); with
+  `reintroduce` it is silent. `reintroduce` therefore has a real
+  role: it acknowledges the hide, matching Delphi's hint.
+- The implementation parser keeps the class body's decision: a
+  self-only `isMethodDeclared` check replaces the ancestor-walk
+  flip, so a hidden method's implementation stays static while an
+  override's implementation dispatches.
+- Known v1 divergence: a *further* descendant overriding the new
+  slot virtually (`TDog2 overriding TChild.Foo`) lowers statically -
+  deep virtual chains through reintroduced slots are not modeled.

@@ -195,7 +195,8 @@ proc parseProperty*(p: var TParser): Node
 proc parseRecordOrObject*(p: var TParser, kind: NodeKind,
                           definition: Node): Node
 proc parseRoutineSpecifiers*(p: var TParser, noBody: var bool,
-                             isVirtual: var bool): Node
+                             isVirtual: var bool; isOverride: var bool;
+                             sawReintroduce: var bool): Node
 proc genPropertyAccessors*(p: var TParser, module: Node)
 
 proc exSymbol*(n: Node, isPublic: bool): Node =
@@ -2549,8 +2550,11 @@ proc routineKindNode(p: TParser, kind: TTokKind, isMethod: bool): NodeKind =
   else: result = nkProcDef
 
 proc parseRoutineSpecifiers*(p: var TParser, noBody: var bool,
-                             isVirtual: var bool): Node =
+                             isVirtual: var bool; isOverride: var bool;
+                             sawReintroduce: var bool): Node =
   ## parses `virtual; override; overload; forward; static; inline;` etc.
+  isOverride = false
+  sawReintroduce = false
   result = newNodeP(nkPragma, p)
   while true:
     if p.tok.xkind != pxSymbol and p.tok.xkind != pxInline:
@@ -2564,6 +2568,7 @@ proc parseRoutineSpecifiers*(p: var TParser, noBody: var bool,
       getTokP(p)
     of "override":
       isVirtual = true
+      isOverride = true
       getTokP(p)
     of "overload":
       getTokP(p)
@@ -2603,9 +2608,14 @@ proc parseRoutineSpecifiers*(p: var TParser, noBody: var bool,
       # overriding descendants
       noBody = true
       getTokP(p)
-    of "reintroduce", "platform", "experimental":
-      # genuine no-ops: Delphi hint suppressors / documentation
-      # annotations with no nimony-side semantic
+    of "reintroduce":
+      # acknowledges that this declaration HIDES an ancestor method;
+      # suppresses the hides-virtual warning (Delphi parity)
+      sawReintroduce = true
+      getTokP(p)
+    of "platform", "experimental":
+      # genuine no-ops: documentation annotations with no
+      # nimony-side semantic
       getTokP(p)
     of "external":
       # external declarations: skip the string/qualifier
@@ -2885,7 +2895,26 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
   if isMethod:
     result.defClass = p.classOfProc
   # specifiers & pragmas
-  let pragmas = parseRoutineSpecifiers(p, noBody, isVirtual)
+  var isOverride = false
+  var sawReintroduce = false
+  let pragmas = parseRoutineSpecifiers(p, noBody, isVirtual, isOverride,
+                                       sawReintroduce)
+  # Delphi method hiding: a descendant `virtual` (no override) over an
+  # ancestor's same-name method introduces a NEW slot - the v1 model
+  # lowers the hidden method as a static per-class routine (call sites
+  # resolve by the receiver's declared type), so a base-typed
+  # reference keeps dispatching to the ancestor's method, as Delphi
+  # does. Without `reintroduce`, Delphi warns - so do we.
+  if isVirtual and isMethod and not isOverride:
+    let ci = p.syms.classes.getOrDefault(p.classOfProc.toLowerAscii)
+    if ci.spelling.len > 0 and
+        p.syms.isMethodOf(ci.parent, name):
+      isVirtual = false
+      if not sawReintroduce:
+        parWarning(p, "hide:" & p.classOfProc & "." & name &
+            ":" & renderInfo(nameInfo),
+            "method '" & name & "' hides virtual method of ancestor " &
+            "type - add reintroduce to acknowledge")
   result.add(pragmas)
   result.add(emptyNode(nameInfo))  # exceptions (unused)
   # register the parameter count (the paren-less call rule consults
@@ -2925,14 +2954,17 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
     else:
       p.syms.addRoutine(p.classOfProc, name)
     if not isVirtual and p.section != seInterface:
-      # implementation of a method declared virtual in the interface
-      if p.syms.isMethodOf(p.classOfProc, name):
+      # implementation of a method declared virtual in THIS class's
+      # body (self-only: a hidden/reintroduce'd method stays static)
+      if p.syms.isMethodDeclared(p.classOfProc, name):
         isVirtual = true
     if isVirtual:
       p.syms.addMethod(p.classOfProc, name)
   elif isMethod and p.section != seInterface:
     # implementation of a method declared virtual in the interface
-    if p.syms.isMethodOf(p.classOfProc, name):
+    # the class body's own decision wins over the ancestor walk: a
+    # hidden (reintroduce'd) method stays a static routine
+    if p.syms.isMethodDeclared(p.classOfProc, name):
       isVirtual = true
   if not isMethod:
     p.syms.declareName(name)

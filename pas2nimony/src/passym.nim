@@ -218,6 +218,20 @@ proc addMethod*(t: var SymTab; cls, spelling: string) =
     ci.methodSet[spelling.toLowerAscii] = true
     t.classes[key] = ci
 
+proc isMethodDeclared*(t: SymTab; cls, name: string): bool =
+  ## true only when THIS class declared `name` virtual (no ancestor
+  ## walk - the implementation parser uses it to keep the class body's
+  ## virtual/hiding decision)
+  let ci = t.classes.getOrDefault(cls.toLowerAscii)
+  result = ci.spelling.len > 0 and ci.methodSet.hasKey(name.toLowerAscii)
+
+proc ancestorMethodOf*(t: SymTab; cls, name: string): bool =
+  ## true if `name` is a virtual method of a strict ancestor of `cls`
+  let key = cls.toLowerAscii
+  let ci = t.classes.getOrDefault(key)
+  if ci.spelling.len == 0: return false
+  result = t.isMethodOf(ci.parent, name)
+
 proc isMethodOf*(t: SymTab; cls, name: string): bool =
   ## true if `name` was declared virtual in `cls` or an ancestor
   let key = cls.toLowerAscii
