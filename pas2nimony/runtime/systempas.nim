@@ -700,6 +700,17 @@ proc StrToFloatDef*(s: string; def: float64): float64 =
     if negative: val = -val
     result = val
 
+# SysUtils const tier (the corpus's string/char surface; FPC/Delphi
+# spellings with the shared defaults)
+const
+  NameValueSeparator* = '='
+  PathDelim* = '/'
+  DriveDelim* = ':'
+  ExtensionSeparator* = '.'
+
+proc pasFind*(s: string; sub: string): int32 = int32(find(s, sub))
+proc pasFind*(s: string; sub: char): int32 = int32(find(s, sub))
+
 proc StrToFloat*(s: string): float64 = StrToFloatDef(s, 0.0)
 
 proc StrToFloatDef*(s: char; def: float64): float64 =

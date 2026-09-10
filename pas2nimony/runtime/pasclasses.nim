@@ -115,6 +115,9 @@ proc `[]=`*(self: TStringList; key: string; v: string) =
     inc k
   self.fLines.add(key & "=" & v)
 
+proc Put*(self: TStringList; i: int32; s: string) =
+  self.fLines[i] = s
+
 proc Text*(self: TStringList): string =
   ## all lines joined with the platform line ending (Delphi on Windows
   ## uses CRLF; FPC uses LineEnding - CRLF on Windows, LF on Unix)
@@ -339,6 +342,32 @@ proc GetObject*(self: TStrings; i: int32): RootRef =
   result = nil
 
 # TStrings.Get: the corpus's UpdateValueHash loop reads by index
+proc Assign*(self: TStrings; src: TStrings) =
+  ## v1 stub on the abstract TStrings base
+  discard
+
+proc Put*(self: TStrings; i: int32; s: string) =
+  ## v1 stub on the abstract TStrings base
+  discard
+
+proc PutObject*(self: TStrings; i: int32; obj: RootRef) =
+  ## v1 stub on the abstract TStrings base
+  discard
+
+proc GetName*(self: TStrings; i: int32): string =
+  ## v1 stub on the abstract TStrings base (the concrete split of the
+  ## `name=value` line lives on TStringList)
+  result = ""
+
+proc GetText*(self: TStrings): string =
+  ## v1 stub: the Text read on the abstract base
+  result = ""
+
+proc IndexOfName*(self: TStrings; s: string): int32 =
+  ## v1 stub on the abstract TStrings base (the concrete list storage
+  ## lives on TStringList, mirroring the IndexOf stub above)
+  result = -1
+
 proc Get*(self: TStrings; i: int32): string =
   result = ""
 

@@ -196,15 +196,39 @@ proc expr(s: var TRendor, n: Node): string =
                  else: n[1].strVal
     result = lhs & "." & member
   of nkIndexExpr:
-    result = s.expr(n[0]) & "["
-    for i in 1 ..< n.len:
-      if i > 1: result.add(", ")
-      result.add(s.expr(n[i]))
-    result.add("]")
+    # TStrings indexed properties lower to their Delphi getter calls
+    # (nimony has no indexed-property syntax on object types)
+    if n[0].kind == nkDotExpr and n[0].len == 2 and n[0][1].kind == nkIdent:
+      let member = n[0][1].strVal.toLowerAscii
+      let getter = if member == "objects": "GetObject"
+                   elif member == "strings": "Get"
+                   elif member == "values": "GetValue"
+                   elif member == "names": "GetName"
+                   else: ""
+      if getter.len > 0:
+        result = s.expr(n[0][0]) & "." & getter & "(" & s.expr(n[1]) & ")"
+      else:
+        result = s.expr(n[0]) & "[" & s.expr(n[1]) & "]"
+    else:
+      result = s.expr(n[0]) & "["
+      for i in 1 ..< n.len:
+        if i > 1: result.add(", ")
+        result.add(s.expr(n[i]))
+      result.add("]")
   of nkDeref:
     result = s.expr(n[0]) & "[]"
   of nkAddr:
-    result = "addr(" & s.expr(n[0]) & ")"
+    if n[0].kind == nkDotExpr and n[0].len == 2 and n[0][0].kind == nkDeref:
+      # @X^.F on a pointer X: nimony rejects the explicit-deref form
+      # addr(x[].f) as an lvalue, but accepts the implicit-deref form
+      # addr(x.f) - each dot auto-derefs one pointer level, so the
+      # address is the same and the type gains back the outer level
+      # (a PPHashItem result type-checks)
+      let member = if s.syms != nil: s.syms[].canonicalMember(n[0][1].strVal)
+                   else: n[0][1].strVal
+      result = "addr(" & s.expr(n[0][0][0]) & "." & member & ")"
+    else:
+      result = "addr(" & s.expr(n[0]) & ")"
   of nkPar:
     result = "("
     for i in 0 ..< n.len:
@@ -603,6 +627,19 @@ proc stmt(s: var TRendor, n: Node) =
     if n.strVal.len > 0:
       s.line(n.strVal)
   of nkAsgn:
+    # TStrings indexed-property assignment lowers to the setter call
+    # (nimony has no indexed-property write syntax on object types)
+    if n[0].kind == nkIndexExpr and n[0].len == 2 and
+        n[0][0].kind == nkDotExpr and n[0][0].len == 2 and
+        n[0][0][1].kind == nkIdent:
+      let member = n[0][0][1].strVal.toLowerAscii
+      let setter = if member == "objects": "PutObject"
+                   elif member == "strings": "Put"
+                   else: ""
+      if setter.len > 0:
+        s.line(s.expr(n[0][0][0]) & "." & setter & "(" & s.expr(n[0][1]) &
+            ", " & s.expr(n[1]) & ")")
+        return
     if n[1].kind == nkProcDef and n[1][0].kind == nkEmpty:
       # anonymous method assignment: `F = proc (x: int32) =`
       # followed by the indented body

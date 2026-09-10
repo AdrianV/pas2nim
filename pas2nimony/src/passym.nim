@@ -455,7 +455,7 @@ const RtlNames* = [
   ("singlefloat", "float32"), ("tclass", "RootRef"),
   ("tdatetime", "TDateTime"),
   # builtin routines (pure renames)
-  ("ord", "ord"), ("chr", "chr"), ("low", "low"),
+  ("pasfind", "pasFind"), ("ord", "ord"), ("chr", "chr"), ("low", "low"),
   ("high", "high"), ("setlength", "setLen"), ("inc", "inc"), ("dec", "dec"),
   ("succ", "succ"), ("pred", "pred"), ("abs", "abs"), ("odd", "Odd"),
   ("round", "pasRound"), ("trunc", "trunc"), ("sizeof", "sizeof"),

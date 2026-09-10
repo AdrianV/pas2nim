@@ -90,6 +90,7 @@ type
     procVarTypes*: Table[string, bool] ## vars/fields of plain proc type
     methodPtrVars*: Table[string, Node] ## var/field/param/prop name -> its formal params
     thunkCounter*: int                 ## synthesized event-thunk serial
+    ptrTmpCounter*: int                ## ptr-pool addr temp serial
     absorbed*: UnitSet               ## shared unit-absorption cycle guard
     unitFiles*: Table[string, string] ## lowercase unit name -> module file stem
     classOfProc*: string        ## class the current routine belongs to
@@ -1730,6 +1731,12 @@ proc parseParamList*(p: var TParser): Node =
           let pty = lastType.strVal.toLowerAscii
           if p.recordTypes.hasKey(pty):
             p.varTypes[n.toLowerAscii] = "record:" & lastType.strVal
+          elif p.pointerAliases.hasKey(pty):
+            p.varTypes[n.toLowerAscii] = "ptr:" & lastType.strVal
+          elif p.syms.isClass(pty):
+            # class-typed params/locals: receiver-class logic (the
+            # statement discard rule, per-class return keys) needs it
+            p.varTypes[n.toLowerAscii] = "class:" & lastType.strVal
           else:
             let rtl = rtlSpelling(pty)
             if rtl.len > 0:
@@ -3460,6 +3467,8 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
     else:
       let rtl = rtlSpelling(retKey)
       if rtl.len > 0: p.varTypes["result"] = rtl
+      elif p.pointerAliases.hasKey(retKey):
+        p.varTypes["result"] = "ptr:" & params[0].strVal
       else: p.varTypes["result"] = "unknown" 
   # Delphi conversion/unary class operators (Implicit/Explicit/Inc/
   # Dec) have no nimony operator symbol: lower to uniquely named
@@ -3634,6 +3643,7 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
     # param/local maps are still live (nimony has no ref equality)
     if result.len > 0:
       rewriteClassEq(p, result[result.len - 1])
+      rewritePtrAddr(p, result[result.len - 1])
     if kind == pxConstructor and isMethod:
       # constructors return self so `X := T.create(...)` works
       let pre = newNode(nkAsgn, nameInfo)
@@ -4028,12 +4038,41 @@ proc parseTry*(p: var TParser): Node =
       b.add(emptyNode(info))
       b.add(emptyNode(info))
       if sawOn:
-        # handled via the re-raise in each `on` branch; plain body here
+        # `on X do H else E`: E runs for exceptions no `on` matched.
+        # Each `on` branch lowers to its own ErrorCode case; E (v1: a
+        # bare re-raise, the corpus's shape) becomes the case's else
+        # body. The original else-branch node is demoted to a comment
+        # so the renderer does not emit a second handler.
         let body2 = parseStmt(p)
         b.add(body2)
-        # replace: bare else only applies when no `on` branches exist
         b.kind = nkCommentStmt
-        b.strVal = "# except-else after on-branches not supported"
+        b.strVal = "# except-else: lowered into the on-branch case's else"
+        if body2.kind == nkRaiseStmt:
+          # hexer cannot resolve the hidden ErrorCode binding inside a
+          # `case` scrutinee when the case's else re-raises; the same
+          # shape as an if-chain compiles (probed), so splice there
+          for ob in result.sons:
+            if ob.kind == nkExceptBranch and ob.len >= 3:
+              let caseNode = ob[2]
+              if caseNode.kind == nkCaseStmt and caseNode.len >= 2:
+                let ofB = caseNode[1]
+                if ofB.kind == nkOfBranch and ofB.len >= 2 and
+                    ofB[0].kind == nkIdent:
+                  let iff = newNode(nkIfStmt, info)
+                  let elifb = newNode(nkElifBranch, info)
+                  let cond = newNode(nkInfix, info)
+                  cond.add(newIdentNode("==", info))
+                  cond.add(newIdentNode(ob[1].strVal, info))
+                  cond.add(newIdentNode(ofB[0].strVal, info))
+                  elifb.add(cond)
+                  elifb.add(ofB[1])
+                  iff.add(elifb)
+                  let elseS = newNode(nkElse, info)
+                  let esl = newNode(nkStmtList, info)
+                  esl.add(body2)
+                  elseS.add(esl)
+                  iff.add(elseS)
+                  ob[2] = iff
       else:
         let body2 = parseStmt(p)
         b[1] = body2
@@ -4238,7 +4277,9 @@ proc mapStringBuiltins*(p: var TParser, n: Node): Node =
       let sub = n[1]
       let str1 = n[2]
       var call = newNode(nkCall, n.info)
-      call.add(newIdentNode("find", n.info))
+      # a reserved shim name: the corpus's own `Find` methods must not
+      # pollute canon for nimony's system `find`
+      call.add(newIdentNode("pasFind", n.info))
       call.add(str1)
       call.add(sub)
       let plus = newNode(nkInfix, n.info)
@@ -4253,7 +4294,7 @@ proc mapStringBuiltins*(p: var TParser, n: Node): Node =
       let sub = n[1]
       let str1 = n[2]
       var call = newNode(nkCall, n.info)
-      call.add(newIdentNode("find", n.info))
+      call.add(newIdentNode("pasFind", n.info))
       call.add(str1)
       call.add(sub)
       let plus = newNode(nkInfix, n.info)
@@ -4840,7 +4881,18 @@ proc parseWith(p: var TParser): Node =
   skipCom(p)
   var pushed = 0
   while true:
-    let e = parseExpr(p)
+    # the with-expression's implicit-self members must qualify here:
+    # the lowered temp's init lands in a var section the general
+    # self-qualify walk stops at (nkVarSection/nkIdentDefs are skipped
+    # to protect declaration names)
+    var e = parseExpr(p)
+    var ws: seq[string] = @[]
+    # the with-expression parses before the def-level self-qualify
+    # pass runs, so bring the method's class in here
+    let savedQual = p.qualClass
+    if p.qualClass.len == 0: p.qualClass = p.classOfProc
+    e = selfQualifyInPlace(p, e, ws)
+    p.qualClass = savedQual
     var cls = p.withExprClass(e)
     if cls.len == 0:
       # unresolvable class (a call on a unit-level variable of an
@@ -5403,12 +5455,12 @@ proc isMemberName(p: TParser, cls, name: string): bool =
     if ci.spelling.len == 0: break
     if ci.fieldSet.hasKey(lower) or ci.routineSet.hasKey(lower):
       return true
+    # properties of the class (and every ancestor) qualify too
+    for pr in p.props:
+      if pr.cls.toLowerAscii == k and pr.name.toLowerAscii == lower:
+        return true
     k = ci.parent
     inc guard
-  # properties
-  for pr in p.props:
-    if pr.cls.toLowerAscii == key and pr.name.toLowerAscii == lower:
-      return true
   return false
 
 proc isCtorName(p: TParser, cls, name: string): bool =
@@ -5694,6 +5746,21 @@ proc adjustArrayIndicesInPlace(p: var TParser, n: Node): Node =
     n[0] = adjustArrayIndicesInPlace(p, n[0])
     n[1] = adjustArrayIndicesInPlace(p, n[1])
     if n[0].kind == nkIdent:
+      # a class-typed bare index base is the type's default indexed
+      # property (Delphi TStrings.Strings default); insert the member
+      # so the indexed-property getter/setter lowering applies
+      let vt = p.varTypes.getOrDefault(n[0].strVal.toLowerAscii)
+      if vt.startsWith("class:"):
+        let cls = vt[6 .. ^1].toLowerAscii
+        let def = if cls in ["tstrings", "tstringlist",
+                             "thashedstringlist"]: "Strings"
+                  elif cls == "tlist": "Items"
+                  else: ""
+        if def.len > 0:
+          let dot = newNode(nkDotExpr, n[0].info)
+          dot.add(n[0])
+          dot.add(newIdentNode(def, n[0].info))
+          n[0] = dot
       let low = p.arrayLows.getOrDefault(n[0].strVal.toLowerAscii, 0)
       if low != 0:
         let minus = newNode(nkInfix, n[1].info)
@@ -5754,6 +5821,43 @@ proc rewriteClassEq*(p: var TParser, n: Node) =
       return
   for s in n.sons:
     rewriteClassEq(p, s)
+
+proc rewritePtrAddr*(p: var TParser, n: Node) =
+  ## `X := @Y^.F` on a pointer Y: nimony rejects the explicit-deref form
+  ## addr(y[].f) as an lvalue and the implicit form addr(y.f) will not
+  ## chain through a ptr-ptr, so lower to a temp holding the deref'd
+  ## pointer value; addr(temp.F) re-adds the outer level and addresses
+  ## the same field
+  if n.kind == nkAsgn and n.len == 2 and n[1].kind == nkAddr and
+      n[1].len == 1 and n[1][0].kind == nkDotExpr and n[1][0].len == 2 and
+      n[1][0][0].kind == nkDeref:
+    let y = n[1][0][0][0]
+    let yt = rhsExprType(p, y)
+    if yt.startsWith("ptr:"):
+      let target = p.pointerAliases.getOrDefault(yt[4 .. ^1].toLowerAscii)
+      if target.len > 0:
+        inc p.ptrTmpCounter
+        let tmp = "pasPtrTmp" & $p.ptrTmpCounter
+        let info = n.info
+        let varDecl = newNode(nkVarSection, info)
+        let vd = newNode(nkIdentDefs, info)
+        vd.add(newIdentNode(tmp, info))
+        vd.add(newIdentNode(target, info))
+        vd.add(n[1][0][0])
+        varDecl.add(vd)
+        let inner = newNode(nkDotExpr, info)
+        inner.add(newIdentNode(tmp, info))
+        inner.add(n[1][0][1])
+        let addrNode = newNode(nkAddr, info)
+        addrNode.add(inner)
+        let asgn = newNode(nkAsgn, info)
+        asgn.add(n[0])
+        asgn.add(addrNode)
+        n.kind = nkStmtList
+        n.sons = @[varDecl, asgn]
+      return
+  for s in n.sons:
+    rewritePtrAddr(p, s)
 
 proc rewriteClassAsgns*(p: var TParser, n: Node) =
   ## upcast assignments between differently typed class variables:
@@ -5959,6 +6063,168 @@ proc genPropertyAccessors*(p: var TParser, module: Node) =
 # ---------------------------------------------------------------------------
 # unit driver
 
+# ---------------------------------------------------------------------------
+# raising call sites (nimony's checked-exception model): a routine whose
+# body contains a raise must announce it, and its call sites may only sit
+# inside an except-bearing try (a re-raising except still counts - the
+# checker only rejects unprotected call sites). Every raising call site
+# inside a routine body is wrapped in `try: <stmt> except: raise`; the
+# added bare raises pull the enclosing routine into the raising set, so
+# the wrap runs to a fixpoint over the call graph. The module's top-level
+# main block is already wrapped by the M4-2 machinery.
+
+proc bodyRaises(n: Node): bool =
+  if n.kind == nkRaiseStmt: return true
+  if n.kind == nkCommentStmt: return false
+  for i in 0 ..< n.len:
+    if n[i].len > 0:
+      if bodyRaises(n[i]): return true
+  return false
+
+proc pasDefaultExpr(p: var TParser, ty: Node): Node =
+  ## zero value for the flow check's result slot (v1: primitives, refs)
+  if ty.kind == nkIdent:
+    let k = ty.strVal.toLowerAscii
+    if k in ["int8", "int16", "int32", "int64", "uint8", "uint16",
+             "uint32", "uint64", "byte", "shortint", "smallint",
+             "longint", "longword", "integer", "cardinal", "word",
+             "char", "ansichar", "widechar", "nativeint", "nativeuint",
+             "sizeint", "ptrdiff", "boolean"]:
+      return newIntNode(nkIntLit, 0, ty.info)
+    if k in ["float32", "float64", "single", "double", "real",
+             "tdatetime", "texttime", "comp", "currency"]:
+      return newFloatNode(0.0, ty.info)
+    if k == "bool":
+      return newIdentNode("false", ty.info)
+    if k == "string" or k == "ansistring" or k == "widestring":
+      return newStrNode("", ty.info)
+    # a class/ref type: nil
+    if p.syms.classes.hasKey(k):
+      return newIdentNode("nil", ty.info)
+  if ty.kind in {nkRefTy, nkPtrTy}:
+    return newIdentNode("nil", ty.info)
+  return nil
+
+proc raisingCallTarget(n: Node): string =
+  ## lowercased callee selector of a call/command, "" when none
+  if n.kind in {nkCall, nkCommand} and n.len >= 1:
+    if n[0].kind == nkIdent:
+      return n[0].strVal.toLowerAscii
+    if n[0].kind == nkDotExpr and n[0].len == 2 and
+        n[0][1].kind == nkIdent:
+      return n[0][1].strVal.toLowerAscii
+  return ""
+
+proc exprCallsRaising(p: var TParser, n: Node,
+                      set: Table[string, bool]): bool =
+  ## does any call in this expression tree target a raising routine
+  let sel = raisingCallTarget(n)
+  if sel.len > 0 and set.hasKey(sel):
+    return true
+  for i in 0 ..< n.len:
+    if n[i].len > 0:
+      if exprCallsRaising(p, n[i], set): return true
+  return false
+
+proc wrapRaisingAt(p: var TParser, n: Node, i: int,
+                   set: Table[string, bool], inProt: bool,
+                   retTy: Node): bool =
+  ## may wrap statement n[i]; returns true when wrapped
+  let s = n[i]
+  case s.kind
+  of nkProcDef, nkFuncDef, nkMethodDef, nkTemplateDef,
+     nkTypeSection, nkTypeDef, nkImportStmt, nkVarSection, nkConstSection,
+     nkCommentStmt, nkWhenExpr:
+    return false
+  of nkTryStmt:
+    var hasExcept = false
+    for k in 1 ..< s.len:
+      if s[k].kind == nkExceptBranch: hasExcept = true
+    var changed = false
+    for k in 0 ..< s.len:
+      changed = wrapRaisingAt(p, s, k, set, inProt or hasExcept, retTy) or changed
+    return changed
+  of nkStmtList, nkElse, nkFinally, nkIfStmt:
+    var changed = false
+    for k in 0 ..< s.len:
+      changed = wrapRaisingAt(p, s, k, set, inProt, retTy) or changed
+    return changed
+  of nkElifBranch, nkOfBranch:
+    # kid 0 is the condition / of-value list: not a statement
+    var changed = false
+    for k in 1 ..< s.len:
+      changed = wrapRaisingAt(p, s, k, set, inProt, retTy) or changed
+    return changed
+  of nkWhileStmt:
+    # kid 0 is the loop condition
+    var changed = false
+    for k in 1 ..< s.len:
+      changed = wrapRaisingAt(p, s, k, set, inProt, retTy) or changed
+    return changed
+  of nkForStmt:
+    # kids 0/1 are the hidden var and the shim iterator call
+    var changed = false
+    for k in 2 ..< s.len:
+      changed = wrapRaisingAt(p, s, k, set, inProt, retTy) or changed
+    return changed
+  of nkCaseStmt:
+    var changed = false
+    for k in 1 ..< s.len:
+      changed = wrapRaisingAt(p, s, k, set, inProt, retTy) or changed
+    return changed
+  else:
+    if inProt: return false
+    if not exprCallsRaising(p, s, set): return false
+    # wrap in try/except/raise
+    let t = newNode(nkTryStmt, s.info)
+    let wbody = newNode(nkStmtList, s.info)
+    wbody.add(s)
+    t.add(wbody)
+    let eb = newNode(nkExceptBranch, s.info)
+    eb.add(emptyNode(s.info))
+    eb.add(emptyNode(s.info))
+    let hbody = newNode(nkStmtList, s.info)
+    if retTy.kind != nkEmpty:
+      let dflt = pasDefaultExpr(p, retTy)
+      if dflt != nil:
+        let asgn = newNode(nkAsgn, s.info)
+        asgn.add(newIdentNode("result", s.info))
+        asgn.add(dflt)
+        hbody.add(asgn)
+    let rn = newNode(nkRaiseStmt, s.info)
+    rn.add(emptyNode(s.info))
+    hbody.add(rn)
+    eb.add(hbody)
+    t.add(eb)
+    n[i] = t
+    return true
+
+proc wrapRaisingCalls*(p: var TParser, module: Node) =
+  ## fixpoint: wrap raising call sites, transitively marking callers
+  var rounds = 0
+  while rounds < 12:
+    inc rounds
+    var set = initTable[string, bool]()
+    for def in module.sons:
+      if def.kind in {nkProcDef, nkFuncDef, nkMethodDef} and def.len > 0 and
+          def[def.len - 1].kind == nkStmtList:
+        if bodyRaises(def[def.len - 1]):
+          set[def[0].strVal.toLowerAscii] = true
+    var changed = false
+    for def in module.sons:
+      if def.kind in {nkProcDef, nkFuncDef, nkMethodDef} and def.len > 0 and
+          def[def.len - 1].kind == nkStmtList:
+        var retTy = emptyNode(def.info)
+        if def.len >= 3 and def[2].kind == nkFormalParams and
+            def[2][0].kind != nkEmpty:
+          retTy = def[2][0]
+        let body = def[def.len - 1]
+        if body.len > 0:
+          changed = wrapRaisingAt(p, body, 0, set, false, retTy) or changed
+          for i in 1 ..< body.len:
+            changed = wrapRaisingAt(p, body, i, set, false, retTy) or changed
+    if not changed: break
+
 proc wrapMemberCalls*(p: var TParser, n: Node): Node =
   ## Pascal allows calling a member function without parentheses
   ## (`x := obj.Value`); nimony needs the call. Wrap a member access
@@ -5974,6 +6240,10 @@ proc wrapMemberCalls*(p: var TParser, n: Node): Node =
   for i in 0 ..< n.len:
     if n.kind == nkCall and i == 0:
       continue  # the callee of a call is already the call target
+    if n.kind == nkAsgn and i == 0:
+      # never wrap an assignment's LHS in a read call: the shim's
+      # `Prop=` setter sugar needs the bare member form (`x.Position = v`)
+      continue
     if n.sons[i].len > 0:
       n.sons[i] = wrapMemberCalls(p, n.sons[i])
   return n
@@ -6098,6 +6368,10 @@ proc parseUnit*(p: var TParser): Node =
   selfQualifyAll(p, p.module)
   adjustArrayIndices(p, p.module)
   classQualifyAll(p, p.module)
+  # nimony's checked-exception model: raising call sites must sit inside
+  # an except-bearing try; wrap them and let the added bare raises pull
+  # transitive callers into the raising set
+  wrapRaisingCalls(p, p.module)
   # class vars: hoist the module-level storage after the last type
   # section so routines (declared later) see it
   if p.classVarHoist.len > 0:

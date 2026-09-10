@@ -1110,3 +1110,53 @@ Landing of the "Delphi on Windows, FPC normalization elsewhere" policy:
 - `test/private/compile-errors.sh`/`compile.sh` thread the LINUX/UNIX/
   POSIX defines into their nimony compile lines so the shims see the
   same platform identity the translation used.
+
+## M12 - IniFiles tier: TStrings-object surface, exception-flow cascade
+
+The pointer-pool/TStrings-object tier landed. `IniFiles` moved from
+failing to compile-clean in the census (12/39 OK, was 11).
+
+- **nimony checked-exception model (probed)**: a routine whose body
+  contains a `raise` must announce `{.raises.}` (both renderers already
+  did via containsRaise); its call sites may only sit inside an
+  except-bearing `try` - from another `{.raises.}` routine too, and
+  inside a bare `try`/`finally` does not count (the frontend regression
+  test in nimony's tree documents the same rule). A re-raising `except`
+  is fine - the checker only rejects unprotected call sites. New
+  `wrapRaisingCalls` fixpoint pass: every unprotected call site of a
+  raising routine is wrapped in `try: <stmt> except: raise` (plus a
+  `result = <default>` before the raise for value-returning routines -
+  nimony's flow check demands the result slot initialized), and the
+  added bare raises pull the enclosing routines into the raising set
+  until the call graph settles.
+- **hexer bug (probe)**: a bare `raise` inside a `case` scrutinee's
+  else inside an except arm fails hexer with
+  `could not find symbol: pasECode2.0`; the identical shape as an
+  if-chain compiles and runs. The `on X do H else raise` lowering
+  therefore splices the else body into an if-chain
+  (`if pasECode2 == <code>: H else: raise`) instead of the case's else.
+  The pre-existing v1 gap that *dropped* `else raise` entirely (the
+  on-section's else was discarded with a "not supported" comment while
+  the dropped node still triggered the raises marking) is closed.
+- **Properties of ancestor classes**: `isMemberName` now walks the
+  property list at every link of the parent chain (it previously
+  checked only the routine's own class), so a corpus method's bare
+  `FileName` (a TCustomIniFile property) self-qualifies inside a
+  TMemIniFile method. `with`-expressions qualify their implicit-self
+  members at parse time because the lowered temp's init lands in a var
+  section the def-level self-qualify walk stops at.
+- **Assignment LHS**: `wrapMemberCalls` no longer wraps an assignment's
+  LHS in a read call - the shim setter sugar needs the bare member form
+  (`Stream.Position = v` targets the TMemoryStream field).
+- **Default indexed property**: a class-typed bare index base
+  (`Strings[I]`) is Delphi's default property; the parser inserts the
+  member (`Strings.Strings[I]`) so the indexed-property lowering
+  applies, and the renderer lowers indexed-property reads to the
+  getter calls (objects/strings/values/names) and indexed-property
+  writes to the setter calls (PutObject/Put).
+- **Shims**: TStrings GetName/GetText/Assign/Put/PutObject stubs on the
+  abstract base, TStringList.Put (`fLines[i] = s`), SysUtils const tier
+  (NameValueSeparator/PathDelim/DriveDelim/ExtensionSeparator), the
+  reserved `pasFind` spelling for Pos/AnsiPos (+ RTL pin + char
+  overload - the corpus's own `Find` methods must not pollute the canon).
+- Delphi census stays 6/15 PASS; the oracle suite stays 15/15.
