@@ -1055,3 +1055,24 @@ census tracks the tier separately from the nimony leg.
   receiver's static type; the slot at that class carries the declaring
   signature). The shim scan now parses `ref object of Parent` chains
   (shim ancestor walks no longer collapse to no parent).
+
+### Probed: nimony's I/O does not translate line endings on Windows
+
+A cross-compiled win64 probe (nimony C backend + x86_64-w64-mingw32-gcc,
+run under wine) shows nimony's `std/syncio` is a pure-Nimony layer with
+**no text-mode translation**: `echo`, `writeLine` to a text-mode file
+and `writeFile` all emit bare `\n` on Windows (nim 1 differs: it goes
+through C `stdout` in text mode, so the MSVCRT translates `\n` to
+`\r\n`). Consequences:
+
+- The platform line ending is the runtime's job: `pasLineEnding`
+  resolves to `"\r\n"` under `-d:MSWINDOWS` and `"\n"` otherwise
+  (mirroring FPC's `LineEnding`), and `TStrings.Text`/save paths plus
+  the `Writeln` shim route through it.
+- Locale surfaces stay our shim's job on every platform (the nimony
+  runtime reads no locale; float formatting is always `.`).
+- Cross-compilation caveats found while probing: the i386 Windows
+  target fails to link (nimony's Windows system C code declares Win32
+  procs without `__stdcall`, so Ubuntu mingw's decorated imports
+  `_ExitProcess@4` never match); use `--cpu:amd64` for now. Old wine
+  (6.17-staging amd64) hangs a nimony PE at exit - wine 11.x works.
