@@ -503,6 +503,26 @@ proc RaiseLastOSError*() =
 # fcCustomFormat's format callback) - no arithmetic or conversion is
 # exercised, so one concrete shape keeps every signature type-checking.
 # A real VarData model is a documented next tier.
+
+# New/Dispose: the corpus's pointer-record pools (THashedStringList's
+# PHashItem) — v1 allocates nothing (the buckets stay exercise-only)
+proc New*[T](p: var ptr T) =
+  discard
+
+proc Dispose*[T](p: ptr T) =
+  discard
+
+# pasCStr: Delphi's `PChar(Integer(P) + N)` pointer arithmetic has no
+# nimony spelling (int<->cstring casts are rejected); the v1 shim
+# answers nil and the corpus's binary-stream paths stay compile-only
+proc pasCStr*(a: int32): cstring =
+  result = nil
+
+# sameRef: nimony's `==`/`!=` refuse ref-object operands; class
+# comparisons rewrite to pointer identity (Delphi's `a = b` on objects)
+proc sameRef*(a, b: RootRef): bool =
+  result = cast[pointer](a) == cast[pointer](b)
+
 type
   Variant* = TVarRec
 

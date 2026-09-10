@@ -322,3 +322,9 @@ proc FormatDateTime*(fmt: string; dt: TDateTime): string =
 
 proc DateTimeToStr*(dt: TDateTime): string =
   FormatDateTime("yyyy-mm-dd hh:nn:ss", dt)
+
+proc DateToStr*(dt: TDateTime): string =
+  FormatDateTime("yyyy-mm-dd", dt)
+
+proc TimeToStr*(dt: TDateTime): string =
+  FormatDateTime("hh:nn:ss", dt)

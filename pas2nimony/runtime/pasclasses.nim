@@ -287,6 +287,78 @@ proc Sorted*(self: TStringList): bool =
 proc `Sorted=`*(self: TStringList; v: bool) =
   self.fSorted = v
 
+# TStream.Size/Position/CopyFrom: the binary-stream shims the
+# corpus's ReadBinaryStream/WriteBinaryStream paths touch
+proc Size*(self: TStream): int32 =
+  result = 0
+
+proc Position*(self: TStream): int32 =
+  result = 0
+
+proc CopyFrom*(self: TStream; src: TStream; count: int32) =
+  discard
+
+# TStrings.BeginUpdate/EndUpdate: the corpus's bulk-build paths
+proc BeginUpdate*(self: TStrings) =
+  discard
+
+proc EndUpdate*(self: TStrings) =
+  discard
+
+# TMemoryStream: the IniFiles ReadBinaryStream path needs Memory/
+# Position/Size/SetSize (v1: an empty backing store)
+type
+  TMemoryStream* = ref object of TStream
+    Memory*: int32    # the buffer address (v1: nil via pasCStr paths)
+    Position*: int32
+    fSize*: int32
+
+proc Create*(self: TMemoryStream): TMemoryStream =
+  result = self
+
+proc Size*(self: TMemoryStream): int32 =
+  result = self.fSize
+
+proc SetSize*(self: TMemoryStream; v: int32) =
+  self.fSize = v
+
+# Classes.HexToBin/BinToHex: v1 converts nothing (the corpus's
+# binary-stream paths are exercise-only)
+proc HexToBin*(text: string; buf: cstring; count: int32): int32 =
+  result = count
+
+proc BinToHex*(buf: cstring; text: string; count: int32) =
+  discard
+
+# TStrings.AddObject/Objects[]: the corpus's section lists ride them
+proc AddObject*(self: TStrings; s: string; obj: RootRef): int32 =
+  result = self.Add(s)
+
+proc GetObject*(self: TStrings; i: int32): RootRef =
+  result = nil
+
+# TStrings.Get: the corpus's UpdateValueHash loop reads by index
+proc Get*(self: TStrings; i: int32): string =
+  result = ""
+
+# TStrings.CaseSensitive: the corpus's THashedStringList reads and
+# writes the property through the inherited base
+proc CaseSensitive*(self: TStrings): bool =
+  result = false
+
+proc `CaseSensitive=`*(self: TStrings; v: bool) =
+  discard
+
+# TStrings.Changed: the corpus's THashedStringList overrides it (the
+# vtable slot needs the base's declaration)
+proc Changed*(self: TStrings) =
+  discard
+
+# TStrings.IndexOf: the ValueExists loop searches the TStrings-typed
+# local (a TStringList instance rides the base's method)
+proc IndexOf*(self: TStrings; item: string): int32 =
+  result = -1
+
 # TStringList.CommaText: the corpus only moves the value through the
 # property setter (and reads it back); v1 joins with commas
 proc CommaText*(self: TStringList): string =

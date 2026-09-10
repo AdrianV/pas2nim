@@ -156,18 +156,40 @@ proc expr(s: var TRendor, n: Node): string =
                 s.expr(n[1])
     result = op & " " & arg
   of nkCall:
-    result = s.expr(n[0]) & "("
-    for i in 1 ..< n.len:
-      if i > 1: result.add(", ")
-      result.add(s.expr(n[i]))
-    result.add(")")
+    # Delphi `PChar(x)`: a string variable passes through bare (nimony
+    # accepts only string LITERALS as a cstring() conversion); pointer
+    # arithmetic routes through the pasCStr shim (int<->cstring casts
+    # are rejected outright)
+    if n[0].kind == nkIdent and n.len == 2 and
+        n[0].strVal.toLowerAscii in ["pchar", "pwidechar", "pansichar"]:
+      if n[1].kind in {nkIdent, nkDotExpr}:
+        result = s.expr(n[1])
+      elif n[1].kind notin {nkStrLit}:
+        let pc = newNode(nkCall, n.info)
+        pc.add(newIdentNode("pasCStr", n.info))
+        pc.add(n[1])
+        result = s.expr(pc)
+      else:
+        result = s.expr(n[0]) & "("
+        result.add(s.expr(n[1]))
+        result.add(")")
+    else:
+      result = s.expr(n[0]) & "("
+      for i in 1 ..< n.len:
+        if i > 1: result.add(", ")
+        result.add(s.expr(n[i]))
+      result.add(")")
   of nkCommand:
     # procCall suppression of dynamic dispatch
     result = s.canon(n[0].strVal) & " " & s.expr(n[1])
   of nkDotExpr:
     let lhs = if n[0].kind in {nkInfix, nkPrefix, nkCall, nkIndexExpr,
-                               nkDeref, nkAddr}:
+                               nkAddr}:
                 "(" & s.expr(n[0]) & ")"
+              elif n[0].kind == nkDeref:
+                # `x[].f` is unambiguous nim; the parens break nimony's
+                # addr(x[].f) lvalue check
+                s.expr(n[0])
               else:
                 s.expr(n[0])
     let member = if s.syms != nil: s.syms[].canonicalMember(n[1].strVal)

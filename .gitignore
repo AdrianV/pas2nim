@@ -12,6 +12,8 @@ pas2nimony/test/private
 # scratch
 a/
 b/
+# relocated wine prefixes (Delphi 2007 oracle; never published)
+.wine/
 with.nim
 test.txt
 .tmpx/

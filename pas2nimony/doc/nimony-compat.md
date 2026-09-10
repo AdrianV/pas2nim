@@ -1008,3 +1008,50 @@ beyond `ord()` (IniFiles), `SyncObjs` corpus MSWINDOWS-only bodies
 under LINUX defines, and the VCL tier (`TFrame`/`TForm`/`Menus`) plus
 the ht-family adapter units. FPC cannot compile SyncObjs on Linux
 either (it needs Kyrix's Libc); the frames are a VCL shim tier.
+
+## M11 - Delphi 2007 oracle tier (dcc32 under wine)
+
+The oracle contract gains a Delphi leg: `test/delphi-oracle.sh` translates
+each corpus sample, compiles it with dcc32 (Delphi 2007) inside a wine
+prefix relocated into the workspace, runs both binaries and diffs the
+normalized output. FAILs are findings-only (the script exits 0); the
+census tracks the tier separately from the nimony leg.
+
+- Prefix: `../.wine/delphi2007/` (gitignored via `.wine/`). The DSH
+  sandbox is workspace-write only, so the prefix MUST live inside the
+  workspace - wine writes outside it hit "Read-only file system" and
+  dcc32 fails with `F2039 ...drf`.
+- Wine: `~/.PlayOnLinux/wine/linux-x86/7.11/bin/wine` (32-bit for the
+  win32 prefix). Skip `wineboot -u` (it times out; wine self-configures
+  on first use). Always `export WINEPREFIX=... WINEDEBUG=-all
+  XDG_CACHE_HOME=/tmp/xdg-cache` and normalize CRLF with `tr -d '\r'`.
+- dcc32 rule: with an ABSOLUTE source path the .exe lands next to the
+  source; compile the scratch copy under a RELATIVE name instead.
+- MSWINDOWS defines tier: the uses bridge grew a `windows` branch
+  importing `runtime/placeholders/Windows.nim` (the Win32 compat shim:
+  THandle/HWND/HWnd/HMODULE/HINSTANCE as `uint32`, the WAIT_*/QS_*/
+  PM_*/RPC_* consts, the wait/mutex/critical-section/window/OLE API
+  stubs, `Win32Platform`, `HWND_MESSAGE` = `0xFFFFFFFD'u32`). The
+  spelling passed to `absorbNimModule` must match the file name
+  (Linux is case-sensitive) or the scan silently runs on nothing.
+- `HMODULE`/`HINSTANCE` are `uint32` (D2007: `= THandle`), and
+  `FARPROC` carries the exact TCoWait signature so
+  `GetProcAddress(...)` assigns to the corpus's proc-type var.
+- Emitter additions this tier: `sameRef` class comparisons (nimony's
+  `==`/`!=` refuse ref objects; the rewrite runs at routine-body
+  completion where the per-routine param maps are still live),
+  `pasCStr` for `PChar(<int expr>)` (nimony forbids int<->cstring
+  casts outright), PChar(string var) passes through bare (nimony
+  accepts only string literals as cstring() args), ord() operands of
+  bit operators widen to the operand's width (rhsExprType now
+  propagates the narrow width through parens and bit chains), setLen
+  widens its count to int64, `New`/`Dispose`/`HexToBin`/`BinToHex`
+  shims, `TStrings.Get/CaseSensitive(+setter)/AddObject/GetObject/
+  BeginUpdate/EndUpdate/IndexOf/Changed`, `TMemoryStream`
+  (Memory as an int32 address number), and array consts of string
+  convert their char literals (`array[Boolean] of string = ('0','1')`).
+- `inherited m(...)` renders the arg form with the cast to the
+  member's DECLARING class (nimsem resolves the bare name through the
+  receiver's static type; the slot at that class carries the declaring
+  signature). The shim scan now parses `ref object of Parent` chains
+  (shim ancestor walks no longer collapse to no parent).
