@@ -458,7 +458,7 @@ const RtlNames* = [
   ("ord", "ord"), ("chr", "chr"), ("low", "low"),
   ("high", "high"), ("setlength", "setLen"), ("inc", "inc"), ("dec", "dec"),
   ("succ", "succ"), ("pred", "pred"), ("abs", "abs"), ("odd", "Odd"),
-  ("round", "round"), ("trunc", "trunc"), ("sizeof", "sizeof"),
+  ("round", "pasRound"), ("trunc", "trunc"), ("sizeof", "sizeof"),
   ("sqr", "sqr"), ("sqrt", "sqrt"), ("sin", "sin"), ("cos", "cos"),
   ("min", "min"), ("max", "max"),
   ("arctan", "arctan"), ("ln", "ln"), ("exp", "exp"), ("pi", "PI"),

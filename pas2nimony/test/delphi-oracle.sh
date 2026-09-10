@@ -55,8 +55,11 @@ for pas in "$HERE"/oracle/*.pas; do
   fi
   (cd "$w" && "$WINE" "./$name.exe" >run.raw 2>/dev/null)
   tr -d '\r' < "$w/run.raw" > "$w/dcc32.out"
-  (cd "$w" && "$ROOT/bin/pasler" --nimony:"$NIMONY" --run "$name.pas" \
-      >pasler.out 2>&1)
+  # The Delphi contrast leg models the Windows deployment of our chain:
+  # the shims compile with the MSW tier's defines so pasLineEnding is
+  # CRLF (Delphi's Windows RTL), while oracle.sh's FPC leg stays LF
+  (cd "$w" && "$ROOT/bin/pasler" --nimony:"$NIMONY" --run \
+      -d:MSWINDOWS -d:WIN32 -d:WINDOWS "$name.pas" >pasler.out 2>&1)
   if diff -u "$w/dcc32.out" "$w/pasler.out" > "$w/diff.txt" 2>&1; then
     echo "PASS $name"
   else

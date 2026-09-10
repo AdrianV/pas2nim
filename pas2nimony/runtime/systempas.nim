@@ -54,8 +54,8 @@ proc IntToStr*(i: int32): string = $i
 proc IntToStr*(i: uint32): string = $i
 proc IntToStr*(i: uint64): string = $i
 
-proc FloatToStr*(f: float): string = fpcFormatG(f, 15)
-proc FloatToStr*(f: float32): string = fpcFormatG(f, 15)
+proc FloatToStr*(f: float): string = applyDecSep(fpcFormatG(f, 15))
+proc FloatToStr*(f: float32): string = applyDecSep(fpcFormatG(f, 15))
 
 proc StrToIntDef*(s: char; def: int64): int64 =
   ## 1-char Pascal literal: never parses as a number
@@ -128,7 +128,7 @@ proc fpcWidthSci*(f: float64; w: int32): string =
   else:
     result = padWidth(body, w)
 
-proc pasW*(v: float64; w: int32): string = fpcWidthSci(v, w)
+proc pasW*(v: float64; w: int32): string = applyDecSep(fpcWidthSci(v, w))
 
 proc pasW*(v: string; w: int32): string = padWidth(v, w)
 
@@ -517,6 +517,66 @@ proc Dispose*[T](p: ptr T) =
 # answers nil and the corpus's binary-stream paths stay compile-only
 proc pasCStr*(a: int32): cstring =
   result = nil
+
+# pasLineEnding: the platform's native line terminator. Probed: nimony's
+# syncio is a pure-Nimony layer with NO text-mode translation, so even a
+# Windows build emits bare \n; the RTL spellings route through this
+# constant, mirroring FPC's LineEnding (CRLF on Windows, LF on Unix/macOS)
+when defined(MSWINDOWS):
+  const pasLineEnding* = "\r\n"
+else:
+  const pasLineEnding* = "\n"
+
+# TFormatSettings: the FPC-shaped locale record. v1 defaults are the
+# locale-independent '.'/','/ISO-ish forms; a per-platform locale query
+# (Win32 API / clocale) can fill the same fields later - Delphi reads the
+# Win32 locale on Windows, FPC reads clocale on Unix, so the shim matches
+# both once the values are populated.
+type
+  TFormatSettings* = object
+    DecimalSeparator*: char
+    ThousandSeparator*: char
+    DateSeparator*: char
+    TimeSeparator*: char
+    ShortDateFormat*: string
+    LongDateFormat*: string
+    ShortTimeFormat*: string
+    LongTimeFormat*: string
+
+var pasFormatSettings* = TFormatSettings(
+  DecimalSeparator: '.', ThousandSeparator: ',', DateSeparator: '/',
+  TimeSeparator: ':', ShortDateFormat: "yyyy-mm-dd",
+  LongDateFormat: "yyyy-mm-dd hh:nn:ss", ShortTimeFormat: "hh:nn",
+  LongTimeFormat: "hh:nn:ss")
+
+proc applyDecSep*(s: string): string =
+  ## swap the formatter's '.' for the configured decimal separator
+  let ds = pasFormatSettings.DecimalSeparator
+  if ds == '.': result = s
+  else:
+    result = s
+    var k = 0
+    while k < result.len:
+      if result[k] == '.': result[k] = ds
+      inc k
+
+proc pasRound*(f: float64): int64 =
+  ## Delphi/FPC banker's rounding: halves go to the even neighbor
+  ## (nim's round is half-away-from-zero). Truncation toward zero
+  ## (nimony has no floor) plus the signed-fraction handling
+  var t = int64(f)
+  var frac = f - float64(t)
+  if f < 0.0: frac = -frac
+  if frac > 0.5:
+    if f < 0.0: result = t - 1 else: result = t + 1
+  elif frac < 0.5:
+    result = t
+  elif (t mod 2) == 0:
+    result = t
+  elif f < 0.0:
+    result = t - 1
+  else:
+    result = t + 1
 
 # sameRef: nimony's `==`/`!=` refuse ref-object operands; class
 # comparisons rewrite to pointer identity (Delphi's `a = b` on objects)

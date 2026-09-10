@@ -116,11 +116,12 @@ proc `[]=`*(self: TStringList; key: string; v: string) =
   self.fLines.add(key & "=" & v)
 
 proc Text*(self: TStringList): string =
-  ## all lines joined with newlines (no setter in v1)
+  ## all lines joined with the platform line ending (Delphi on Windows
+  ## uses CRLF; FPC uses LineEnding - CRLF on Windows, LF on Unix)
   result = ""
   var k = 0
   while k < self.fLines.len:
-    result.add(self.fLines[k] & "\n")
+    result.add(self.fLines[k] & pasLineEnding)
     inc k
 
 proc IndexOf*(self: TStringList; s: string): int32 =

@@ -1076,3 +1076,37 @@ through C `stdout` in text mode, so the MSVCRT translates `\n` to
   procs without `__stdcall`, so Ubuntu mingw's decorated imports
   `_ExitProcess@4` never match); use `--cpu:amd64` for now. Old wine
   (6.17-staging amd64) hangs a nimony PE at exit - wine 11.x works.
+
+### M11b - cross-platform line endings, locale record, banker's rounding
+
+Landing of the "Delphi on Windows, FPC normalization elsewhere" policy:
+
+- `runtime/systempas.nim` gains `pasLineEnding` (`"\r\n"` under
+  `-d:MSWINDOWS`, `"\n"` otherwise - the FPC `LineEnding` model) and
+  `TFormatSettings`/`pasFormatSettings` (the FPC-shaped locale record;
+  v1 defaults are `.`/`,`/ISO-ish, a per-platform locale query can fill
+  the same fields later). `FloatToStr` and the `Writeln` float path
+  route through `applyDecSep`, so populating `DecimalSeparator` from a
+  locale makes the German-locale outputs (`0,6046875`, `ratio=2,6`)
+  match Delphi without code changes.
+- `runtime/pasclasses.nim`'s `TStrings.Text` joins with
+  `pasLineEnding` - Delphi's CRLF-joined text on Windows, FPC's LF on
+  Unix from the same source (the `strlist` oracle sample's
+  `textlen=23` finding is resolved by this).
+- `pasRound` implements Delphi/FPC banker's rounding (halves to the
+  even neighbor; nim's `round` is half-away-from-zero) and the RTL
+  spell map now sends `Round` there - `RoundTo(2.5, 0) = 2` matches
+  Delphi's `rt=` row.
+- The SimpleRoundTo finding turns out to be the Extended-precision
+  divergence, not rounding: Delphi's 80-bit Extended keeps
+  `2.675/0.01` below the half, FPC (and our double-based shim) print
+  `2.68`. Ours matches FPC, which is the anchor per policy; documented
+  as a deliberate divergence.
+- `test/delphi-oracle.sh`'s pasler leg now compiles with
+  `-d:MSWINDOWS -d:WIN32 -d:WINDOWS` (the Windows deployment of our
+  chain - CRLF line endings) while `oracle.sh`'s FPC leg stays LF.
+  Delphi census: 6/15 PASS (was 5); `funcs`/`ordinals`/`strapio` still
+  fail at the dcc32-compile step (VCL-tier census units).
+- `test/private/compile-errors.sh`/`compile.sh` thread the LINUX/UNIX/
+  POSIX defines into their nimony compile lines so the shims see the
+  same platform identity the translation used.
