@@ -26,7 +26,7 @@ type
     lnAdded, lnDeleted, lnExtracted  # Delphi order
 
   TList* {.inheritable.} = ref object of RootRef
-    fItems*: seq[RootRef]
+    fItems*: seq[pointer]
 
   TStrings* {.inheritable.} = ref object of RootRef
   TStream* {.inheritable.} = ref object of RootRef
@@ -115,8 +115,24 @@ proc `[]=`*(self: TStringList; key: string; v: string) =
     inc k
   self.fLines.add(key & "=" & v)
 
+proc Put*(self: TStringList; key: string; v: string) =
+  ## the string-indexed setter call: `List.Strings['key'] := v` lowers to
+  ## this (pasnimout.stmt / pasnifout.emitStmt map the indexed property to
+  ## its accessor call, because nimony has no indexed-property form).
+  ## Same body as `[]=`, which the direct `List['key'] := v` spelling uses.
+  `[]=`(self, key, v)
+
 proc Put*(self: TStringList; i: int32; s: string) =
+  ## the integer-indexed setter call: `List.Strings[i] := s` lowers to
+  ## this. The base `TStrings.Put` is only a stub (the abstract base has no
+  ## storage), so the concrete override is what makes the property work -
+  ## an inherited stub would silently discard the write.
   self.fLines[i] = s
+
+proc Get*(self: TStringList; i: int32): string =
+  ## the integer-indexed getter call: `List.Strings[i]` lowers to this.
+  ## Same reason as `Put`: without it the base's stub returns "".
+  self.fLines[int(i)]
 
 proc Text*(self: TStringList): string =
   ## all lines joined with the platform line ending (Delphi on Windows
@@ -222,28 +238,145 @@ proc LoadFromFile*(self: TStringList; path: string) =
     if cur.len > 0: self.fLines.add(cur)
   except Exception:
     discard
-# TList - the pointer-list container (v1: items ride RootRef; the
-# corpus only stores/reads TObject references through it)
+# TComponent notification hook: the corpus's TComponentListNexus
+# overrides it. The ctor mirrors Delphi's TComponent.Create(AOwner) on
+# a preallocated instance so subclass ctor calls dispatch here through
+# the ancestor (nimsem rejects a descendant instance against
+# typedesc[TComponent]; the instance form upcasts freely)
+proc Create*(self: typedesc[TComponent]): TComponent =
+  var r = TComponent()
+  result = r
+
+proc Create*(self: TComponent; AOwner: TComponent): TComponent =
+  result = self
+
+method FreeNotification(self: TComponent; AComponent: TComponent) =
+  ## Delphi's TComponent.FreeNotification: the corpus's
+  ## TComponentList.Notify registers a free-notification link; the v1
+  ## shim discards (no destruction machinery to hook)
+  discard
+
+method Notification*(self: TComponent; AComponent: TComponent;
+                     Operation: TOperation) =
+  ## the ancestor notification hook (the corpus's TComponentListNexus
+  ## overrides it)
+  discard
+
+# `TObject(Ptr).Free` / `TObject(Ptr).FreeNotification(x)` on a
+# POINTER-typed receiver (Contnrs' TObjectList.Notify, TComponentList):
+# the WIP translator lowers these to pasFreeObj / pasFreeNotification
+# (paspars.mapStringBuiltins), and **neither helper can be written yet**.
+#
+# nimony resolves a method call in the *static* receiver's vtable, and
+# `cast[RootRef](p)` makes that receiver RootRef - whose vtable is the
+# builtin RootObj's, with no entries and no way to add one from a shim.
+# So `Destroy(cast[RootRef](p))` is a hard error:
+#   [Error] method `Destroy` not found in class RootObj
+# Declaring method roots on TList/TStrings/TStream/TPersistent does not
+# help (verified), and dropping the cast would lose the virtual dispatch
+# the whole lowering exists for. A module that merely *contains* such a
+# helper fails to build even when it never calls it, so there is no
+# partial shim to ship - the lowering needs the receiver's real class.
+#
+# Until then the translator must not emit these two names; Contnrs'
+# TObjectList.Notify and TComponentList.Notify are the only corpus
+# callers. See doc/toolchain.md lesson 41.
+proc fItemsSame(p: pointer; r: RootRef): bool =
+
+  cast[pointer](r) == p
+
 proc Create*(self: typedesc[TList]): TList =
   var r = TList()
   r.fItems = @[]
   result = r
 
-proc Add*(self: TList; item: RootRef): int32 =
+proc Add*(self: TList; item: pointer): int32 =
+  # Delphi's TList is a pointer list; the corpus's object wrappers cast
   self.fItems.add(item)
   result = int32(self.fItems.len - 1)   # Delphi returns the index
+
+proc Add*(self: TList; item: RootRef): int32 =
+  ## the corpus's TList.Add(TObject) wrapper argument
+  self.fItems.add(cast[pointer](item))
+  result = int32(self.fItems.len - 1)
+
+proc Delete*(self: TList; index: int32) =
+  # Delphi TList.Delete: the corpus's TOrderedList.Delete forwards here
+  self.fItems.delete(int(index))
 
 proc Count*(self: TList): int32 =
   int32(self.fItems.len)
 
-proc `[]`*(self: TList; i: int32): RootRef =
-  self.fItems[i]
+proc `[]`*(self: TList; i: int32): pointer =
+  result = cast[pointer](self.fItems[i])
 
 proc `[]=`*(self: TList; i: int32; v: RootRef) =
-  self.fItems[i] = v
+  self.fItems[i] = cast[pointer](v)
+
+proc Last*(self: TList): pointer =
+  # Delphi TList.Last: the last item (v1: nil on an empty list)
+  if self.fItems.len > 0:
+    self.fItems[self.fItems.len - 1]
+  else:
+    nil
+
+proc Notify*(self: TList; pv: pointer; action: TListNotification) =
+  ## the ancestor notification hook (the corpus's TObjectList overrides
+  ## it; the shim's TList stores objects directly, nothing to do here)
+  discard
+
+proc Remove*(self: TList; item: RootRef): int32 =
+  var k = 0
+  while k < self.fItems.len:
+    if fItemsSame(self.fItems[k], item):
+      self.fItems.delete(k)
+      return int32(k)
+    inc k
+  result = -1
+
+proc Insert*(self: TList; i: int32; item: pointer) =
+  # the pointer overload mirrors the RootRef insert (no nimony seq insert)
+  var old = self.fItems
+  if i >= old.len:
+    self.fItems.add(item)
+  else:
+    self.fItems = @[]
+    var k = 0
+    while k < i:
+      self.fItems.add(old[k])
+      inc k
+    self.fItems.add(item)
+    k = i
+    while k < old.len:
+      self.fItems.add(old[k])
+      inc k
+
+proc IndexOf*(self: TList; item: RootRef): int32 =
+  for k in 0 ..< self.fItems.len:
+    if self.fItems[k] == cast[pointer](item):
+      return int32(k)
+  result = -1
+
+proc Insert*(self: TList; i: int32; item: RootRef) =
+  # a middle insert shifts the tail entries (while loops: nimony's
+  # slice iteration over mixed int widths resolves to the set op)
+  var old = self.fItems
+  if i >= old.len:
+    self.fItems.add(cast[pointer](item))
+  else:
+    self.fItems = @[]
+    var k = 0
+    while k < i:
+      self.fItems.add(old[k])
+      inc k
+    self.fItems.add(cast[pointer](item))
+    k = i
+    while k < old.len:
+      self.fItems.add(old[k])
+      inc k
 
 # Delphi TList.First: the first item (v1: nil on an empty list)
-proc First*(self: TList): RootRef =
+proc First*(self: TList): pointer =
   result = nil
   if self.fItems.len > 0:
     result = self.fItems[0]
@@ -254,7 +387,7 @@ proc Extract*(self: TList; item: RootRef): RootRef =
   result = nil
   var idx = -1
   for i in 0 ..< self.fItems.len:
-    if self.fItems[i] == item:
+    if self.fItems[i] == cast[pointer](item):
       idx = i
       break
   if idx >= 0:

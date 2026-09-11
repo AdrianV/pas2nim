@@ -3,8 +3,38 @@
 pas2nimony is built and tested **with the nimony toolchain itself**:
 
 ```
-../nimony/bin/nimony   (nimony 0.4.0 at time of writing)
+../nimony/bin/nimony   (nimony 0.6.3 development at time of writing)
 ```
+
+Two consumption paths exist, and both must be kept working:
+
+| path | front end | driver invocation |
+|---|---|---|
+| `.nim` | `pas2nimony` renders Nim source | `nimony c --path:. foo.nim` |
+| pasler NIF | `pasler` writes parsed NIF directly | `nimony s --path:… foo.p.nif` |
+
+`pasler` is the primary one; `test/run.sh` exercises both, as does
+`test/oracle.sh` (differential against FPC 3.2.2).
+
+## Version history and what each bump changed
+
+- **0.4.0 → 0.6.3 development** (nimony `19973add..2a458ed9`, 2026-08-30 →
+  2026-09-11, 66 commits; nativenif `73eadb4..7bd3d04`, 22 commits). The
+  update was verified **not** to break this project: no emitted tag moved
+  (all 48 tags pas2nimony registers resolve to identical numeric ids), the
+  parsed-NIF contract and `nifmake`/`--path`/`-o:`/nimcache handling are
+  unchanged, and the three failures it was suspected of causing reproduce
+  identically on a 0.4.0 build (see lessons 37/38).
+- Upstream's `formatBiggestFloat`/`formatFloat` lost their `snprintf`
+  dependency in this range. The shim's `fpcFormatE`/`fpcFormatG`/
+  `fpcSciMantissa` route through those, so FPC-equivalence was re-measured:
+  digit-for-digit identical to FPC 3.2.2 across `%f`, `%e`, `%g`, `%n`,
+  `%m` and a grid of magnitudes and precisions, with **two** known
+  non-equivalences that are ours, not upstream's: `%.0f` of a `x.5` value
+  rounds half-to-even (FPC rounds half-away) and non-finite values lose
+  their sign/spelling (`FloatToStr(1.0/0.0)` prints `0`, FPC prints
+  `+Inf`). Both reproduce on the 0.4.0 build, so neither is a regression -
+  they are latent shim defects.
 
 ## Pinned nimony commit
 
@@ -228,13 +258,75 @@ translator itself — keep current:
     a routine-call result to a base-typed var fails the nil-proof
     (`cannot prove expression is not nil`) — wrap the RHS in
     `cast[Base](...)`.
-37. **A local declaration shadows an imported one entirely** (no
-    cross-module overload resolution): a subclass's own `create`
-    hides the prelude's constructor even for `inherited` calls —
-    give prelude routines non-colliding names (`pasExcCreate`).
-38. **nimony's build cache can silently no-op**: `nimony c -o:bin/x
-    src/x.nim` may exit 0 without rebuilding when a same-minute
-    artifact exists, so `./build.sh` "succeeds" while the binary keeps
-    the old parser — a "mysterious" persisted error right after editing
-    the source means a stale binary; `rm -rf nimcache bin/pas2nimony`
-    and rebuild before debugging parser changes.
+37. **A local declaration does not hide an imported overloadable one**
+    (nimony 0.6.x: `import` is not a shadowing boundary). A proc/func/
+    template/iterator/enum field in the same module joins the *same*
+    symbol choice as an imported one of that name; the choice is then
+    resolved by expected type first, then scope distance. So a subclass's
+    own `create` no longer hides the prelude constructor — verified on
+    both 0.4.0 and 0.6.3 for a cross-module `Create(cast[Base](self), m)`
+    call. What *does* still break is the **same-module** case: when the
+    user's subclass and the base constructor live in one generated module
+    (as in `test/except.pas`), the translator's own `MyError.Create` is a
+    genuine candidate for its own body's `Create(...)` call, and the
+    argument is cast to the base so the derived overload matches first:
+    `expected: EMyError.Obj but got: PasException.Obj`. Give the prelude
+    routine a non-colliding name (`pasExcCreate` in `systempas.nim`) -
+    the discipline is still required, just for a narrower reason than this
+    entry originally claimed.
+38. **nimony's build cache is now graph-driven, not mtime-guesswork**:
+    `cachedconfigfile.txt` stopped being an input of every sem node and a
+    new `nifmake --rerun` flag forces a re-sem when options change. The
+    old advice — `rm -rf nimcache bin/pas2nimony` before debugging a
+    "mysterious" persisted error — is still safe, but a same-minute edit
+    no longer silently no-ops. **Do not run two toolchain builds
+    concurrently against the same nimcache**: with `nifmake -j`, a second
+    build reusing the cache can fail with
+    `[Error] cannot open: nimcache/<mod>.s.nif`, which is a cache
+    collision, not a real error. Clean `nimcache` and re-run alone before
+    investigating that message.
+39. **`uses <placeholder unit>` needs the module next to the anchor**:
+    paspars absorbs a unit that has no real source (`Windows`, `Forms`,
+    `Controls`, …) and the anchor then says `import Windows`. The
+    `runtime/placeholders` directory is deliberately *not* on `--path`
+    (it only ever supplies declarations, and a real unit of the same name
+    must win), so `nimony` reports `file not found`. Both drivers mirror
+    the placeholder into nimcache — `pasler.mirrorPlaceholders` and the
+    `cp runtime/placeholders/*.nim` in `test/run.sh` — and never overwrite
+    an existing file of that name.
+40. **Indexed collection properties are accessor calls in both emitters**:
+    Pascal's `List.Strings[i]`, `.Objects[i]`, `.Values[k]`, `.Names[i]`
+    have no nimony equivalent, so `pasnimout`/`pasnifout` lower them to
+    `Get`/`Put`, `GetObject`/`PutObject`, `GetValue`, `GetName`. nimsem
+    does *not* resolve `(dot obj Prop)` through the shim's accessors on
+    parsed NIF, so the NIF emitter must do the same lowering as the `.nim`
+    emitter or the pasler path disagrees with it. Each of those accessors
+    needs a **concrete override on `TStringList`**: the `TStrings` base is
+    abstract and its accessors are stubs, so an inherited `Get` silently
+    returns `""` and an inherited `Put` discards the write.
+41. **A method call resolves in the *static* receiver's vtable, and
+    `RootRef`'s vtable is the builtin `RootObj`'s — empty and not
+    extensible.** `cast[RootRef](p)` followed by a method call is
+    therefore a hard error, even though the call would dispatch fine on a
+    typed receiver:
+    ```
+    [Error] method `Destroy` not found in class RootObj
+    ```
+    Declaring `method Destroy*(self: TList)` (and on every other shim
+    root, and on `TPersistent` for the `TComponent` branch) does **not**
+    fix it — verified. Consequence for the WIP lowering of
+    `TObject(Ptr).Free` / `TObject(Ptr).FreeNotification(x)` in
+    `paspars.mapStringBuiltins`: `pasFreeObj` / `pasFreeNotification`
+    cannot be implemented as shims until the translator can name the
+    receiver's real class, and a module that merely *contains* such a
+    helper fails to build even when the call never executes — so there is
+    no partial version to ship. Do not reintroduce those two names
+    without solving that first; Contnrs' `TObjectList.Notify` and
+    `TComponentList.Notify` are the only corpus callers.
+    `pasPtrToObj`, which sat next to them, was never needed at all: a
+    plain `cast[TargetTy](ptr)` works (the translator emits it directly).
+42. **`p.outerResultTy` is stored lowercased, and nimsem's `cast` check is
+    case sensitive.** A cast built from it emits `cast[rootref]`, which
+    fails with `cannot cast between types pointer and rootref`; the
+    spelling has to come back through `passym.rtlSpelling`
+    (`tobject`/`tclass` → `RootRef`) the way the other cast sites do.

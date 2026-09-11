@@ -57,6 +57,7 @@ type
     extra*: seq[TExtraStmt]
     props*: seq[TPropDecl]
     outerProcName*: string      ## enclosing routine (for `inherited`)
+    outerResultTy*: string      ## enclosing routine's result spelling, lowercased
     outerIsMethod*: bool        ## enclosing routine is a virtual method
     outerParams*: seq[string]   ## param names of the enclosing routine
     module*: Node               ## the nkStmtList built so far
@@ -75,6 +76,10 @@ type
     pointerAliases*: Table[string, string] ## P = ^T alias -> element
     routineReturns*: Table[string, string] ## routine name -> return spelling
     routineParams*: Table[string, seq[string]] ## routine name -> param spellings
+    variantParams*: Table[string, seq[bool]] ## routine -> which params are Variant
+    varRawTypes*: Table[string, string] ## var name -> *Pascal* type spelling
+                                        ## (Currency is float64 in nimony but
+                                        ## varCurrency in a Variant)
     routineParamDefaults*: Table[string, seq[Node]]
     ## interface-declared default param values by `class.name:argc` -
     ## the implementation redeclaration repeats them so nimony merges
@@ -473,7 +478,7 @@ proc scanNimExports(ln: string; s: var SymTab) =
           while v < t.len and t[v] in {'a'..'z', 'A'..'Z', '0'..'9', '_'}:
             pn.add(t[v]); inc v
           par = pn
-        s.registerClass(name, par, true)
+        s.registerClassShape(name, par, true)
       return
   # declaration keywords: `proc* name` / `proc name*(`
   const kws = ["proc", "func", "iterator", "template", "converter",
@@ -965,6 +970,50 @@ proc stringBaseType(p: var TParser, base: Node): string =
   else:
     discard
 
+proc isOrdinalSpelling(ty: string): bool =
+  ## integer/ordinal spellings the RTL map produces (rtlSpelling) - the
+  ## source side of the Win32-era `Pointer(<ordinal>)` reinterpretation
+  case ty
+  of "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32",
+     "uint64", "int", "uint", "bool", "char":
+    result = true
+  else:
+    result = false
+
+proc isPointerishSpelling(ty: string): bool =
+  ## spellings that hold a raw address or an object reference - the
+  ## source side of the Win32-era `Integer(<pointer>)` reinterpretation
+  result = ty == "pointer" or ty == "rootref" or ty.startsWith("class:") or
+           ty.startsWith("ptr") or ty.startsWith("ref ")
+
+proc operandDomain(p: var TParser; a: Node): string =
+  ## the operand's domain for Delphi's typecast rules: "num" (ordinal),
+  ## "ptr" (raw pointer), "ref" (object/method reference), "" unknown.
+  ## Delphi casts WITHIN one domain are conversions (`int32(1)`,
+  ## `float(1)`) and stay plain calls; casts ACROSS domains are
+  ## reinterpretations (`Integer(ptr)`, `Pointer(someInt)`,
+  ## `TObject(ptr)`) and need `cast[...]`, which nimsem requires anyway -
+  ## it accepts neither an ordinal->pointer nor a ref->pointer
+  ## conversion, on any target.
+  var ty = ""
+  case a.kind
+  of nkIdent:
+    ty = p.stringBaseType(a)
+  of nkCast:
+    if a.len == 2 and a[0].kind == nkIdent:
+      ty = p.syms.canonical(a[0].strVal).toLowerAscii
+  of nkIntLit:
+    return "num"
+  of nkNilLit:
+    return "ptr"
+  else:
+    return ""
+  if ty.len == 0: return ""
+  if ty == "pointer": return "ptr"
+  if isOrdinalSpelling(ty): return "num"
+  if isPointerishSpelling(ty): return "ref"
+  result = ""
+
 proc bracketExprList(p: var TParser, first: Node): Node =
   result = newNode(nkIndexExpr, first.info)
   result.add(first)
@@ -1159,6 +1208,11 @@ proc primary(p: var TParser): Node =
           let op = p.syms.getConvOp(rcls, "explicit", rcls, targetKey)
           if op.len > 0:
             result[0] = newIdentNode(op, result[0].info)
+      # `Variant(x)` is a *cast*: measured (test/variant/vcast.pas) to agree
+      # with the implicit conversion for every source type in both oracles
+      if result.len == 2 and result[0].kind == nkIdent and
+          result[0].strVal.toLowerAscii in ["variant", "olevariant"]:
+        result = variantCoerce(p, result[1])
       # a 1-char Pascal literal passed to a callee is a string in
       # almost every signature; char-arg procs keep the char. The
       # callee's declared param types win over the default.
@@ -1174,6 +1228,36 @@ proc primary(p: var TParser): Node =
           wc.add(newIdentNode("int64", result[2].info))
           wc.add(result[2])
           result[2] = wc
+        if a.kind == nkIdent and
+            a.strVal.toLowerAscii in ["vararrayof", "vararraycreate"] and
+            result.len > 1 and result[1].kind == nkBracket:
+          # VarArrayOf([...]) - an open `array of Variant`, so each element
+          # must be built; VarArrayCreate's bounds are `array of Integer`
+          # (int32 in the shim) and a literal array is typed int64 by nimony
+          let br = result[1]
+          let isOf = a.strVal.toLowerAscii == "vararrayof"
+          for bi in 0 ..< br.len:
+            br[bi] = if isOf: variantArrayElem(p, br[bi])
+                     else: variantInt32Arg(p, br[bi])
+        block:
+          # Variant-typed parameters (Delphi's implicit conversion)
+          var vps: seq[bool] = @[]
+          if a.kind == nkIdent:
+            vps = p.variantParams.getOrDefault(a.strVal.toLowerAscii)
+            if vps.len == 0 and p.selfClass.len > 0:
+              vps = p.variantParams.getOrDefault(
+                  p.selfClass.toLowerAscii & "." & a.strVal.toLowerAscii)
+            if vps.len == 0 and p.classOfProc.len > 0:
+              vps = p.variantParams.getOrDefault(
+                  p.classOfProc.toLowerAscii & "." & a.strVal.toLowerAscii)
+          elif a.kind == nkDotExpr and a[1].kind == nkIdent:
+            vps = p.variantParams.getOrDefault(a[1].strVal.toLowerAscii)
+            if vps.len == 0 and a[0].kind == nkIdent:
+              vps = p.variantParams.getOrDefault(
+                a[0].strVal.toLowerAscii & "." & a[1].strVal.toLowerAscii)
+          for ai in 1 ..< result.len:
+            if ai - 1 < vps.len and vps[ai - 1]:
+              result[ai] = variantCoerce(p, result[ai])
         if a.kind == nkIdent:
           argTypes = p.routineParams.getOrDefault(a.strVal.toLowerAscii)
           if argTypes.len == 0 and p.selfClass.len > 0:
@@ -1218,6 +1302,13 @@ proc primary(p: var TParser): Node =
               wc.add(newIdentNode(narrow, result[ai].info))
               wc.add(result[ai])
               result[ai] = wc
+      if result.len > 1 and a.kind == nkIdent:
+        # the dialect shim's own Variant-taking helpers (VarType, VarToStr,
+        # VarAsType, VarIs*, VarArray*): their signatures live in the Nim
+        # runtime, so the parser carries the positions
+        for pos in variantShimArgPositions(a.strVal.toLowerAscii):
+          if pos < result.len:
+            result[pos] = variantCoerce(p, result[pos])
       if a.kind == nkIdent and a.strVal in p.nestedProcs:
         # nested routines see `self` implicitly
         result.add(newIdentNode("self", a.info))
@@ -1444,6 +1535,19 @@ proc lowestExprAux(p: var TParser, v: var Node, limit: int): TTokKind =
       node.add(callee)
       node.add(v)
     else:
+      if isVariantExpr(p, v) or isVariantExpr(p, v2):
+        # Variant arithmetic/comparison: Pascal semantics live in the shim's
+        # named procs (they raise on a type mismatch, exactly like Delphi)
+        let vop = variantOpName(opNode.strVal)
+        if vop.len > 0:
+          let vc = newNode(nkCall, node.info)
+          vc.add(newIdentNode(vop, node.info))
+          vc.add(variantCoerce(p, v))
+          vc.add(variantCoerce(p, v2))
+          v = vc
+          op = nextop
+          opPred = getPrecedence(nextop)
+          continue
       if op == pxSlash:
         # Pascal `/` is real division; nimony's `/` accepts floats
         # only - convert non-float operands explicitly
@@ -1504,7 +1608,7 @@ proc parseExprStmt*(p: var TParser): Node =
   if p.tok.xkind == pxAsgn:
     getTokP(p)
     skipCom(p)
-    let b = parseExpr(p)
+    var b = parseExpr(p)
     # an empty `[]` assigned to a set-typed target is the empty SET
     # (nimony's `[]` is an auto array literal that will not coerce);
     # the renderer keeps plain empty `[]` for openArray call args
@@ -1738,6 +1842,7 @@ proc parseParamList*(p: var TParser): Node =
             # statement discard rule, per-class return keys) needs it
             p.varTypes[n.toLowerAscii] = "class:" & lastType.strVal
           else:
+            p.varRawTypes[n.toLowerAscii] = pty
             let rtl = rtlSpelling(pty)
             if rtl.len > 0:
               p.varTypes[n.toLowerAscii] = rtl
@@ -1925,6 +2030,11 @@ proc parseVarSection*(p: var TParser): Node =
           for i in 0 ..< defs.len - 2:
             if defs[i].kind == nkIdent:
               p.varTypes[defs[i].strVal.toLowerAscii] = mapped
+        # the *Pascal* spelling as well: Currency and TDateTime are plain
+        # float64 here but carry their own Variant tag (measured)
+        for i in 0 ..< defs.len - 2:
+          if defs[i].kind == nkIdent:
+            p.varRawTypes[defs[i].strVal.toLowerAscii] = tyKey
 
 proc parseConstSection*(p: var TParser): Node =
   result = newNodeP(nkConstSection, p)
@@ -1945,7 +2055,12 @@ proc parseConstSection*(p: var TParser): Node =
     skipCom(p)
     p.syms.declareName(name)
     let def = newNode(nkIdentDefs, info)
-    def.add(newIdentNode(name, info))
+    # interface consts/resourcestrings travel as module-level consts in
+    # the generated unit; without the export marker a consuming unit
+    # (import <Unit>) sees "undeclared identifier" (the parseIdentColon-
+    # Equals rule applies to consts too)
+    def.add(exSymbol(newIdentNode(name, info),
+        p.section == seInterface and p.visibility != visPrivate))
     if p.tok.xkind == pxColon:
       getTokP(p)
       skipCom(p)
@@ -3275,6 +3390,7 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
           " (v1 supports class procedure/function/operator/var)")
   let oldOuterName = p.outerProcName
   let oldOuterIsMethod = p.outerIsMethod
+  let oldOuterResultTy = p.outerResultTy
   let oldClass = p.classOfProc
   let oldSelfClass = p.selfClass
   let oldVisibility = p.visibility
@@ -3389,6 +3505,22 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
   result.add(typeVars)
   # params
   let params = p.parseParamList()
+  block:
+    # which parameters are Variant-typed: nimony applies no converters, so
+    # the call site has to build the Variant value itself. Recorded for
+    # procedures as well (routineParams is only filled for functions).
+    var vps: seq[bool] = @[]
+    for pi in 1 ..< params.len:
+      let d = params[pi]
+      vps.add(d.kind == nkIdentDefs and d.len >= 2 and
+              d[d.len - 2].kind == nkIdent and
+              d[d.len - 2].strVal.toLowerAscii in ["variant", "olevariant"])
+    if true in vps:
+      p.variantParams[name.toLowerAscii] = vps
+      if p.classOfProc.len > 0:
+        p.variantParams[p.classOfProc.toLowerAscii & "." & name.toLowerAscii] = vps
+      if p.selfClass.len > 0:
+        p.variantParams[p.selfClass.toLowerAscii & "." & name.toLowerAscii] = vps
   p.opt(pxSemiColon)
   skipCom(p)
   # return type (function)
@@ -3592,6 +3724,20 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
   else:
     p.outerProcName = name
     p.outerIsMethod = isVirtual and isMethod and not isClassProc
+    p.outerResultTy = p.mappedTypeName(params[0]).toLowerAscii
+    # register the member's param type spellings for inherited-call
+    # arg coercion (the corpus's Pointer-vs-TObject params)
+    if p.selfClass.len > 0:
+      var ptyParts: seq[string] = @[]
+      for i in 1 ..< params.len:
+        let d = params[i]
+        if d.kind == nkIdentDefs:
+          let dmty = p.mappedTypeName(d[d.len - 2])
+          let parts = if dmty.len > 0: dmty
+                      else: d[d.len - 2].strVal.toLowerAscii
+          for j in 0 ..< d.len - 2:
+            ptyParts.add(parts)
+      p.syms.addMemberParams(p.selfClass, name, ptyParts.join(";"))
     # param types for 1-based string indexing inside the body
     let savedParamTypes = p.paramTypes
     p.paramTypes = initTable[string, string]()
@@ -3657,6 +3803,7 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
     p.varTypes["result"] = oldResultVt
     p.outerProcName = oldOuterName
     p.outerIsMethod = oldOuterIsMethod
+    p.outerResultTy = oldOuterResultTy
     p.outerParams = savedOuterParams
     p.paramTypes = savedParamTypes
     p.classOfProc = oldClass
@@ -3794,6 +3941,14 @@ proc parseInherited*(p: var TParser): Node =
       result = d
   else:
     # `inherited name(args)` or `inherited name`
+    # capture the member name before parseStmt: statement-position
+    # builtin mapping may rename the call's callee (the corpus's bare
+    # `Insert(s, s2, idx)` becomes strInsert) and would defeat the
+    # same-name test below
+    let memberName = if p.tok.xkind == pxSymbol:
+      p.tok.ident.toLowerAscii
+    else:
+      ""
     var a = parseStmt(p)
     var call: Node
     # a bare call statement comes back discard-wrapped; unwrap it
@@ -3809,10 +3964,48 @@ proc parseInherited*(p: var TParser): Node =
     # (child) method; qualify the parent type so nimsem checks the
     # parent's own signature
     let sameName = p.outerProcName.len > 0 and
-        ((a.kind == nkCall and a.len > 0 and a[0].kind == nkIdent and
+        (memberName == p.outerProcName.toLowerAscii or
+         (a.kind == nkCall and a.len > 0 and a[0].kind == nkIdent and
           a[0].strVal.toLowerAscii == p.outerProcName.toLowerAscii) or
          (a.kind == nkIdent and
           a.strVal.toLowerAscii == p.outerProcName.toLowerAscii))
+    # the corpus's Pointer-vs-TObject member params: coerce class-typed
+    # args to pointer form when the ancestor's member declares Pointer
+    var mpRaw = p.syms.memberParamsOf(parent, memberName)
+    if mpRaw.len == 0:
+      # walk the ancestor chain: the member may be declared above the
+      # direct parent (TObjectStack.Push -> TOrderedList.Push)
+      var wk = parent.toLowerAscii
+      var wguard = 0
+      while wk.len > 0 and wguard < 100:
+        let wci = p.syms.classes.getOrDefault(wk)
+        if wci.spelling.len == 0: break
+        mpRaw = p.syms.memberParamsOf(wci.spelling, memberName)
+        if mpRaw.len > 0: break
+        wk = wci.parent
+        inc wguard
+    var mpParts: seq[string] = @[]
+    if mpRaw.len > 0:
+      var cur = ""
+      for ch in mpRaw:
+        if ch == ';':
+          mpParts.add(cur)
+          cur = ""
+        else:
+          cur.add(ch)
+      mpParts.add(cur)
+    if a.kind == nkCall and mpParts.len > 0:
+      for i in 1 ..< a.len:
+        let pi = i - 1
+        if pi < mpParts.len and mpParts[pi].toLowerAscii == "pointer" and
+            a[i].kind == nkIdent:
+          let aty = p.paramTypes.getOrDefault(a[i].strVal.toLowerAscii)
+          if aty.toLowerAscii == "rootref" or
+              aty.toLowerAscii.startsWith("class:"):
+            let pcn = newNode(nkCast, a[i].info)
+            pcn.add(newIdentNode("pointer", a[i].info))
+            pcn.add(a[i])
+            a[i] = pcn
     if sameName:
       var declCls = parent
       var k = parent.toLowerAscii
@@ -3828,14 +4021,60 @@ proc parseInherited*(p: var TParser): Node =
       let declCast = newNode(nkCast, info)
       declCast.add(newIdentNode(declCls, info))
       declCast.add(selfNode)
+      # the callee spelling: a constructor must render through the name
+      # registry (the source may write `inherited create(...)` for a
+      # member the registry spells `Create`, and nimony is
+      # case-sensitive), and the prelude exception ctor is spelled
+      # pasExcCreate in systempas; any other member keeps its raw
+      # spelling (noQualCallee keeps the builtin map off member calls)
+      var callee = p.outerProcName
+      let dci = p.syms.classes.getOrDefault(declCls.toLowerAscii)
+      if dci.ctorSet.hasKey(memberName):
+        callee = if declCls == "PasException" and memberName == "create":
+                   "pasExcCreate"
+                 else:
+                   p.syms.canonical(p.outerProcName)
       call = newNode(nkCall, a.info)
-      call.add(newIdentNode(p.outerProcName, info))
+      call.add(newIdentNode(callee, info))
       call.add(declCast)
       if a.kind == nkCall:
         for i in 1 ..< a.len:
           call.add(a[i])
       else:
         discard
+    elif a.kind == nkIndexExpr or (a.kind == nkAsgn and a.len == 2 and
+        a[0].kind == nkIndexExpr):
+      # `inherited Items[Index]` / `inherited Items[Index] := v`: the
+      # ancestor's default indexed property lowers to the parent's
+      # indexer shim (`[]` / `[]=`) on the parent cast; the call form
+      # (`Items[Index](castParent)`) is not callable in nimony
+      if a.kind == nkIndexExpr:
+        let ie = newNode(nkIndexExpr, a.info)
+        ie.add(parentCast)
+        ie.add(a[1])
+        # the object-typed outer result needs the pointer->object cast
+        # (the shim's [] returns pointer; nimsem rejects the implicit).
+        # outerResultTy is stored lowercased, and nimsem's cast check is
+        # case sensitive, so `RootRef` needs its real spelling back.
+        if p.outerResultTy.len > 0 and p.outerResultTy != "pointer" and
+            (p.outerResultTy in ["tobject", "tclass", "rootref"] or
+             p.syms.isClass(p.outerResultTy)):
+          let castTy =
+            if p.outerResultTy in ["tobject", "tclass", "rootref"]: "RootRef"
+            else: rtlSpelling(p.outerResultTy)
+          let icn = newNode(nkCast, a.info)
+          icn.add(newIdentNode(castTy, a.info))
+          icn.add(ie)
+          call = icn
+        else:
+          call = ie
+      else:
+        let ie = newNode(nkIndexExpr, a[0].info)
+        ie.add(parentCast)
+        ie.add(a[0][1])
+        call = newNode(nkAsgn, a.info)
+        call.add(ie)
+        call.add(a[1])
     elif a.kind == nkCall:
       call = newNode(nkCall, a.info)
       if parentIsPrelude:
@@ -4235,11 +4474,145 @@ proc asStrOperand(n: Node): Node =
   dollar.add(n)
   return dollar
 
+proc isPtrCastRecv*(p: var TParser, recv: Node): bool =
+  ## the receiver is a class cast of a pointer-typed identifier, in
+  ## either the cast[form](x) or the T(x) call spelling
+  result = false
+  if recv.kind == nkCast and recv.len == 2 and recv[1].kind == nkIdent and
+      p.paramTypes.getOrDefault(recv[1].strVal.toLowerAscii) == "pointer":
+    return true
+  if recv.kind == nkCall and recv.len == 2 and recv[0].kind == nkIdent and
+      (p.syms.classes.hasKey(recv[0].strVal.toLowerAscii) or
+       recv[0].strVal.toLowerAscii in ["rootref", "tobject"]) and
+      recv[1].kind == nkIdent and
+      p.paramTypes.getOrDefault(recv[1].strVal.toLowerAscii) == "pointer":
+    return true
+
 proc mapStringBuiltins*(p: var TParser, n: Node): Node =
   ## expression-level rewrites of the 1-based string family
   ## (also invoked from mapBuiltinCall for statement-position calls)
+  # `TObject(Ptr).Free` / `TObject(Ptr).FreeNotification(x)` on a
+  # pointer-typed receiver: nimony rejects a pointer-to-ref cast, so
+  # lower to the pasFreeObj / pasFreeNotification shims (v1: no
+  # destroy dispatch on notification pointers). The bare member
+  # statement arrives as a dot (`TObject(Ptr).Free`), the paren form
+  # as a call; handle both.
+  var fm = ""
+  if n.kind == nkDotExpr and n.len == 2 and n[1].kind == nkIdent:
+    fm = n[1].strVal.toLowerAscii
+  elif n.kind == nkCall and n.len >= 2 and n[0].kind == nkDotExpr and
+      n[0].len == 2 and n[0][1].kind == nkIdent:
+    fm = n[0][1].strVal.toLowerAscii
+  if fm in ["free", "freenotification", "removefreenotification"]:
+    let recv = if n.kind == nkDotExpr: n[0] else: n[0][0]
+    if isPtrCastRecv(p, recv):
+      var fc = newNode(nkCall, n.info)
+      if fm == "free":
+        fc.add(newIdentNode("pasFreeObj", n.info))
+      else:
+        fc.add(newIdentNode("pasFreeNotification", n.info))
+      fc.add(recv[1])
+      if n.kind == nkCall:
+        for i in 1 ..< n.len:
+          fc.add(n[i])
+      return fc
   if n.kind != nkCall or n.len == 0: return n
   if n[0].kind != nkIdent: return n
+  if n.noQualCallee: return n   # inherited calls keep the member spelling
+  # class-cast treatment: the corpus's TObject(x)/TComponent(ptr)/...
+  # call-form casts across the pointer/object boundary
+  let clsCallee = n[0].strVal.toLowerAscii
+  if p.syms.isClass(clsCallee) or
+      clsCallee in ["tobject", "rootref", "tclass"]:
+    if n.len == 2:
+      var isPtrArg = false
+      if n[1].kind == nkIdent:
+        isPtrArg = p.paramTypes.getOrDefault(n[1].strVal.toLowerAscii) == "pointer"
+      elif n[1].kind in {nkCall, nkIndexExpr}:
+        # the corpus's TObject(inherited X) family rides Pointer results
+        isPtrArg = true
+      if isPtrArg:
+        # the pointer->object cast; RootRef must keep its exact
+        # capitalization (nimsem's cast check is case sensitive)
+        var tgt = ""
+        if clsCallee in ["tobject", "tclass", "rootref"]:
+          tgt = "RootRef"
+        else:
+          tgt = n[0].strVal
+        if n[1].kind == nkIdent:
+          var cn = newNode(nkCast, n.info)
+          cn.add(newIdentNode(tgt, n.info))
+          cn.add(n[1])
+          return cn
+        # indexing/inherited-call arguments: keep the cast (the shim's
+        # RootRef-returning members and an existing wrap need no wrap)
+        if n[1].kind == nkCall and n[1].len > 0 and
+            n[1][0].kind == nkIdent and
+            n[1][0].strVal.toLowerAscii in ["extract", "remove"]:
+          return n
+        var cn2 = newNode(nkCast, n.info)
+        cn2.add(newIdentNode(tgt, n.info))
+        cn2.add(n[1])
+        return cn2
+    return n
+  case n[0].strVal.toLowerAscii
+  of "pointer":
+    # the `Pointer(x)` reinterpretation: Delphi allows it when Integer
+    # and Pointer are the same size (the Win32 origin), and FPC still
+    # accepts it on x86-64 with a "Conversion between ordinals and
+    # pointers is not portable" warning. nimsem rejects the CONVERSION
+    # on every target (probed: kind-based, also under --cpu:i386
+    # --bits:32), so an ordinal argument must become the explicit bit
+    # cast - which sign-extends a negative int32 exactly like FPC's
+    # `Pointer(-1)` -> $FFFFFFFFFFFFFFFF
+    if n.len == 2:
+      # a numeric operand (`Pointer(1)`, `Pointer(Integer(x))`,
+      # `Pointer(NativeInt(x))`) or a ref operand crosses domains: cast.
+      # `Pointer(somePtr)` and an unknown operand stay a conversion.
+      let pd = operandDomain(p, n[1])
+      if pd == "num" or pd == "ref":
+        var cn = newNode(nkCast, n.info)
+        cn.add(newIdentNode("pointer", n.info))
+        cn.add(n[1])
+        return cn
+    return n
+  of "integer":
+    # `Integer(x)`: a reinterpretation only across domains - the low 32
+    # bits of a pointer (Win32's own view of the same value), on
+    # inherited-call results (which ride Pointer results) and on
+    # pointer/object-typed identifiers alike. `Integer(someInt64)` is a
+    # plain numeric conversion and stays one.
+    if n.len == 2:
+      if n[1].kind in {nkCall, nkIndexExpr} or
+          operandDomain(p, n[1]) in ["ptr", "ref"]:
+        var cn = newNode(nkCast, n.info)
+        cn.add(newIdentNode("int32", n.info))
+        cn.add(n[1])
+        return cn
+    return n
+  of "nativeint", "ptrint":
+    # `NativeInt(p)`: the word-size-correct spelling of the same
+    # reinterpretation (`Integer(p)` is the Win32-only form above).
+    # Pointer-sized in nimony == `int`, whose width IS the target word
+    # size, so no 32-bit assumption remains
+    if n.len == 2:
+      if n[1].kind in {nkCall, nkIndexExpr} or
+          operandDomain(p, n[1]) in ["ptr", "ref"]:
+        var cn = newNode(nkCast, n.info)
+        cn.add(newIdentNode("int", n.info))
+        cn.add(n[1])
+        return cn
+    return n
+  of "nativeuint", "ptruint":
+    # the unsigned twin of `NativeInt(p)`
+    if n.len == 2:
+      if n[1].kind in {nkCall, nkIndexExpr} or
+          operandDomain(p, n[1]) in ["ptr", "ref"]:
+        var cn = newNode(nkCast, n.info)
+        cn.add(newIdentNode("uint", n.info))
+        cn.add(n[1])
+        return cn
+    return n
   case n[0].strVal.toLowerAscii
   of "length":
     # Pascal Length() returns Integer (int32); nimony's len returns
@@ -4264,6 +4637,13 @@ proc mapStringBuiltins*(p: var TParser, n: Node): Node =
       # plain proc vars: nimony has no assigned() builtin
       if n[1].kind == nkIdent and
           p.procVarTypes.hasKey(n[1].strVal.toLowerAscii):
+        var ne = newNode(nkInfix, n.info)
+        ne.add(newIdentNode("!=", n.info))
+        ne.add(n[1])
+        ne.add(newNode(nkNilLit, n.info))
+        return ne
+      # object-typed refs (locals, params, class fields): non-nil test
+      if n[1].kind in {nkIdent, nkDotExpr, nkDeref}:
         var ne = newNode(nkInfix, n.info)
         ne.add(newIdentNode("!=", n.info))
         ne.add(n[1])
@@ -4454,7 +4834,152 @@ proc rhsExprType(p: var TParser, n: Node): string =
     else: result = ""
   else: result = ""
 
-proc mapBuiltinCall*(p: var TParser, n: Node): Node =
+# --- Variant construction at Variant-typed sites ---------------------------
+# nimony applies no converters at all (measured: `f(3)` fails even with a
+# matching converter in scope), so every place Pascal relies on an implicit
+# Variant conversion must be rewritten into an explicit construction:
+#   toVariant(typed value)   - Integer/Int64/Double/Single/string/bool/char
+#   pasVarLit(integer literal) - Delphi types a literal by its value
+#   pasVarCurrF(currency)    - Currency is float64 here but varCurrency there
+# and arithmetic/comparison on Variant operands routes to the named pasVar*
+# procs, which also marks the call as {.raises.} for nimony.
+
+proc variantOpName(op: string): string =
+  ## the shim proc for a Pascal operator over Variants ("" = not Variant)
+  case op
+  of "+": result = "pasVarAdd"
+  of "-": result = "pasVarSub"
+  of "*": result = "pasVarMul"
+  of "/": result = "pasVarDiv"
+  of "div": result = "pasVarIDiv"
+  of "mod": result = "pasVarMod"
+  of "==": result = "pasVarEq"
+  of "!=": result = "pasVarNe"
+  of "<": result = "pasVarLt"
+  of "<=": result = "pasVarLe"
+  of ">": result = "pasVarGt"
+  of ">=": result = "pasVarGe"
+  else: result = ""
+
+proc variantShimArgPositions(name: string): seq[int] =
+  ## 1-based argument positions the shim declares as Variant
+  case name
+  of "vartype", "vartostr", "vartowidestr", "varisnull", "varisempty",
+     "varisclear", "varisarray", "varastype", "vararrayhighbound",
+     "vararraylowbound", "vararraydimcount", "vararrayget":
+    result = @[1]
+  of "vartostrdef": result = @[1, 2]
+  of "vararrayput": result = @[2]
+  else: result = @[]
+
+proc isVariantExpr(p: var TParser; e: Node): bool =
+  ## already a Variant value? (so it must not be wrapped twice)
+  case e.kind
+  of nkIdent:
+    result = e.strVal.toLowerAscii in ["null", "unassigned", "emptyparam"] or
+             p.varTypes.getOrDefault(e.strVal.toLowerAscii).toLowerAscii ==
+               "variant"
+  of nkCall:
+    result = e.len > 0 and e[0].kind == nkIdent and
+             e[0].strVal.toLowerAscii in ["tovariant", "pasvarlit",
+               "pasvarcurr", "pasvarcurrf", "pasvaradd", "pasvarsub",
+               "pasvarmul", "pasvardiv", "pasvaridiv", "pasvarmod",
+               "pasvarneg", "varastype", "vararrayget", "vararrayof",
+               "vararraycreate"]
+  of nkPar:
+    result = e.len > 0 and isVariantExpr(p, e[0])
+  of nkIndexExpr:
+    # indexing a Variant array yields a Variant
+    result = e.len > 1 and e[0].kind == nkIdent and
+             p.varTypes.getOrDefault(e[0].strVal.toLowerAscii).toLowerAscii ==
+               "variant"
+  else: result = false
+
+proc variantCoerce(p: var TParser; e: Node): Node =
+  ## make `e` a Variant value *explicitly* (no-op if it already is one)
+  if isVariantExpr(p, e): return e
+  if e.kind in {nkIntLit, nkInt64Lit}:
+    result = newNode(nkCall, e.info)
+    result.add(newIdentNode("pasVarLit", e.info))
+    result.add(e)
+    return
+  if e.kind == nkPrefix and e.len == 2 and e[0].kind == nkIdent and
+      e[0].strVal == "-" and e[1].kind in {nkIntLit, nkInt64Lit}:
+    # a negative literal is a prefix node; fold the sign so pasVarLit can
+    # apply Delphi's by-value typing (measured: -3 -> varShortInt(0010),
+    # -70000 -> varInteger(0003))
+    let lit = newNode(nkIntLit, e.info)
+    lit.intVal = -e[1].intVal
+    result = newNode(nkCall, e.info)
+    result.add(newIdentNode("pasVarLit", e.info))
+    result.add(lit)
+    return
+  if e.kind == nkIdent:
+    # the Pascal type is not the nimony type: Currency and TDateTime are
+    # float64 aliases, WideString is a string, and each carries its own tag
+    let ctor = case p.varRawTypes.getOrDefault(e.strVal.toLowerAscii)
+      of "currency", "comp": "pasVarCurrF"
+      of "tdatetime": "pasVarDateF"
+      of "widestring": "pasVarWStr"
+      else: ""
+    if ctor.len > 0:
+      result = newNode(nkCall, e.info)
+      result.add(newIdentNode(ctor, e.info))
+      result.add(e)
+      return
+  result = newNode(nkCall, e.info)
+  result.add(newIdentNode("toVariant", e.info))
+  result.add(e)
+
+proc variantInt32Arg(p: var TParser; e: Node): Node =
+  ## the shim's int32 array parameters (VarArrayCreate/VarArrayGet bounds):
+  ## a literal array is `array[0..n, int64]` in nimony
+  if e.kind in {nkIntLit, nkInt64Lit}:
+    result = newNode(nkCall, e.info)
+    result.add(newIdentNode("int32", e.info))
+    result.add(e)
+  else:
+    result = e
+
+proc variantCoerceTyped(p: var TParser; e: Node): Node =
+  ## like variantCoerce, but a literal is *not* typed by its value: an
+  ## assignment to an element of a variant array converts to the array's
+  ## element type instead (measured: `a[0] := 10` on a varInteger array gives
+  ## varInteger(0003), where a plain `v := 10` gives the literal policy's
+  ## varByte(0011))
+  if isVariantExpr(p, e): return e
+  var src = e
+  if src.kind in {nkIntLit, nkInt64Lit}:
+    # an untyped literal is int64 in nimony: the element conversions all
+    # start from Integer (measured 0003 for a varInteger array)
+    let c = newNode(nkCall, src.info)
+    c.add(newIdentNode("int32", src.info))
+    c.add(src)
+    src = c
+  result = newNode(nkCall, e.info)
+  result.add(newIdentNode("toVariant", e.info))
+  result.add(src)
+
+proc variantArrayElem(p: var TParser; e: Node): Node =
+  ## one element of `VarArrayOf([...])`, whose parameter is an open
+  ## `array of Variant`. Measured (test/variant/varray.pas, both oracles
+  ## agreeing): a *string-typed* element becomes varOleStr (0008), where the
+  ## same value assigned to a Variant gives varString (0100).
+  if isVariantExpr(p, e): return e
+  var isStr = e.kind in {nkStrLit, nkCharLit}
+  if e.kind == nkIdent:
+    if p.varRawTypes.getOrDefault(e.strVal.toLowerAscii) in
+        ["string", "ansistring", "widestring", "unicodestring",
+         "shortstring", "char", "ansichar", "widechar", "pchar"]:
+      isStr = true
+  if isStr:
+    result = newNode(nkCall, e.info)
+    result.add(newIdentNode("pasVarWStr", e.info))
+    result.add(e)
+    return
+  result = variantCoerce(p, e)
+
+proc mapBuiltinCall*(p: var TParser; n: Node): Node =
   ## rewrite builtins that need argument changes:
   ## write(x) -> write(stdout, x); writeln(...) -> echo(...);
   ## Pos(sub, s) -> find(s, sub); Copy(s, a, b) -> substr(s, a, b);
@@ -4463,6 +4988,7 @@ proc mapBuiltinCall*(p: var TParser, n: Node): Node =
   if m != n: return m
   if n.kind != nkCall or n.len == 0: return n
   if n[0].kind != nkIdent: return n
+  if n.noQualCallee: return n   # inherited calls keep the member spelling
   let name = n[0].strVal.toLowerAscii
   case name
   of "inc", "dec":
@@ -5241,7 +5767,36 @@ proc parseStmt*(p: var TParser): Node =
     if p.tok.xkind == pxAsgn:
       getTokP(p)
       skipCom(p)
-      let b = parseExpr(p)
+      var b = parseExpr(p)
+      # Variant targets: Pascal converts implicitly, nimony not at all
+      # (measured) - build the Variant value at the assignment
+      block:
+        var lhsVT = ""
+        if a.kind == nkIdent:
+          lhsVT = p.varTypes.getOrDefault(a.strVal.toLowerAscii)
+        elif a.kind == nkIndexExpr and a.len >= 1 and a[0].kind == nkIdent:
+          # an element of a variant array is itself a Variant, but the store
+          # converts to the array's *element* type
+          lhsVT = p.varTypes.getOrDefault(a[0].strVal.toLowerAscii)
+          if lhsVT.toLowerAscii == "variant":
+            b = variantCoerceTyped(p, b)
+            lhsVT = "variant:element"
+        elif a.kind == nkDotExpr and a.len == 2 and a[0].kind == nkIdent and
+            a[1].kind == nkIdent:
+          lhsVT = p.fieldTypes.getOrDefault(a[0].strVal.toLowerAscii & "." &
+                                            a[1].strVal.toLowerAscii)
+        if lhsVT.toLowerAscii == "variant":
+          b = variantCoerce(p, b)
+        elif lhsVT.toLowerAscii in ["uint64", "qword", "nativeuint",
+                                    "uint32", "longword", "cardinal",
+                                    "uint16", "word", "uint8", "byte"] and
+            b.kind in {nkIntLit, nkInt64Lit}:
+          # a literal wider than int32 renders with an 'i64 suffix (int64),
+          # which an unsigned target will not take
+          let uc = newNode(nkCall, b.info)
+          uc.add(newIdentNode(lhsVT, b.info))
+          uc.add(b)
+          b = uc
       result = newNode(nkAsgn, info)
       result.add(a)
       result.add(b)

@@ -174,7 +174,14 @@ proc expr(s: var TRendor, n: Node): string =
         result.add(s.expr(n[1]))
         result.add(")")
     else:
-      result = s.expr(n[0]) & "("
+      let callee = if n.noQualCallee and n[0].kind == nkIdent:
+                     # inherited callees must not lose their member
+                     # spelling to the canon (the corpus's `Insert`
+                     # would rename to the string shim `strInsert`)
+                     n[0].strVal
+                   else:
+                     s.expr(n[0])
+      result = callee & "("
       for i in 1 ..< n.len:
         if i > 1: result.add(", ")
         result.add(s.expr(n[i]))
@@ -292,9 +299,12 @@ proc defaultInit(s: var TRendor, ty: Node): string =
   of nkIdent:
     let lower = ty.strVal.toLowerAscii
     case lower
+    of "uint64", "qword", "nativeuint":
+      # a bare `0` is int64 in nimony and will not coerce to uint64
+      result = lower & "(0)"
     of "integer", "int8", "int16", "int32", "int64", "int", "longint",
        "smallint", "byte", "word", "cardinal", "longword", "uint8",
-       "uint16", "uint32", "uint64", "nativeint", "nativeuint", "qword",
+       "uint16", "uint32", "nativeint",
        "shortint", "usize", "isize":
       result = "0"
     of "char", "ansichar", "widechar":
@@ -760,12 +770,15 @@ proc stmt(s: var TRendor, n: Node) =
     for d in n.sons:
       if d.kind != nkIdentDefs: continue
       let name = s.canon(d[0].strVal)
+      # interface consts/resourcestrings carry the export marker (the
+      # nkVarSection rule): importing units read the name
+      let star = if d[0].exported: "*" else: ""
       let tyStr = s.typeStr(d[1])
       let valStr = s.expr(d[2])
       if tyStr.len > 0:
-        s.line("const " & tickName(name) & ": " & tyStr & " = " & valStr)
+        s.line("const " & tickName(name) & star & ": " & tyStr & " = " & valStr)
       else:
-        s.line("const " & tickName(name) & " = " & valStr)
+        s.line("const " & tickName(name) & star & " = " & valStr)
   of nkTypeSection:
     discard
   of nkProcDef, nkFuncDef, nkMethodDef, nkTemplateDef:

@@ -69,6 +69,7 @@ type
     rtlUnits*: seq[string]             ## Pascal unit names from `uses`
     returnsValue*: Table[string, bool] ## functions/constructors by lower name
     returnsBool*: Table[string, bool]  ## shim functions returning Boolean
+    memberParams*: Table[string, string] ## cls.member -> ';'-joined param spellings
     convOps*: Table[string, string]
     ## conversion operator registry: key
     ## "conv:<cls>:<kind>:<from>:<to>" -> the lowered proc name
@@ -166,6 +167,24 @@ proc registerClass*(t: var SymTab; spelling: string; parent: string; isRef: bool
                      isRef: isRef)
   t.classes[spelling.toLowerAscii] = ci
 
+proc registerClassShape*(t: var SymTab; spelling: string; parent: string;
+                         isRef: bool) =
+  ## register a class from a shim source scan: the shim's
+  ## `X* = ref object of Y` line proves the SHAPE only. A class the
+  ## prelude (or a Pascal unit) already describes keeps its members -
+  ## re-registering would drop the exception ctor registration and make
+  ## every shim exception subclass look ctorless (its synthesized
+  ## `create` then hijacks `raise SomeE.Create(msg)`). The scanned
+  ## parent is adopted only when none is known.
+  let key = spelling.toLowerAscii
+  var ci = t.classes.getOrDefault(key)
+  ci.spelling = spelling
+  if ci.parent.len == 0:
+    ci.parent = parent.toLowerAscii
+  ci.isRef = isRef
+  t.classes[key] = ci
+  declareName(t, spelling)
+
 proc lookupClass*(t: SymTab; name: string): ClassInfo =
   t.classes.getOrDefault(name.toLowerAscii)
 
@@ -255,6 +274,16 @@ proc isMethodOf*(t: SymTab; cls, name: string): bool =
     k = ci.parent
     inc guard
   return false
+
+proc addMemberParams*(t: var SymTab; cls, member: string;
+                       tys: string) =
+  ## record a member's parameter type spellings (';'-joined, self
+  ## excluded) so inherited-call args can coerce pointer/object forms
+  t.memberParams[cls.toLowerAscii & "." & member.toLowerAscii] = tys
+
+proc memberParamsOf*(t: SymTab; cls, member: string): string =
+  t.memberParams.getOrDefault(cls.toLowerAscii & "." &
+                              member.toLowerAscii)
 
 proc addCtor*(t: var SymTab; cls, spelling: string) =
   ## record a constructor of class `cls` (also a routine)
@@ -454,6 +483,10 @@ const RtlNames* = [
   ("unicodestring", "string"), ("shortstring", "string"), ("tstring", "string"),
   ("singlefloat", "float32"), ("tclass", "RootRef"),
   ("tdatetime", "TDateTime"),
+  ("variant", "Variant"), ("olevariant", "Variant"),
+  # nimony has no `UInt64` spelling of its own: the Pascal name must map
+  ("uint64", "uint64"), ("uint32", "uint32"), ("uint16", "uint16"),
+  ("uint8", "uint8"),
   # builtin routines (pure renames)
   ("pasfind", "pasFind"), ("ord", "ord"), ("chr", "chr"), ("low", "low"),
   ("high", "high"), ("setlength", "setLen"), ("inc", "inc"), ("dec", "dec"),

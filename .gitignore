@@ -7,6 +7,8 @@ legacy/pascal/syspas
 pas2nimony/nimcache
 pas2nimony/bin
 pas2nimony/test/tmp
+# scratch: logs, old-toolchain export, one-off repro trees (hundreds of MB)
+pas2nimony/test/tmp2
 # closed-source Delphi compiler food - never published
 pas2nimony/test/private
 # scratch

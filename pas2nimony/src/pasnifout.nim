@@ -92,6 +92,54 @@ proc emitAtom(e: var NifEmitter; n: Node) =
   of nkEmpty: e.buf.addDotToken(i)
   else: e.buf.addDotToken(i)
 
+proc propIndexAccessor(n: Node; which: int): string =
+  ## The shim accessor for `(dot RECEIVER PROP)[INDEX]`, or "" when `n` is
+  ## not an indexed collection property. `which` is 0 for the getter, 1 for
+  ## the setter (which is "" when the property is read-only).
+  ##
+  ## Pascal's indexed collection properties have no nimony equivalent, so
+  ## they lower to these calls - the same mapping the `.nim` emitter uses
+  ## (pasnimout.expr/stmt). The shim's `[]`/`[]=` overloads are deliberately
+  ## not used: nimsem does not resolve `(dot obj Prop)` through them on
+  ## parsed NIF, and they are only reached when the Pascal source spells an
+  ## index on the list itself.
+  result = ""
+  if n.kind != nkIndexExpr or n.len != 2: return
+  if n[0].kind != nkDotExpr or n[0].len != 2: return
+  if n[0][1].kind != nkIdent: return
+  let member = n[0][1].strVal.toLowerAscii
+  if which == 0:
+    case member
+    of "strings": result = "Get"
+    of "objects": result = "GetObject"
+    of "values": result = "GetValue"
+    of "names": result = "GetName"
+    else: result = ""
+  else:
+    case member
+    of "strings": result = "Put"
+    of "objects": result = "PutObject"
+    else: result = ""
+
+proc emitPropIndexGet(e: var NifEmitter; info: NifLineInfo;
+                      receiver, arg: Node; accessor: string) =
+  ## `(call Accessor receiver arg)` - reading an indexed collection
+  ## property
+  e.buf.copyInto(globalTags.registerTag("call"), info):
+    e.buf.addIdent(accessor, info)
+    e.emitExpr(receiver)
+    e.emitExpr(arg)
+
+proc emitPropIndexSet(e: var NifEmitter; info: NifLineInfo;
+                      receiver, arg, value: Node; accessor: string) =
+  ## `(call Accessor receiver arg value)` - assigning an indexed
+  ## collection property
+  e.buf.copyInto(globalTags.registerTag("call"), info):
+    e.buf.addIdent(accessor, info)
+    e.emitExpr(receiver)
+    e.emitExpr(arg)
+    e.emitExpr(value)
+
 proc emitCall(e: var NifEmitter; n: Node) =
   ## (call callee arg...); set ops are plain calls to incl/excl, the
   ## parser already canonicalizes Include/Exclude to those names
@@ -102,8 +150,13 @@ proc emitCall(e: var NifEmitter; n: Node) =
       for s in n.sons:
         echo "DBG   son: kind=", $s.kind, " len=", s.len, " strVal=", s.strVal
   e.buf.copyInto(globalTags.registerTag("call"), i):
-    for son in n.sons:
-      e.emitExpr(son)
+    for k, son in n.sons:
+      if k == 0 and n.noQualCallee and son.kind == nkIdent:
+        # inherited callee: keep the member spelling (the canon would
+        # rename e.g. Insert to the string shim strInsert)
+        e.buf.addIdent(son.strVal, e.info(son))
+      else:
+        e.emitExpr(son)
 
 proc emitAnonProc(e: var NifEmitter; n: Node) =
   ## anonymous method value: (proc . . . . (params ...) ret . . (stmts))
@@ -159,11 +212,19 @@ proc emitExpr(e: var NifEmitter; n: Node) =
       else:
         e.emitExpr(n[1])
   of nkIndexExpr:
-    # (at receiver index)
-    e.buf.copyInto(globalTags.registerTag("at"), i):
-      e.emitExpr(n[0])
-      for j in 1 ..< n.len:
-        e.emitExpr(n[j])
+    # an indexed collection property is a call, never a field index:
+    # nimsem does not resolve `(dot obj Prop)` through the shim's getter
+    # on parsed NIF, so `Strings[i]` must become `(call Get receiver i)`
+    block:
+      let getter = propIndexAccessor(n, 0)
+      if getter.len > 0:
+        e.emitPropIndexGet(i, n[0][0], n[1], getter)
+      else:
+        # (at receiver index)
+        e.buf.copyInto(globalTags.registerTag("at"), i):
+          e.emitExpr(n[0])
+          for j in 1 ..< n.len:
+            e.emitExpr(n[j])
   of nkCast:
     # nifler parses `cast[T](x)` as (cast T x)
     e.buf.copyInto(globalTags.registerTag("cast"), e.info(n)):
@@ -337,9 +398,17 @@ proc emitStmt(e: var NifEmitter; n: Node) =
           echo "DBG   callee: ", n[0][0][0].strVal, ".", n[0][0][1].strVal
   case n.kind
   of nkAsgn:
-    e.buf.copyInto(globalTags.registerTag("asgn"), i):
-      e.emitExpr(n[0])
-      e.emitExpr(n[1])
+    # `List.Strings[i] := v` / `List.Objects[i] := obj` lower to the
+    # shim's setter call; the shim has no writable `[]=`-shaped property
+    # form and nimsem does not resolve `(dot obj Prop)` on parsed NIF
+    block:
+      let setter = propIndexAccessor(n[0], 1)
+      if setter.len > 0:
+        e.emitPropIndexSet(i, n[0][0][0], n[0][1], n[1], setter)
+      else:
+        e.buf.copyInto(globalTags.registerTag("asgn"), i):
+          e.emitExpr(n[0])
+          e.emitExpr(n[1])
   of nkIfStmt:
     e.buf.copyInto(globalTags.registerTag("if"), i):
       for branch in n.sons:

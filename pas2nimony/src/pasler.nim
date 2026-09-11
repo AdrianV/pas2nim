@@ -84,6 +84,61 @@ proc findSystemPas: string =
   write(stderr, "pasler: cannot find runtime/systempas.nim\n")
   quit(1)
 
+proc readFileOrEmpty(f: string): string =
+  result = ""
+  try:
+    result = readFile(f)
+  except ErrorCode:
+    result = ""
+
+proc collectAnchorImports(anchor: string; imports: var seq[string]) =
+  ## add every plain module name the rendered anchor imports
+  let text = readFileOrEmpty(anchor)
+  var k = 0
+  while k < text.len:
+    var j = k
+    while j < text.len and text[j] != '\n': inc j
+    let line = strip(substr(text, k, j - 1))
+    k = j + 1
+    if startsWith(line, "import "):
+      for name in split(substr(line, 7), ","):
+        let nm = strip(name)
+        # only bare unit names can be placeholders: a slash path is a
+        # stdlib module and a bracket is a group import
+        if nm.len > 0 and nm.find('/') < 0 and nm.find('[') < 0:
+          imports.add(nm)
+
+proc mirrorPlaceholders(nimcache, runtimeDir: string;
+                        units: seq[string]; mainFile: string) =
+  ## Copy the placeholder module of every unit the anchors import into
+  ## nimcache, so nimony's module resolver can find it.
+  ##
+  ## A Pascal unit that absorbs nothing but is still imported appears in
+  ## the anchor as `import <name>`; paspars resolves such a unit to
+  ## runtime/placeholders/<name>.nim when no real source exists (see
+  ## paspars.placeholderCandidates). That directory is deliberately not on
+  ## --path: the placeholders carry declarations only, and a real unit of
+  ## the same name must win when the project has one. nimcache is already
+  ## on --path, and nimony prefers a nimcache hit over a library search, so
+  ## the copy is exactly as visible as an absorbed unit - which is what a
+  ## Pascal unit import means.
+  let phDir = runtimeDir / "placeholders"
+  var anchors = units
+  anchors.add(mainFile)
+  var imports: seq[string] = @[]
+  for u in anchors:
+    let anchor = nimcache / splitFile(u).name & ".nim"
+    if fileExists(anchor):
+      collectAnchorImports(anchor, imports)
+  for nm in imports:
+    let src = phDir / nm & ".nim"
+    let dst = nimcache / nm & ".nim"
+    if fileExists(src) and not fileExists(dst):
+      try:
+        writeFile(dst, readFile(src))
+      except ErrorCode:
+        discard
+
 proc fileMtimeNs(f: string): int64 =
   try:
     result = getLastModificationTime(f)
@@ -241,6 +296,28 @@ proc main =
     closeParser(p)
   units.sort(proc(x, y: string): int = cmp(x, y))  # deterministic order
 
+  # 1b. render every `.nim` anchor up front. The order matters: whichever
+  #     backend runs, the anchors are the only source nimony's module
+  #     resolver has for a Pascal unit, so they must exist before either
+  #     consumer - the native/wasm/check/doc delegation below and the
+  #     TokenBuf NIF invocation at the end.
+  var lastAnchorNs: int64 = 0
+  for u in units:
+    let t = parseAndRender(u, nimcache, flags, defines, searchPaths)
+    if t > lastAnchorNs: lastAnchorNs = t
+  let mainStem = splitFile(infile).name
+  let mainNif = nimcache / mainStem & ".p.nif"
+  block:
+    let t = parseAndRender(infile, nimcache, flags, defines, searchPaths)
+    if t > lastAnchorNs: lastAnchorNs = t
+
+  # 1c. mirror the placeholder module of every unit the anchors import.
+  #     paspars absorbs `uses Windows` and the anchor then says
+  #     `import Windows`, but the placeholders directory is deliberately
+  #     not on --path (it only ever supplies declarations, never
+  #     definitions), so nimony would report "file not found".
+  mirrorPlaceholders(nimcache, runtimeDir, units, infile)
+
   if command in ["n", "w", "check", "m", "doc", "l"]:
     # delegate to nimony's own project graph over the rendered .nim
     # anchors (phase A is enough - no TokenBuf NIFs needed); this is
@@ -279,17 +356,7 @@ proc main =
         cmd.add(" " & quoteShell(pa))
     quit(execShellCmd(cmd))
 
-  # 2. phase A: write every .nim anchor first (units, then the main)
-  var lastAnchorNs: int64 = 0
-  for u in units:
-    let t = parseAndRender(u, nimcache, flags, defines, searchPaths)
-    if t > lastAnchorNs: lastAnchorNs = t
-  let mainStem = splitFile(infile).name
-  let mainNif = nimcache / mainStem & ".p.nif"
-  block:
-    let t = parseAndRender(infile, nimcache, flags, defines, searchPaths)
-    if t > lastAnchorNs: lastAnchorNs = t
-
+  # 2. phase A already ran above (1b)
   # the nimony driver's staleness comparison has whole-second
   # granularity, so make sure the TokenBuf NIFs land in a later second
   # than every anchor; a probe file gives "now" in file-mtime units

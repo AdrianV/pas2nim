@@ -487,7 +487,7 @@ method Destroy*(self: RootRef) =
 proc ClassType*(self: RootRef): RootRef =
   result = self
 
-# TObject.InheritsFrom: v1 accepts everything (single-threaded
+# Delphi TObject.InheritsFrom: v1 accepts everything (single-threaded
 # front-end, no RTTI dispatch exercised)
 proc InheritsFrom*(self: RootRef; cls: RootRef): bool =
   result = true
@@ -584,7 +584,51 @@ proc sameRef*(a, b: RootRef): bool =
   result = cast[pointer](a) == cast[pointer](b)
 
 type
-  Variant* = TVarRec
+  # Delphi Variant: TVarData's tag plus a payload wide enough to keep the
+  # Delphi union views (VInteger/VLongWord/VInt64/VDouble/VCurrency/...)
+  # synchronised on every store, so corpus code reading
+  # `TVarData(v).VInteger` sees what Delphi sees. `TVarData` is the same
+  # type, which makes Delphi's `TVarData(v)` cast an identity in Nim.
+  #
+  # The semantics below are *measured*, not recalled: type codes, the
+  # Null/Unassigned predicates, the conversions and the operators were
+  # pinned against Delphi 2007 (dcc32/Win32 under wine) and FPC 3.2.2 by
+  # test/variant/vcore.pas + test/variant-oracle.sh; see
+  # .dsh/wiki/pas2nimony-variant-semantics.md. Divergences are marked.
+  TVarType* = uint16
+
+  Variant* = object
+    VType*: TVarType
+    # integer views, kept in sync on store (a union's low-32 view of an
+    # unsigned value is a two's-complement reinterpretation, as in Delphi)
+    VInteger*: int32
+    VLongWord*: uint32
+    VSmallint*: int16
+    VShortInt*: int8
+    VByte*: uint8
+    VWord*: uint16
+    VInt64*: int64
+    VUInt64*: uint64
+    # real views
+    VSingle*: float32
+    VDouble*: float64
+    VCurrency*: int64      # Delphi Currency: scaled by 10000
+    VDate*: float64        # TDateTime
+    # misc scalars
+    VBoolean*: uint16      # WordBool
+    VChar*: char
+    VWideChar*: uint16
+    VError*: int32
+    # payloads without a scalar view
+    VString*: string       # varString / varOleStr / varUString
+    VObject*: RootRef      # varUnknown / varDispatch
+    VArray*: RootRef       # variant array (VariantArrayObj)
+
+  # a variant array: per-dimension bounds plus flat storage
+  VariantArrayObj* = object
+    dims*: seq[tuple[lo, hi: int32]]
+    values*: seq[Variant]
+  VariantArray* = ref VariantArrayObj
 
   # System's TMethod (Delphi's method-pointer pair): the v1 shell keeps
   # the field names; Code stays a pointer (no nimony model for a
@@ -604,12 +648,47 @@ type
 
   # SysUtils's conversion exception
   EConvertError* = ref object of PasException
-  TVarData* {.inheritable.} = ref object of RootRef
-    VType*: int32
-    VString*: string
-    VInteger*: int32
-    VDouble*: float64
-    VBoolean*: bool
+  # `Variant` and `TVarData` are one type: Delphi's TVarData(v) cast is
+  # the identity, and the field names are the Delphi ones.
+  TVarData* = Variant
+
+# Delphi's variant type codes; measured identical in dcc32 and FPC
+const
+  varEmpty* = TVarType(0x0000)
+  varNull* = TVarType(0x0001)
+  varSmallint* = TVarType(0x0002)
+  varInteger* = TVarType(0x0003)
+  varSingle* = TVarType(0x0004)
+  varDouble* = TVarType(0x0005)
+  varCurrency* = TVarType(0x0006)
+  varDate* = TVarType(0x0007)
+  varOleStr* = TVarType(0x0008)
+  varDispatch* = TVarType(0x0009)
+  varError* = TVarType(0x000A)
+  varBoolean* = TVarType(0x000B)
+  varVariant* = TVarType(0x000C)
+  varUnknown* = TVarType(0x000D)
+  varShortInt* = TVarType(0x0010)
+  varByte* = TVarType(0x0011)
+  varWord* = TVarType(0x0012)
+  varLongWord* = TVarType(0x0013)
+  varInt64* = TVarType(0x0014)
+  varUInt64* = TVarType(0x0015)   # FPC only: D2007 stores UInt64 as varInt64
+  varString* = TVarType(0x0100)   # Delphi's AnsiString variant
+  varAny* = TVarType(0x0101)      # FPC only (D2007: E2003)
+  varUString* = TVarType(0x0102)  # FPC / Delphi 2009+
+  varArray* = TVarType(0x2000)    # OR'd into the tag of a variant array
+  varParam* = TVarType(0x4000)    # OR'd in for an untyped `var` parameter
+
+# The three special values. Measured: Null is Null but NOT clear; Unassigned
+# is both Empty and Clear; EmptyParam is a varError variant carrying
+# DISP_E_PARAMNOTFOUND. They are module-level `let`s rather than `const`s:
+# nimony cannot fold a Variant construction (its ref field would have to be
+# defaulted) at compile time.
+let
+  Null* = Variant(VType: varNull)
+  Unassigned* = Variant(VType: varEmpty)
+  EmptyParam* = Variant(VType: varError, VError: -2147352572'i32)
 
 # Delphi `x as T`: nil stays nil, a failed checked cast yields nil.
 # (The raising variant would mark every transitive caller {.raises.};
@@ -654,6 +733,9 @@ proc IntToHex*(value: int64; digits: int32): string =
     s = "0" & s
   result = s
 proc IntToHex*(value: int32; digits: int32): string =
+  IntToHex(int64(value), digits)
+proc IntToHex*(value: uint16; digits: int32): string =
+  ## TVarType is a Word; Delphi's Hex(VarType) helper passes it directly
   IntToHex(int64(value), digits)
 
 proc StrToFloatDef*(s: string; def: float64): float64 =
@@ -1184,3 +1266,547 @@ proc StrToTime*(s: string): TDateTime {.raises.} =
 type
   TInvokeableVariantType* {.inheritable.} = ref object of RootRef
   EVariantError* = ref object of PasException
+  # Delphi's hierarchy: the cast failure is a *subclass*, so
+  # `except on E: EVariantError` catches it (measured: dcc32 raises
+  # EVariantTypeCastError where FPC raises plain EVariantError)
+  EVariantTypeCastError* = ref object of EVariantError
+
+proc Create*(self: typedesc[EVariantError]; msg: string): EVariantError =
+  result = EVariantError(Message: msg)
+
+proc Create*(self: typedesc[EVariantTypeCastError];
+             msg: string): EVariantTypeCastError =
+  result = EVariantTypeCastError(Message: msg)
+
+# ---------------------------------------------------------------------------
+# Variant: construction
+#
+# Measured: dcc32 stores a *literal* by its value (3 -> varByte,
+# -3 -> varShortInt, 70000 -> varLongWord) but a typed Integer/Int64 keeps
+# its own tag, and Single widens to varDouble. nimony unifies `int` and
+# `int64` AND does not apply converters at all (measured: `f(3)` fails with
+# a matching converter in scope), so the emitter emits the construction
+# explicitly: toVariant(...) for a typed value, pasVarLit(...) for nkIntLit.
+# The converters below are kept for tooling that honours them and to
+# document the mapping.
+
+proc vInt(tag: TVarType; x: int64): Variant {.noSideEffect.} =
+  ## every integer view of the union is written, so a read through any of
+  ## them matches Delphi's bit pattern
+  result = Variant(VType: tag)
+  result.VInt64 = x
+  result.VUInt64 = cast[uint64](x)
+  result.VInteger = int32(x and 0xFFFFFFFF'i64)
+  result.VLongWord = cast[uint32](result.VInteger)
+  result.VWord = uint16(result.VLongWord and 0xFFFF'u32)
+  result.VByte = uint8(uint32(result.VWord) and 0xFF'u32)
+  result.VSmallint = cast[int16](result.VWord)
+  result.VShortInt = cast[int8](result.VByte)
+
+proc vReal(tag: TVarType; x: float64): Variant {.noSideEffect.} =
+  result = Variant(VType: tag)
+  result.VDouble = x
+  result.VSingle = float32(x)
+  if tag == varDate:
+    result.VDate = x
+
+proc vCurrency(cu: int64): Variant {.noSideEffect.} =
+  ## Delphi Currency: an int64 scaled by 10000 (the same 8 bytes as VInt64)
+  result = Variant(VType: varCurrency)
+  result.VCurrency = cu
+  result.VInt64 = cu
+  result.VUInt64 = cast[uint64](cu)
+  result.VDouble = float64(cu) / 10000.0
+  result.VSingle = float32(result.VDouble)
+
+proc pasVarCurrF*(x: float64): Variant =
+  ## a Pascal Currency-typed expression reaches the shim as float64
+  ## (rtlSpelling maps Currency to float64), but its Variant tag must be
+  ## varCurrency (measured: 0006 in both oracles)
+  vCurrency(int64(pasRound(x * 10000.0)))
+
+proc pasVarCurr*(cu: int64): Variant {.noSideEffect.} =
+  ## a Pascal Currency value (already scaled by 10000) stored as varCurrency;
+  ## the emitter routes Currency-typed expressions here, since neither the
+  ## int64 nor the float64 constructor would produce the right tag
+  vCurrency(cu)
+
+proc pasVarDateF*(x: TDateTime): Variant {.noSideEffect.} =
+  ## TDateTime is a float64 alias here, but its Variant tag is varDate
+  ## (measured: 0007 in both oracles)
+  vReal(varDate, x)
+
+proc pasVarWStr*(c: char): Variant {.noSideEffect.} =
+  ## a Char element of `VarArrayOf([...])` is varOleStr as well (measured);
+  ## nimony has no `$char` - concatenation is the only conversion
+  vStr(varOleStr, "" & c)
+
+proc pasVarWStr*(s: string): Variant {.noSideEffect.} =
+  ## a WideString arrives as a plain string; both oracles tag it varOleStr
+  ## (measured: 0008)
+  vStr(varOleStr, s)
+
+proc vStr(tag: TVarType; s: string): Variant {.noSideEffect.} =
+  result = Variant(VType: tag)
+  result.VString = s
+
+proc vBool(b: bool): Variant {.noSideEffect.} =
+  result = Variant(VType: varBoolean)
+  result.VBoolean = if b: 1'u16 else: 0'u16
+  result.VInteger = if b: 1'i32 else: 0'i32
+
+proc pasVarLit*(x: int64): Variant {.noSideEffect.} =
+  ## Pascal integer *literals*, as dcc32 types them: the narrowest type that
+  ## holds the value, preferring the unsigned Byte/Word/LongWord for
+  ## non-negative literals (measured: 300 -> varWord, 32768 -> varWord,
+  ## 70000 -> varLongWord, -70000 -> varInteger).
+  result = Variant(VType: varEmpty)
+  if x >= 0:
+    if x <= 255: result = vInt(varByte, x)
+    elif x <= 65535: result = vInt(varWord, x)
+    elif x <= 4294967295'i64: result = vInt(varLongWord, x)
+    else: result = vInt(varInt64, x)
+  else:
+    if x >= -128: result = vInt(varShortInt, x)
+    elif x >= -32768: result = vInt(varSmallint, x)
+    elif x >= -2147483648'i64: result = vInt(varInteger, x)
+    else: result = vInt(varInt64, x)
+
+converter toVariant*(x: int32): Variant = vInt(varInteger, int64(x))
+converter toVariant*(x: int64): Variant = vInt(varInt64, x)
+converter toVariant*(x: int16): Variant = vInt(varSmallint, int64(x))
+converter toVariant*(x: int8): Variant = vInt(varShortInt, int64(x))
+converter toVariant*(x: uint32): Variant = vInt(varLongWord, int64(x))
+converter toVariant*(x: uint16): Variant = vInt(varWord, int64(x))
+converter toVariant*(x: uint8): Variant = vInt(varByte, int64(x))
+converter toVariant*(x: uint64): Variant = vInt(varInt64, cast[int64](x))
+  ## measured divergence: Delphi has no unsigned 64-bit variant and stores
+  ## UInt64 as varInt64; FPC 3.2.2 stores varUInt64 (0x0015)
+converter toVariant*(x: float64): Variant = vReal(varDouble, x)
+  ## measured divergence: dcc32 stores a decimal *literal* as varCurrency,
+  ## FPC as varDouble. A Nim float64 cannot tell a literal from a typed
+  ## Double, so this follows FPC; the emitter can fix it later by routing
+  ## nkFloatLit through the shim (see the wiki's open decisions).
+converter toVariant*(x: float32): Variant = vReal(varDouble, float64(x))
+  ## measured: Single and Double both land in varDouble in dcc32 and FPC
+converter toVariant*(x: string): Variant = vStr(varString, x)
+converter toVariant*(x: bool): Variant = vBool(x)
+converter toVariant*(x: char): Variant = vStr(varString, $x)
+  ## measured: a Char is stored as a one-character varString in both
+converter toVariant*(x: RootRef): Variant =
+  result = Variant(VType: varUnknown)
+  result.VObject = x
+
+# ---------------------------------------------------------------------------
+# Variant: predicates and inspection
+
+proc VarType*(v: Variant): TVarType = v.VType
+proc VarIsNull*(v: Variant): bool = v.VType == varNull
+proc VarIsEmpty*(v: Variant): bool = v.VType == varEmpty
+proc VarIsClear*(v: Variant): bool = v.VType == varEmpty
+  ## measured: Null is NOT clear (Clear == Unassigned/varEmpty)
+proc VarIsArray*(v: Variant): bool = (v.VType and varArray) != TVarType(0)
+proc VarArrayDimCount*(v: Variant): int32 =
+  let a = cast[VariantArray](v.VArray)
+  if a == nil: result = 0 else: result = int32(a.dims.len)
+proc VarArrayLowBound*(v: Variant; dim: int32): int32 =
+  let a = cast[VariantArray](v.VArray)
+  if a == nil or dim < 1 or dim > a.dims.len: result = 0
+  else: result = a.dims[dim - 1].lo
+proc VarArrayHighBound*(v: Variant; dim: int32): int32 =
+  let a = cast[VariantArray](v.VArray)
+  if a == nil or dim < 1 or dim > a.dims.len: result = -1
+  else: result = a.dims[dim - 1].hi
+
+proc isIntTag(t: TVarType): bool =
+  t in {varSmallint, varInteger, varShortInt, varByte, varWord, varLongWord,
+        varInt64, varUInt64}
+proc isRealTag(t: TVarType): bool =
+  t in {varSingle, varDouble, varDate, varCurrency}
+proc isStrTag(t: TVarType): bool =
+  t in {varString, varOleStr, varUString}
+
+proc asInt64(v: Variant): int64 =
+  ## the *signed* reading Delphi's arithmetic uses per tag
+  if v.VType in {varInt64, varUInt64}: result = v.VInt64
+  elif v.VType == varLongWord: result = int64(v.VLongWord)
+  elif v.VType == varWord: result = int64(v.VWord)
+  elif v.VType == varByte: result = int64(v.VByte)
+  elif v.VType == varSmallint: result = int64(v.VSmallint)
+  elif v.VType == varShortInt: result = int64(v.VShortInt)
+  else: result = int64(v.VInteger)
+
+proc asFloat64(v: Variant): float64 =
+  case v.VType
+  of varSingle: result = float64(v.VSingle)
+  of varDouble, varDate: result = v.VDouble
+  of varCurrency: result = float64(v.VCurrency) / 10000.0
+  of varBoolean: result = float64(v.VBoolean)
+  else: result = float64(asInt64(v))
+
+proc variantToStr(v: Variant): string =
+  ## measured: Null and Unassigned both render as ''; Boolean as
+  ## 'True'/'False'; a varLongWord renders *unsigned* (4000000000) even
+  ## though VInteger reads back signed; a real uses the locale separator in
+  ## dcc32 but '.' in FPC (we follow FPC - the pinned DecimalSeparator)
+  case v.VType
+  of varEmpty, varNull: result = ""
+  of varBoolean: result = if v.VBoolean != 0'u16: "True" else: "False"
+  of varCurrency:
+    let n = v.VCurrency
+    let neg = n < 0
+    let m = if neg: -n else: n
+    var s = $(m div 10000)
+    var frac = m mod 10000
+    if frac != 0:
+      var fs = ""
+      for i in 0 ..< 4:
+        fs = $(frac mod 10) & fs
+        frac = frac div 10
+      while fs.len > 0 and fs[^1] == '0': fs.setLen(fs.len - 1)
+      s = s & "." & fs
+    result = (if neg: "-" else: "") & s
+  of varSingle: result = FloatToStr(v.VSingle)
+  of varDouble, varDate: result = FloatToStr(v.VDouble)
+  of varString, varOleStr, varUString: result = v.VString
+  of varLongWord: result = $v.VLongWord
+  of varWord: result = $v.VWord
+  of varByte: result = $v.VByte
+  else: result = $asInt64(v)
+
+proc parseCurr(s: string): int64 {.raises.} =
+  ## '4.25' -> 42500 (Currency is scaled by 10000)
+  var i = 0
+  var neg = false
+  if i < s.len and (s[i] == '-' or s[i] == '+'):
+    neg = s[i] == '-'
+    inc i
+  var whole = 0'i64
+  var seen = false
+  while i < s.len and s[i] in {'0'..'9'}:
+    whole = whole * 10 + int64(ord(s[i]) - ord('0'))
+    seen = true
+    inc i
+  var frac = 0'i64
+  var scale = 1000'i64
+  if i < s.len and s[i] == '.':
+    inc i
+    while i < s.len and s[i] in {'0'..'9'}:
+      if scale > 0:
+        frac = frac + int64(ord(s[i]) - ord('0')) * scale
+        scale = scale div 10
+      seen = true
+      inc i
+  if not seen:
+    pasCurrentExc = EVariantTypeCastError.Create("Invalid variant type cast")
+    raise ValueError
+  result = whole * 10000 + frac
+  if neg: result = -result
+
+proc parseInt64(s: string): int64 {.raises.} =
+  var i = 0
+  while i < s.len and s[i] in {' ', '\t'}: inc i
+  var neg = false
+  if i < s.len and (s[i] == '-' or s[i] == '+'):
+    neg = s[i] == '-'
+    inc i
+  var n = 0'i64
+  var seen = false
+  while i < s.len and s[i] in {'0'..'9'}:
+    n = n * 10 + int64(ord(s[i]) - ord('0'))
+    seen = true
+    inc i
+  if not seen:
+    pasCurrentExc = EVariantTypeCastError.Create("Invalid variant type cast")
+    raise ValueError
+  result = if neg: -n else: n
+
+proc parseFloat64(s: string): float64 {.raises.} =
+  var i = 0
+  while i < s.len and s[i] in {' ', '\t'}: inc i
+  var neg = false
+  if i < s.len and (s[i] == '-' or s[i] == '+'):
+    neg = s[i] == '-'
+    inc i
+  var whole = 0.0
+  var seen = false
+  while i < s.len and s[i] in {'0'..'9'}:
+    whole = whole * 10.0 + float64(ord(s[i]) - ord('0'))
+    seen = true
+    inc i
+  if i < s.len and s[i] == '.':
+    inc i
+    var scale = 0.1
+    while i < s.len and s[i] in {'0'..'9'}:
+      whole = whole + float64(ord(s[i]) - ord('0')) * scale
+      scale = scale / 10.0
+      seen = true
+      inc i
+  if not seen:
+    pasCurrentExc = EVariantTypeCastError.Create("Invalid variant type cast")
+    raise ValueError
+  result = if neg: -whole else: whole
+
+proc numericOf(v: Variant): float64 {.raises.} =
+  if isStrTag(v.VType): result = parseFloat64(v.VString)
+  else: result = asFloat64(v)
+
+proc intOf(v: Variant): int64 {.raises.} =
+  ## measured: a real rounds half to even (1.9 -> 2, 2.5 -> 2); a numeric
+  ## string is parsed ('42' -> 42); a non-numeric string raises
+  if isStrTag(v.VType): result = parseInt64(v.VString)
+  else: result = pasRound(asFloat64(v))
+
+proc VarAsType*(v: Variant; t: TVarType): Variant {.raises.} =
+  if v.VType == t: return v
+  if v.VType in {varEmpty, varNull}: return v
+  case t
+  of varSmallint, varShortInt, varByte, varWord, varLongWord, varInteger,
+     varInt64, varUInt64:
+    result = vInt(t, intOf(v))
+  of varSingle, varDouble, varDate:
+    result = vReal(if t == varDate: varDate else: varDouble, numericOf(v))
+  of varCurrency:
+    if isStrTag(v.VType): result = vCurrency(parseCurr(v.VString))
+    else: result = vCurrency(int64(asFloat64(v) * 10000.0))
+  of varBoolean:
+    if isStrTag(v.VType): result = vBool(v.VString == "True")
+    else: result = vBool(asFloat64(v) != 0.0)
+  of varString, varOleStr, varUString:
+    result = vStr(t, variantToStr(v))
+  else:
+    pasCurrentExc = EVariantTypeCastError.Create("Invalid variant conversion")
+    raise ValueError
+
+proc VarToStr*(v: Variant): string = variantToStr(v)
+proc VarToWideStr*(v: Variant): string = variantToStr(v)
+proc VarToStrDef*(v: Variant; default: string): string =
+  if v.VType in {varEmpty, varNull}: result = default
+  else: result = variantToStr(v)
+
+# ---------------------------------------------------------------------------
+# Variant: operators
+#
+# Promotion measured in dcc32 and FPC: int op int -> varInteger (varInt64
+# when either side is 64-bit), a real mixed in -> varDouble, str + str ->
+# varString, `/` always -> varDouble, and a type mismatch raises. Null
+# swallows the operation (measured: Null + int -> Null).
+
+proc vNullOr(a, b: Variant): bool = a.VType == varNull or b.VType == varNull
+
+# Measured promotion (dcc32 + FPC agree):
+#   int op int            -> varInteger
+#   LongWord/Int64/UInt64 -> varInt64   (measured: varLongWord + varByte = 0014)
+#   Currency with integer -> varCurrency (measured: varInteger + varCurrency = 0006)
+#   Double/Single mixed in-> varDouble   (`/` always)
+type
+  VPromoKind = enum vpkInt, vpkInt64, vpkDouble, vpkCurrency
+
+proc promoKind(a, b: Variant): VPromoKind =
+  let aCur = a.VType == varCurrency
+  let bCur = b.VType == varCurrency
+  let aReal = a.VType in {varSingle, varDouble}
+  let bReal = b.VType in {varSingle, varDouble}
+  if aCur or bCur:
+    result = if aReal or bReal: vpkDouble else: vpkCurrency
+  elif aReal or bReal or a.VType == varDate or b.VType == varDate:
+    result = vpkDouble
+  elif a.VType in {varInt64, varUInt64, varLongWord} or
+       b.VType in {varInt64, varUInt64, varLongWord}:
+    result = vpkInt64
+  else:
+    result = vpkInt
+
+proc promoAdd(a, b: Variant): float64 = asFloat64(a) + asFloat64(b)
+proc promoSub(a, b: Variant): float64 = asFloat64(a) - asFloat64(b)
+proc promoMul(a, b: Variant): float64 = asFloat64(a) * asFloat64(b)
+
+proc mismatched(): Variant {.raises.} =
+  pasCurrentExc = EVariantTypeCastError.Create("Invalid variant operation")
+  raise ValueError
+
+proc pasVarAdd*(a, b: Variant): Variant {.raises.} =
+  if vNullOr(a, b): return Null
+  if isStrTag(a.VType) and isStrTag(b.VType):
+    return vStr(varString, a.VString & b.VString)
+  if isStrTag(a.VType) or isStrTag(b.VType): return mismatched()
+  case promoKind(a, b)
+  of vpkCurrency: result = vCurrency(int64(pasRound(promoAdd(a, b) * 10000.0)))
+  of vpkDouble: result = vReal(varDouble, promoAdd(a, b))
+  of vpkInt64: result = vInt(varInt64, asInt64(a) + asInt64(b))
+  of vpkInt: result = vInt(varInteger, asInt64(a) + asInt64(b))
+
+proc pasVarSub*(a, b: Variant): Variant {.raises.} =
+  if vNullOr(a, b): return Null
+  if isStrTag(a.VType) or isStrTag(b.VType): return mismatched()
+  case promoKind(a, b)
+  of vpkCurrency: result = vCurrency(int64(pasRound(promoSub(a, b) * 10000.0)))
+  of vpkDouble: result = vReal(varDouble, promoSub(a, b))
+  of vpkInt64: result = vInt(varInt64, asInt64(a) - asInt64(b))
+  of vpkInt: result = vInt(varInteger, asInt64(a) - asInt64(b))
+
+proc pasVarMul*(a, b: Variant): Variant {.raises.} =
+  if vNullOr(a, b): return Null
+  if isStrTag(a.VType) or isStrTag(b.VType): return mismatched()
+  case promoKind(a, b)
+  of vpkCurrency: result = vCurrency(int64(pasRound(promoMul(a, b) * 10000.0)))
+  of vpkDouble: result = vReal(varDouble, promoMul(a, b))
+  of vpkInt64: result = vInt(varInt64, asInt64(a) * asInt64(b))
+  of vpkInt: result = vInt(varInteger, asInt64(a) * asInt64(b))
+
+proc pasVarDiv*(a, b: Variant): Variant {.raises.} =
+  ## `/` always yields varDouble (measured)
+  if vNullOr(a, b): return Null
+  if isStrTag(a.VType) or isStrTag(b.VType): return mismatched()
+  result = vReal(varDouble, asFloat64(a) / asFloat64(b))
+
+proc intWidth64(a, b: Variant): bool =
+  ## the measured widening rule: LongWord/Int64/UInt64 force a 64-bit result
+  a.VType in {varInt64, varUInt64, varLongWord} or
+    b.VType in {varInt64, varUInt64, varLongWord}
+
+proc pasVarIDiv*(a, b: Variant): Variant {.raises.} =
+  if vNullOr(a, b): return Null
+  if isStrTag(a.VType) or isStrTag(b.VType): return mismatched()
+  if intWidth64(a, b): return vInt(varInt64, asInt64(a) div asInt64(b))
+  result = vInt(varInteger, asInt64(a) div asInt64(b))
+
+proc pasVarMod*(a, b: Variant): Variant {.raises.} =
+  if vNullOr(a, b): return Null
+  if isStrTag(a.VType) or isStrTag(b.VType): return mismatched()
+  if intWidth64(a, b): return vInt(varInt64, asInt64(a) mod asInt64(b))
+  result = vInt(varInteger, asInt64(a) mod asInt64(b))
+
+proc pasVarNeg*(a: Variant): Variant {.raises.} =
+  if a.VType == varNull: return Null
+  if isRealTag(a.VType): return vReal(varDouble, -asFloat64(a))
+  result = vInt(varInteger, -asInt64(a))
+
+proc pasVarCmp*(a, b: Variant): int =
+  ## Delphi's VarCmp ordering. Measured: Null = Null is True, Null =
+  ## Unassigned is False (no exception), Unassigned < Null; a Null against
+  ## a value orders first, as COM does.
+  if a.VType == varNull or b.VType == varNull:
+    if a.VType == varNull and b.VType == varNull: return 0
+    if a.VType == varNull: return -1
+    return 1
+  if a.VType == varEmpty or b.VType == varEmpty:
+    if a.VType == varEmpty and b.VType == varEmpty: return 0
+    if a.VType == varEmpty: return -1
+    return 1
+  if isStrTag(a.VType) or isStrTag(b.VType):
+    let sa = variantToStr(a)
+    let sb = variantToStr(b)
+    if sa < sb: return -1
+    if sa > sb: return 1
+    return 0
+  if isRealTag(a.VType) or isRealTag(b.VType):
+    let x = asFloat64(a)
+    let y = asFloat64(b)
+    if x < y: return -1
+    if x > y: return 1
+    return 0
+  let x = asInt64(a)
+  let y = asInt64(b)
+  if x < y: return -1
+  if x > y: return 1
+  result = 0
+
+proc pasVarEq*(a, b: Variant): bool = pasVarCmp(a, b) == 0
+proc pasVarNe*(a, b: Variant): bool = pasVarCmp(a, b) != 0
+proc pasVarLt*(a, b: Variant): bool = pasVarCmp(a, b) < 0
+proc pasVarLe*(a, b: Variant): bool = pasVarCmp(a, b) <= 0
+proc pasVarGt*(a, b: Variant): bool = pasVarCmp(a, b) > 0
+proc pasVarGe*(a, b: Variant): bool = pasVarCmp(a, b) >= 0
+
+# Pascal's operators (`v + w`), routed to the named implementations above so
+# the emitter has one spelling per operation. They raise on a type mismatch
+# exactly as Delphi does, which means a call site must sit in a try/except or
+# in a {.raises.} routine - nimony's rule for any raising call.
+proc `+`*(a, b: Variant): Variant {.raises.} = pasVarAdd(a, b)
+proc `-`*(a, b: Variant): Variant {.raises.} = pasVarSub(a, b)
+proc `*`*(a, b: Variant): Variant {.raises.} = pasVarMul(a, b)
+proc `/`*(a, b: Variant): Variant {.raises.} = pasVarDiv(a, b)
+proc `div`*(a, b: Variant): Variant {.raises.} = pasVarIDiv(a, b)
+proc `mod`*(a, b: Variant): Variant {.raises.} = pasVarMod(a, b)
+proc `-`*(a: Variant): Variant {.raises.} = pasVarNeg(a)
+proc `==`*(a, b: Variant): bool = pasVarEq(a, b)
+proc `<`*(a, b: Variant): bool = pasVarLt(a, b)
+proc `<=`*(a, b: Variant): bool = pasVarLe(a, b)
+proc `>`*(a, b: Variant): bool = pasVarGt(a, b)
+proc `>=`*(a, b: Variant): bool = pasVarGe(a, b)
+
+# ---------------------------------------------------------------------------
+# Variant arrays
+#
+# Delphi's tag carries the varArray bit plus the element type; the bounds
+# arrive as (lo, hi) pairs. Storage is flat with per-dimension strides.
+
+proc VarArrayCreate*(bounds: openArray[int32]; elemType: TVarType): Variant =
+  var a = VariantArray(dims: @[])
+  var i = 0
+  var total = 1
+  while i + 1 < bounds.len:
+    let lo = bounds[i]
+    let hi = bounds[i + 1]
+    a.dims.add((lo: lo, hi: hi))
+    total = total * int(hi - lo + 1)
+    i = i + 2
+  a.values = newSeq[Variant](total)
+  for j in 0 ..< total:
+    a.values[j] = Variant(VType: elemType)
+  result = Variant(VType: varArray or elemType)
+  result.VArray = cast[RootRef](a)
+
+proc VarArrayOf*(values: openArray[Variant]): Variant =
+  var a = VariantArray(dims: @[(lo: 0'i32, hi: int32(values.len) - 1)],
+                       values: @[])
+  for v in values: a.values.add(v)
+  result = Variant(VType: varArray or varVariant)
+  result.VArray = cast[RootRef](a)
+
+proc arrayIndexOf(a: VariantArray; indices: openArray[int32]): int =
+  result = 0
+  var stride = 1
+  var i = a.dims.len - 1
+  while i >= 0:
+    let idx = int(indices[i]) - int(a.dims[i].lo)
+    result = result + idx * stride
+    stride = stride * int(a.dims[i].hi - a.dims[i].lo + 1)
+    dec i
+
+proc `[]`*(v: Variant; i: int32): Variant {.raises.} =
+  let a = cast[VariantArray](v.VArray)
+  if a == nil:
+    pasCurrentExc = EVariantError.Create("Variant is not an array")
+    raise ValueError
+  result = a.values[arrayIndexOf(a, [i])]
+
+proc `[]=`*(v: var Variant; i: int32; x: Variant) {.raises.} =
+  let a = cast[VariantArray](v.VArray)
+  if a == nil:
+    pasCurrentExc = EVariantError.Create("Variant is not an array")
+    raise ValueError
+  a.values[arrayIndexOf(a, [i])] = x
+
+proc VarArrayGet*(v: Variant; indices: openArray[int32]): Variant =
+  let a = cast[VariantArray](v.VArray)
+  if a == nil: result = Unassigned
+  else: result = a.values[arrayIndexOf(a, indices)]
+
+proc VarArrayPut*(v: var Variant; x: Variant; indices: openArray[int32]) =
+  let a = cast[VariantArray](v.VArray)
+  if a != nil: a.values[arrayIndexOf(a, indices)] = x
+
+proc VarArrayRedim*(v: var Variant; highBound: int32) =
+  let a = cast[VariantArray](v.VArray)
+  if a != nil and a.dims.len == 1:
+    let lo = a.dims[0].lo
+    a.dims[0] = (lo: lo, hi: highBound)
+    var total = int(highBound - lo + 1)
+    if total < 0: total = 0
+    let elem = if a.values.len > 0: a.values[0].VType else: varVariant
+    let old = a.values.len
+    a.values.setLen(total)
+    for j in old ..< total:
+      a.values[j] = Variant(VType: elem)

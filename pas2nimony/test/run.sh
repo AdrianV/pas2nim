@@ -19,8 +19,13 @@ fi
 
 TMP="$HERE/tmp"
 mkdir -p "$TMP"
-# the runtime shim units must be importable from the generated modules
+# the runtime shim units must be importable from the generated modules.
+# The placeholder-only units (Windows, Forms, ...) go alongside them: a
+# Pascal `uses Windows` becomes `import Windows`, and the placeholders
+# directory is deliberately not on --path, so the module has to be
+# visible where the .nim anchor is compiled from.
 cp -f "$ROOT"/runtime/*.nim "$TMP/"
+cp -f "$ROOT"/runtime/placeholders/*.nim "$TMP/" 2>/dev/null || true
 
 if [ $# -gt 0 ]; then
   SAMPLES=("$@")
