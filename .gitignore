@@ -11,6 +11,13 @@ pas2nimony/test/tmp
 pas2nimony/test/tmp2
 # closed-source Delphi compiler food - never published
 pas2nimony/test/private
+# closed-source Delphi corpus: several nested git checkouts. NEVER publish,
+# and never publish anything derived from them (translated .nim, logs, build
+# trees) either.
+/private/
+# the corpus build tree: flattened private sources + generated .nim - derived
+# from the private corpus, so it is private too
+pas2nimony/test/gonzales/
 # scratch
 a/
 b/

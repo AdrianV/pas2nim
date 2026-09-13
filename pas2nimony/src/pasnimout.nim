@@ -236,6 +236,23 @@ proc expr(s: var TRendor, n: Node): string =
       result = "addr(" & s.expr(n[0][0][0]) & "." & member & ")"
     else:
       result = "addr(" & s.expr(n[0]) & ")"
+  of nkOconstr:
+    # `TRec(Key: "", Link: nil)` - a Pascal typed record constant. Son 0
+    # is the type, the rest are `kv` pairs (son 0 the literal ident "kv",
+    # son 1 the field name, son 2 the value). Rendering this as a plain
+    # parenthesized list would emit `(kv(Key, ""), ...)`, which is not a
+    # constructor: the NIF shape is `(oconstr TY (kv NAME VAL) ...)`.
+    result = s.expr(n[0]) & "("
+    for i in 1 ..< n.len:
+      if i > 1: result.add(", ")
+      let pair = n[i]
+      if pair.kind == nkCall and pair.len == 3:
+        let member = if s.syms != nil: s.syms[].canonicalMember(pair[1].strVal)
+                     else: pair[1].strVal
+        result.add(member & ": " & s.expr(pair[2]))
+      else:
+        result.add(s.expr(pair))
+    result.add(")")
   of nkPar:
     result = "("
     for i in 0 ..< n.len:
@@ -319,8 +336,12 @@ proc defaultInit(s: var TRendor, ty: Node): string =
     of "tobject", "rootref", "pointer", "pchar", "pwidechar":
       result = "nil"
     else:
-      # class instances are nilable; everything else gets default(T)
-      if s.syms != nil and s.syms[].classes.hasKey(lower):
+      # class instances are nilable; everything else gets default(T).
+      # A record is registered in the same table (for its field/routine
+      # lookup) but is a VALUE type, so `isRef` decides - emitting `nil`
+      # for a record is a type error in nimony, not a default.
+      if s.syms != nil and s.syms[].classes.hasKey(lower) and
+          s.syms[].classes.getOrDefault(lower).isRef:
         result = "nil"
       else:
         result = "default(" & s.canon(ty.strVal) & ")"
@@ -766,6 +787,10 @@ proc stmt(s: var TRendor, n: Node) =
         if tyStr.len > 0: ln.add(": " & tyStr)
         if initStr.len > 0: ln.add(" = " & initStr)
         s.line(ln)
+    # an `absolute` alias is a template, and `template` may not sit
+    # inside a `var` block: it follows the block at the same level
+    for d in n.sons:
+      if d.kind == nkTemplateDef: s.stmt(d)
   of nkConstSection:
     for d in n.sons:
       if d.kind != nkIdentDefs: continue
@@ -789,13 +814,18 @@ proc stmt(s: var TRendor, n: Node) =
     else:
       renderDef(s, n)
   of nkWhenExpr:
-    # {$ifdef X} ... {$else} ... {$endif}
-    let branch = n[0]
-    s.line("when " & s.expr(branch[0]) & ":")
-    emitBranchBody(s, branch[1])
-    if n.len > 1 and n[1].kind == nkElse:
-      s.line("else:")
-      emitBranchBody(s, n[1][0])
+    # a `{$if <expr>}` group forwarded to Nim: `when C: ... elif C2: ...
+    # else: ...`. Every branch is rendered, so any number of {$elseif}
+    # arms survives; a `{$ifdef}` evaluated at parse time produces the
+    # same node with a single `elif` and an optional `else`.
+    for i in 0 ..< n.len:
+      let branch = n[i]
+      if branch.kind == nkElifBranch:
+        s.line((if i == 0: "when " else: "elif ") & s.expr(branch[0]) & ":")
+        emitBranchBody(s, branch[1])
+      elif branch.kind == nkElse:
+        s.line("else:")
+        emitBranchBody(s, branch[0])
   of nkImportStmt:
     for u in n.sons:
       if u.kind == nkIdent:
@@ -804,6 +834,9 @@ proc stmt(s: var TRendor, n: Node) =
         s.line("import " & unit)
       elif u.kind == nkCommentStmt:
         s.line(u.strVal)
+      else:
+        # a forwarded `{$if <expr>}` among the units: a guarded import
+        s.stmt(u)
   of nkRecCase:
     # `case tag: Type of` inside an object body
     let disc = n[0]
@@ -835,6 +868,53 @@ proc stmt(s: var TRendor, n: Node) =
     # fallback: render as expression statement
     s.line(s.expr(n))
 
+proc typeBlock(s: var TRendor, defs: seq[Node], hoisted: var seq[Node]) =
+  ## emit `defs` as one `type` section. A section holding only comments
+  ## (metaclass and forward-decl placeholders) emits nothing at all.
+  var anyDef = false
+  for def in defs:
+    if def.kind == nkTypeDef and def[2].kind != nkCommentStmt:
+      anyDef = true
+      break
+  if not anyDef: return
+  s.line("type")
+  s.indent = s.indent + 1
+  for def in defs:
+    if def.kind != nkTypeDef: continue
+    s.renderTypeDef(def, hoisted)
+  s.indent = s.indent - 1
+
+proc whenInTypeSection(s: var TRendor, n: Node, hoisted: var seq[Node]) =
+  ## render a forwarded conditional that sits between type definitions.
+  ## nimony rejects `when` INSIDE a `type` section, so the conditional is
+  ## hoisted to module level and every arm body becomes its own nested
+  ## `type` block:
+  ##
+  ##   when sizeof(pointer) == 8:
+  ##     type
+  ##       IntPtr = int64
+  ##   else:
+  ##     type
+  ##       IntPtr = int32
+  for i in 0 ..< n.len:
+    let branch = n[i]
+    if branch.kind == nkElifBranch:
+      s.line((if i == 0: "when " else: "elif ") & s.expr(branch[0]) & ":")
+      s.indent = s.indent + 1
+      if branch[1].kind == nkTypeSection:
+        typeBlock(s, branch[1].sons, hoisted)
+      else:
+        s.stmt(branch[1])
+      s.indent = s.indent - 1
+    elif branch.kind == nkElse:
+      s.line("else:")
+      s.indent = s.indent + 1
+      if branch[0].kind == nkTypeSection:
+        typeBlock(s, branch[0].sons, hoisted)
+      else:
+        s.stmt(branch[0])
+      s.indent = s.indent - 1
+
 proc renderModule*(module: Node, syms: var SymTab, infile, outfile: string,
                    flags: set[TParserFlag]) =
   var s = TRendor(buf: "", indent: 0, syms: addr(syms), flags: flags)
@@ -849,22 +929,19 @@ proc renderModule*(module: Node, syms: var SymTab, infile, outfile: string,
   for top in module.sons:
     case top.kind
     of nkTypeSection:
+      # a forwarded `{$if <expr>}` group may sit between the definitions.
+      # Each run of definitions is emitted as its own `type` section and
+      # the conditional is hoisted between them (see whenInTypeSection).
       var allHoisted: seq[Node] = @[]
-      var anyDef = false
+      var run: seq[Node] = @[]
       for def in top.sons:
-        if def.kind == nkTypeDef and def[2].kind != nkCommentStmt:
-          anyDef = true
-          break
-      if anyDef:
-        s.line("type")
-        s.indent = s.indent + 1
-      for def in top.sons:
-        if def.kind != nkTypeDef: continue
-        var hoisted: seq[Node] = @[]
-        s.renderTypeDef(def, hoisted)
-        for h in hoisted: allHoisted.add(h)
-      if anyDef:
-        s.indent = s.indent - 1
+        if def.kind == nkWhenExpr:
+          typeBlock(s, run, allHoisted)
+          run.setLen(0)
+          whenInTypeSection(s, def, allHoisted)
+        else:
+          run.add(def)
+      typeBlock(s, run, allHoisted)
       s.buf.add("\n")
       for h in allHoisted:
         s.renderDef(h)

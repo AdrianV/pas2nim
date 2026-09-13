@@ -196,7 +196,10 @@ semantics · ❌ rejected with a clear error (phase-2 lowerings)
 | `x is T` / `x as T` | `(x != nil) and (x of T)` / `pasAs[T](x)` | **runtime-checked (M4)**: nimony's `of` answers true for nil, so `is` guards with `!= nil` (Delphi: `nil is T` = false); `as` rides the generic `systempas.pasAs[T]` — nil stays nil, a failed check yields **nil** instead of raising EInvalidCast (the raising variant would mark every transitive caller `{.raises.}` — nimony only allows such calls inside try); a failed cast therefore surfaces as a nil-deref later |
 | `label L1, L2, 10;` + `goto L` | forward: `block pasGotoL: …` + `break pasGotoL`; backward: `while true: …` + `continue` | **structured rewrite (M4)**: the region between the goto and the label becomes the block/loop; forward gotos from nested loops and out of `try..finally` work (the finally runs, like Delphi); numeric labels supported; label scope is routine-local. v1 rejects: a label targeted both forward and backward, backward gotos crossing a loop boundary, jumping into a nested block, labels not inside a begin/end — all with precise errors |
 | `with E1, E2 do` | hidden temps `var pasW<n>: T = E` + member qualification | **instance-aware (M4)**: bare idents in the body resolve against the with-classes (innermost first, Delphi shadowing — with-members beat locals and `self` fields); later expressions are evaluated in the scope of the earlier ones (`with S, FOrigin do` = `FOrigin` of `S`). v1 heads: class-typed vars/params, `self`, ctor calls, member chains of class-typed fields; value objects/records unsupported (the temp would copy — needs ptr lowering). Planned: Oxygene-style `with E as X do` naming the temp explicitly |
-| `{$ifdef X}` etc. | `when defined(X)` / `when false:` | `{$if …}` conditions limited to `defined()` combinations |
+| `{$ifdef X}` / `{$ifndef X}` | `when defined(X)` / `when not defined(X)` | answered at parse time from the target's symbol set (`-d:` plus `{$define}`s) |
+| `{$if <expr>}` | `when <expr>` | **forwarded, never evaluated**: the frontend cannot answer `declared(X)` or `sizeof(Pointer)`, so the condition becomes real Nim and nimony decides. Closed by `{$endif}` or the Delphi `{$ifend}`; `{$elseif}`/`{$else}` chains, labelled closers, and nesting all supported. Works in statement, type-section, `uses`-clause and `begin`-block position (nimony rejects `when` inside a `type` section, so the emitter splits the section around it and hoists the arms' `type` blocks). Consequence: both branches must be parseable Pascal - see the milestone below |
+| `Name: T absolute Target` | `template Name: T = Target` | variable aliases only (no absolute addresses in the corpus). The template reads and writes through; the renderers hoist it out of the enclosing `var` block, because `template` may not sit inside one |
+| `{@exclude}` and `{@...}` | skipped | documentation directives, not declarations. The lexer hands the opener and its `}` over as separate tokens, both consumed |
 
 ### Case preservation
 
@@ -1160,3 +1163,48 @@ failing to compile-clean in the census (12/39 OK, was 11).
   reserved `pasFind` spelling for Pos/AnsiPos (+ RTL pin + char
   overload - the corpus's own `Find` methods must not pollute the canon).
 - Delphi census stays 6/15 PASS; the oracle suite stays 15/15.
+
+
+## M14 - directive forwarding completed, `absolute`, corpus closure complete
+
+The private-corpus sweep went from **20 to 47 of 55 units translated, 0 failures** (8 more
+satisfied by runtime shims), and the suite grew to 54 sections, all green.
+
+- **`{$if <expr>}` forwarding finished.** The parse-time evaluation scaffolding was
+  removed; every `{$if …}` now becomes a Nim `when`, no exceptions. Four positions had
+  to be handled: statement (already), type section, `uses` clause, and inside a
+  `begin … end` block. The last one was a single bug worth 11 units - the block loop
+  `break`ed at the directive and then reported `expected end but got: {$`. `parseIfDir`
+  is called from all four, carrying a `condWhenStack` so a closer is only consumed by the
+  group that owns it.
+- **`absolute` variable aliases** (35 occurrences, 12 units) lower to a template with the
+  target as its body. Verified at module and local scope, including the write-through
+  case. A local alias needs no initializer of its own; the target's declaration owns the
+  storage.
+- **`{@exclude}`** used to hang the parser: `parseStmt` had no `pxCommand` arm, so the
+  token was never consumed and the unit loop called `skipCom` forever, producing no output
+  at all. Skipping the annotation (and the `}` the lexer delivers separately) fixed it.
+- **A unit-level no-progress guard** now turns that whole failure class into a warning plus
+  a step over the offending token, capped at 32 per unit - a batch translator hanging
+  silently is the worst possible failure mode.
+- **Nested `goto` resolved at the source, not in the translator.** The last 10 units all
+  died on one routine in a corpus unit, where a `goto` jumped
+  two blocks *inward* to skip the cursor advance on the first pass. `FFirst` already
+  carried that state, so each of the two scan arms now reads
+  `if FFirst then FFirst := False else inc(<cursor>)` with no label and no jump. The
+  refusal for genuinely inward jumps stays, pinned by
+  `test/negative/goto_nested.pas`.
+- **`Registry` shim**: the last MISSING unit. One corpus unit listed it in `uses` without
+  taking a symbol from it, but the closure could not resolve it. The API surface was read
+  from the Delphi 2007 RTL source shipped in the wine prefix
+  (`source/Win32/rtl/common/Registry.pas`); `runtime/placeholders/Registry.nim` now covers
+  the full `TRegistry` surface plus `TRegIniFile` over an in-memory store. Documented
+  divergence: pasclasses' `TStrings` is an unbacked base (its `Add` is a no-op), so the
+  enumeration helpers take a `TStringList`.
+
+**Corpus repairs, not translator workarounds.** Forwarding a `{$if}` as a `when` means both
+branches must be parseable, which Delphi never required of a dead branch. Two were needed:
+One corpus unit had `:` where `;` belongs, and another needed the nested `goto` above.
+
+**Status: nothing in this tier has been type-checked.** Translation is reach; compilation
+is the next milestone.

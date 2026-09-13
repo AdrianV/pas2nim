@@ -51,7 +51,14 @@ type
     nkDistinctTy, nkSetTy, nkArrayTy, nkRangeTy, nkOpenArrayTy, nkVarTy,
     nkSeqTy,
     nkOfInherit, nkIdentDefs, nkRecList, nkRecCase, nkGenericParams,
-    nkImportStmt, nkTypeOfTy, nkStaticTy
+    nkImportStmt, nkTypeOfTy, nkStaticTy,
+    nkOconstr
+    ## object/record constructor `TRec(Key: v; Link: w)`, parsed from a
+    ## Pascal typed record constant. Kept distinct from `nkPar`: the NIF
+    ## shape is `(oconstr TY (kv NAME VAL) ...)`, and rendering it as a
+    ## plain parenthesized list loses the field bindings (`kv(Name, v)`
+    ## is not a valid Nim constructor). Appended at the END of the enum
+    ## so no existing ordinal shifts.
 
   Node* = ref object
     kind*: NodeKind

@@ -200,6 +200,13 @@ proc addField*(t: var SymTab; cls, spelling: string) =
   ## record a field declaration of class `cls`
   let key = cls.toLowerAscii
   var ci = t.classes.getOrDefault(key)
+  if ci.spelling.len == 0 and cls.len > 0:
+    # A `record` body is parsed by parseTypeDesc, which publishes the
+    # self-class name but does not go through registerClass for every
+    # path. Create the entry on demand: silently dropping the field
+    # would disable self-qualification for the whole type rather than
+    # fail loudly.
+    ci = ClassInfo(spelling: cls, parent: "", isRef: false)
   if ci.spelling.len > 0:
     if not ci.fieldSet.hasKey(spelling.toLowerAscii):
       ci.fields.add(spelling)

@@ -144,11 +144,6 @@ proc emitCall(e: var NifEmitter; n: Node) =
   ## (call callee arg...); set ops are plain calls to incl/excl, the
   ## parser already canonicalizes Include/Exclude to those names
   let i = e.info(n)
-  when defined(PASLER_DEBUG_AST):
-    if n.len > 0 and n[0].kind notin {nkIdent, nkDotExpr}:
-      echo "DBG call callee kind=", $n[0].kind, " sons=", n.len
-      for s in n.sons:
-        echo "DBG   son: kind=", $s.kind, " len=", s.len, " strVal=", s.strVal
   e.buf.copyInto(globalTags.registerTag("call"), i):
     for k, son in n.sons:
       if k == 0 and n.noQualCallee and son.kind == nkIdent:
@@ -230,6 +225,21 @@ proc emitExpr(e: var NifEmitter; n: Node) =
     e.buf.copyInto(globalTags.registerTag("cast"), e.info(n)):
       e.emitTypeDesc(n[0])
       e.emitExpr(n[1])
+  of nkOconstr:
+    # `TRec(Key: "", Link: nil)` -> (oconstr TY (kv NAME VAL) ...)
+    # Verified against nifler (test/tmp2/nifref): the kv tag wraps the
+    # field name and its value, and the type is son 0.
+    e.buf.copyInto(globalTags.registerTag("oconstr"), i):
+      for k, son in n.sons:
+        if k == 0:
+          e.emitTypeDesc(son)
+        elif son.kind == nkCall and son.len == 3:
+          let ki = e.info(son)
+          e.buf.copyInto(globalTags.registerTag("kv"), ki):
+            e.buf.addIdent(son[1].strVal, e.info(son[1]))
+            e.emitExpr(son[2])
+        else:
+          e.emitExpr(son)
   of nkPar:
     if n.len == 1:
       e.emitExpr(n[0])
@@ -390,12 +400,6 @@ proc emitStmts(e: var NifEmitter; n: Node) =
 
 proc emitStmt(e: var NifEmitter; n: Node) =
   let i = e.info(n)
-  when defined(PASLER_DEBUG_AST):
-    if n.kind == nkDiscardStmt:
-      echo "DBG discard son kind=", n[0].kind, " len=", n[0].len
-      if n[0].kind == nkCall and n[0].len >= 1:
-        if n[0][0].kind == nkDotExpr:
-          echo "DBG   callee: ", n[0][0][0].strVal, ".", n[0][0][1].strVal
   case n.kind
   of nkAsgn:
     # `List.Strings[i] := v` / `List.Objects[i] := obj` lower to the
@@ -518,10 +522,12 @@ proc emitStmt(e: var NifEmitter; n: Node) =
         if branch.kind == nkElifBranch:
           e.buf.copyInto(globalTags.registerTag("elif"), e.info(branch)):
             e.emitExpr(branch[0])
-            e.emitStmts(branch[1])
+            # the arm may hold a SECTION (`{$if}` between type
+            # definitions), whose children are definers, not statements
+            e.emitStmtBody(branch[1])
         elif branch.kind == nkElse:
           e.buf.copyInto(globalTags.registerTag("else"), e.info(branch)):
-            e.emitStmts(branch[0])
+            e.emitStmtBody(branch[0])
   of nkCommentStmt:
     discard "comments carry no semantics in NIF"
   of nkStmtList:
@@ -805,6 +811,12 @@ proc emitDef(e: var NifEmitter; n: Node) =
         # forward declarations (`Name = class;`) and comments carry no
         # NIF semantics
         continue
+      if def.kind == nkWhenExpr:
+        # a forwarded `{$if <expr>}` group between definitions. NIF keeps
+        # the `when` as a statement; its arm bodies are type sections of
+        # their own, which emitStmt routes back into this arm.
+        e.emitStmt(def)
+        continue
       var hoisted: seq[Node] = @[]
       e.emitTypeDef(def, hoisted)
       for h in hoisted: allHoisted.add(h)
@@ -814,12 +826,25 @@ proc emitDef(e: var NifEmitter; n: Node) =
     for d in n.sons:
       if d.kind == nkIdentDefs:
         e.emitVarDef(d, "var")
+    # an `absolute` alias is a template; NIF keeps it beside the vars
+    for d in n.sons:
+      if d.kind == nkTemplateDef:
+        e.emitDef(d)
   of nkConstSection:
     for d in n.sons:
       if d.kind == nkIdentDefs:
         e.emitVarDef(d, "const")
   of nkImportStmt:
-    e.emitImport(n)
+    # a forwarded `{$if <expr>}` among the units becomes a guarded
+    # import: the plain units go into the `(import ...)` list and the
+    # `when` follows as a statement of its own.
+    var conds: seq[Node] = @[]
+    var plain = newNode(nkImportStmt, n.info)
+    for son in n.sons:
+      if son.kind == nkWhenExpr: conds.add(son)
+      else: plain.add(son)
+    if plain.len > 0: e.emitImport(plain)
+    for c in conds: e.emitStmt(c)
   else:
     discard
 

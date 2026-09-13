@@ -4,6 +4,22 @@ pasler is a pascal compiler using the https://github.com/nim-lang/nimony compile
 The project is on an early state but can already translate a reasonable subset of the Delphi/Freepascal language. Because pasler is using the nimony toolchain it can also
 use .nim modules in its `uses` clause.
 
+## How far a construct gets
+
+Two different things are easy to conflate, so they are stated separately.
+
+- **Translate-only** - the parser accepts the Pascal and emits Nim. Nothing has been
+  compiled, so this proves reach, not correctness.
+- **Working** - the emitted Nim compiles under nimony *and* runs, and the output is
+  checked by `pas2nimony/test/run.sh`. Everything under "Language subset" and "RTL shim
+  units" below is in this tier unless it says otherwise.
+
+The parser's reach is deliberately wider than the proven tier. It is measured against a
+large third-party Delphi 2007 corpus that is kept out of this repository:
+**all 55 units of that closure translate** - 47 from Pascal source, 8 satisfied by runtime
+shims. None of those 55 has been type-checked yet. That is the next milestone, and the gap
+between "translates" and "compiles" is exactly where the remaining unknowns live.
+
 ## What is working
 
 **Language subset** (each locked in by a sample under `pas2nimony/test/`):
@@ -18,8 +34,20 @@ use .nim modules in its `uses` clause.
 - sets (`in`, `include`/`exclude`, set literals), subranges, static arrays, records with
   `case` variants, pointers and `^` types
 - exceptions: `try/except/finally`, `raise` of exception classes with instances, `on E do`
-- `case/of`, `with` (incl. nesting and Delphi scope semantics), `goto`/`label`, `repeat`,
+- `case/of`, `with` (incl. nesting and Delphi scope semantics), `repeat`,
   `while`, `for` (incl. `downto`, `break`/`continue` semantics), `exit`, `inherited`
+- `goto`/`label` for a label in the same block or an enclosing one (see the limits below)
+- conditional compilation is **forwarded, never evaluated**: every `{$if <expr>}`
+  (`{$elseif}`, `{$else}`, closed by `{$endif}` or the Delphi `{$ifend}`, labelled closers
+  included) becomes a Nim `when`, in statement, type-section, `uses`-clause and
+  `begin`-block position alike. The frontend does not answer `declared(X)` or
+  `sizeof(Pointer)` itself - a real compiler decides. The deliberate consequence is that
+  **both branches must be parseable Pascal**, which Delphi never required of a dead
+  branch, so such a branch occasionally needs a source repair before it will translate
+- `absolute` on a variable (`Name: T absolute Target`), a second name for an existing
+  variable: it lowers to a Nim template and reads and writes through, at module and local
+  scope
+- `{@exclude}` and the other `{@...}` documentation directives are skipped
 - string helpers mapped to nimony builtins (`Pos`, `Copy`, `Length`, `SetLength`, ...)
 - `uses nim.<pkg>.<mod>` - direct use of nimony std modules from Pascal
 
@@ -39,9 +67,24 @@ use .nim modules in its `uses` clause.
   `Between*`/`Start*`/`End*`/`Recode*`/`IsValid*` naming layer
 - `Classes`: `TStringList` (`Add`, default property `List[i]` and `List['key'] := v`,
   `IndexOf`, `Sort`, `SaveToFile`/`LoadFromFile`, name=value handling)
+- `Windows` and `Registry` placeholder shims (`pas2nimony/runtime/placeholders/`): the
+  Win32 compat surface for the `MSWINDOWS` branches, and the `TRegistry`/`TRegIniFile`
+  API over an in-memory store (no advapi32 FFI). Other Delphi units have placeholder
+  files there whose symbols fail loudly at compile time rather than silently - see
+  `doc/nimony-compat.md` for what each one actually covers
 
-Documented v1 gaps live in `pas2nimony/doc/nimony-compat.md` (e.g. `Now` is UTC, no local
-timezone; indexed property forms like `List.Strings[i]` need `List[i]`).
+### Where the limits are
+
+The construct-by-construct matrix lives in `pas2nimony/doc/nimony-compat.md` (e.g. `Now`
+is UTC, no local timezone; indexed property forms like `List.Strings[i]` need `List[i]`;
+`{$if}` forwarding above). The sharpest hard limit is `goto`: a label in the same block or
+in an enclosing one is rewritten into `block`/`while` form, but **jumping into a nested
+block is refused**, with a precise error rather than broken output. Nim has no equivalent
+jump, so Pascal written that way must be restructured at the source.
+`pas2nimony/test/negative/goto_nested.pas` is the minimal reproduction, and `run.sh`
+asserts the refusal. `pas2nimony/doc/toolchain.md` carries the build and cross-compile
+notes, including the one build trap that costs hours: never put a `nimony` symlink or
+directory next to this repo.
 
 ## Building and running
 
@@ -64,7 +107,7 @@ other language frontend would.
 
 1. **Self-test suite** - `cd pas2nimony && ./test/run.sh` runs every sample through
    **both** pipelines (the `.nim` path and the pasler NIF path) and reports pass/fail;
-   currently 33 sections, all green. New language semantics get locked in as a sample the
+   currently 54 sections, all green, with 15 differential oracle samples alongside. New language semantics get locked in as a sample the
    moment they work, so the suite doubles as a regression net and an executable
    feature list.
 

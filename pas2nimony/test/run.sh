@@ -59,6 +59,24 @@ for pas in "${SAMPLES[@]}"; do
   echo "-- ok"
 done
 
+# ---- negative samples: the translator must FAIL, with a named reason ----
+# A `goto` into a deeper block cannot be lowered to Nim. pas2nimony has to
+# say so; emitting broken Nim or hanging is the failure this guards.
+if [ $# -eq 0 ] && [ -f "$HERE/negative/goto_nested.pas" ]; then
+  echo "== negative-goto-nested"
+  neglog="$TMP/negative-goto-nested.log"
+  if "$ROOT/bin/pas2nimony" "$HERE/negative/goto_nested.pas" \
+      -o:"$TMP/negative_goto_nested.nim" > "$neglog" 2>&1; then
+    echo "   GOTO NESTED WAS ACCEPTED (want a refusal)"; fail=1
+  elif ! grep -q "jumping into a nested block" "$neglog"; then
+    echo "   GOTO NESTED FAILED FOR THE WRONG REASON"
+    sed 's/^/   /' "$neglog" | head -3
+    fail=1
+  else
+    echo "-- ok (refused: $(grep -m1 -o 'jumping into a nested block' "$neglog"))"
+  fi
+fi
+
 # ---- multi-unit project: counter unit + program using it ----
 if [ $# -eq 0 ] && [ -d "$HERE/twounit" ]; then
   echo "== twounit"
@@ -147,7 +165,8 @@ if [ $# -eq 0 ] && [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/twounit" ]; then
       echo "   PASLER USESNIM FAILED"; fail=1
     fi
   fi
-  for extra in shims datetime sysutils missing; do
+  for extra in shims datetime sysutils missing \
+               absolute bodywhen ifexpr condfield dirlabel; do
     if [ -f "$HERE/$extra.pas" ]; then
       echo "== pasler-$extra"
       mkdir -p "$TMP/pasler-$extra"

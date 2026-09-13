@@ -22,7 +22,8 @@ type
     pxInvalid, pxEof,
     pxAnd, pxArray, pxAs, pxAsm, pxBegin, pxCase, pxClass, pxConst,
     pxConstructor, pxDestructor, pxDiv, pxDo, pxDownto, pxElse, pxEnd, pxExcept,
-    pxExports, pxFinalization, pxFinally, pxFor, pxFunction, pxGoto, pxIf,
+    pxExports, pxFinalization, pxFinally, pxFor, pxFunction, pxGoto,
+    pxHelper, pxIf,
     pxImplementation, pxIn, pxInherited, pxInitialization, pxInline,
     pxInterface, pxIs, pxLabel, pxLibrary, pxMod, pxNil, pxNot, pxObject, pxOf,
     pxOperator, pxOr, pxOut, pxPacked, pxPrivate, pxProcedure, pxProgram,
@@ -49,7 +50,8 @@ const
   # keywords are sorted!
   Keywords = ["and", "array", "as", "asm", "begin", "case", "class", "const",
     "constructor", "destructor", "div", "do", "downto", "else", "end", "except",
-    "exports", "finalization", "finally", "for", "function", "goto", "if",
+    "exports", "finalization", "finally", "for", "function", "goto", "helper",
+    "if",
     "implementation", "in", "inherited", "initialization", "inline",
     "interface", "is", "label", "library", "mod", "nil", "not", "object", "of",
     "operator", "or", "out", "packed", "private", "procedure", "program",
@@ -458,6 +460,18 @@ proc scanStarComment(L: var TLexer, tok: var TToken) =
       tok.literal.add(buf[pos])
       inc(pos)
   L.bufpos = pos
+
+proc rewindTo*(L: var TLexer; pos: int) =
+  ## Reposition the lexer at an absolute buffer offset, discarding any
+  ## pending end marker. The text-level conditional selector has to
+  ## resume past a `{$...}` group after having WALKED BACK over the
+  ## directive body, because a directive's offset is only known from the
+  ## source text, never from the token stream. Without clearing
+  ## `pendingDirRi` the next token would be the stale `}` of the group
+  ## just skipped; without the walk-back the position would be lost.
+  if pos >= 0 and pos <= L.buf.len:
+    L.bufpos = pos
+  L.pendingDirRi = 0
 
 proc skip(L: var TLexer, tok: var TToken) =
   var pos = L.bufpos

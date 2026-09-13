@@ -52,6 +52,37 @@ Two consumption paths exist, and both must be kept working:
 
 The produced binary lands in `bin/pas2nimony`.
 
+`build.sh` resolves the compiler as `../../nimony/bin/nimony`, i.e. it
+expects a checkout whose parent directory also holds `nimony/`.
+
+**Never put a `nimony` symlink (or directory) next to this repository.**
+nimony refers to its own standard library by a path it computes relative
+to the build directory. A `nimony` entry at the repository root makes
+that path resolve through the symlink, and the build then dies with a
+*stale-looking* error such as
+
+```
+Error: unhandled exception: nifcore.nim(1278, 3) `c.rem == 0` into:
+  body did not consume all 18 children (left 2) [AssertionDefect]
+```
+
+or, after clearing `nimcache`,
+
+```
+[Error] cannot open: nimcache/<hash>.s.nif
+```
+
+Both are symptoms of the extra `nimony` entry, not of the source being
+edited. If a build fails this way, check `ls -ld nimony` in the
+repository root and remove it before touching `src/`. A `git worktree`
+such as `.head-check/` needs no symlink at all: from
+`<root>/.head-check/pas2nimony` the `../../nimony` path already resolves
+to the sibling checkout.
+
+Also: `./build.sh` reports failure only in its last lines, and an earlier
+successful binary stays in place. Always confirm the rebuild by checking
+that `bin/pas2nimony`'s mtime moved, not just by an empty `grep Error`.
+
 ## Notes on writing nimony-compatible Nim (lessons so far)
 
 These are the practical constraints we hit when writing a real program
@@ -100,6 +131,58 @@ If the nimony checkout changes:
 ```
 cd ../nimony && nim c -r src/hastur/hastur build nimony
 ```
+
+## Cross-compiling to Windows (verified working)
+
+nimony's C backend builds genuine Windows executables from Linux, and they
+run under Wine. Verified end to end on a hello-world and on a
+class/ctor/try-except probe: Pascal -> PE32+ -> runs.
+
+Two flags are **both** required, and one environment variable:
+
+```
+CC=x86_64-w64-mingw32-gcc bin/pas2nimony src.pas -o:src.nim
+CC=x86_64-w64-mingw32-gcc ../nimony/bin/nimony c \
+    --os:windows --cpu:amd64 \
+    --cc:x86_64-w64-mingw32-gcc \
+    --path:. src.nim
+```
+
+- **`--cpu:amd64` is mandatory.** 32-bit Windows fails to link: nimony's
+  Windows system C declares Win32 procs without `__stdcall`, so Ubuntu
+  mingw's decorated imports (`_ExitProcess@4`) never match.
+- **`--cc:` alone is not enough — `CC` must be set too.** The two flags
+  cover two different steps, and missing either one fails late and
+  confusingly:
+
+  | step | driven by | symptom when wrong |
+  |---|---|---|
+  | compiling the generated `.c` | `--cc:` (`config.cc`) | glibc's `compilers.h` is pulled in via `-I.`/system headers and the target's `windef.h` is "not found" |
+  | the **final link** | `CC` env var | `niflink` falls back to `cc`/`gcc` and `ld.bfd` tries to link Windows COFF objects: `undefined reference to ExitProcess`, `__emutls_get_address`, `__main` |
+
+  `niflink` picks its driver from `getEnv("CC", "cc")`
+  (`src/niflink/niflink.nim`). Passes `--cc:` through to the compile and
+  link nodes from `config.cc`, but the final link is a separate
+  `niflink` invocation that only reads `CC`.
+- **`--linker:` is not the fix.** `config.linker` sets a *custom* linker
+  name that is resolved as a tool, not a compiler driver; leaving it
+  empty is correct.
+
+Wine needs a writable prefix; the default one is not usable here. Use the
+repo's own prefix (already in `.gitignore`):
+
+```
+WINEPREFIX=$PWD/.wine/probe64 wine build/Prog.exe
+```
+
+Wine 11.16 (staging) is the version this was verified against — the
+project's earlier notes record that old wine (6.17-staging) hangs a
+nimony PE at exit.
+
+`pasler --run` cannot be used for a Windows target: it executes the
+output directly, and Linux cannot exec a PE (`Exec format error`). Build
+with `pasler c`/`nimony c` and run the `.exe` under `wine` yourself.
+
 ## New lessons from stage 1 (translator development)
 
 These were verified against nimony 0.4.x while building and testing the

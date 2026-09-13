@@ -37,7 +37,10 @@ type
     isPublic*: bool
 
   UnitSet* = ref object
-    files*: Table[string, bool]   ## unit files already parsed for symbols
+    files*: Table[string, bool]   ## unit file -> true once fully parsed, and
+                                  ## -> false while it is being parsed, so a
+                                  ## `uses` CYCLE (two corpus units)
+                                  ## is cut instead of recursing forever
 
   TParser* = object
     lex*: TLexer
@@ -103,6 +106,18 @@ type
     nestedProcs*: seq[string]   ## nested routine names of the current proc
     arrayTypeLows*: Table[string, int]  ## alias type name -> declared low
 
+var condWhenStack: seq[int] = @[]
+  ## One entry per OPEN conditional group of the parser currently running,
+  ## outermost first: 1 = the group was FORWARDED to Nim as a `when` (its
+  ## closers belong to parseIfDirAux), 0 = it was evaluated at parse time
+  ## by declDirective, which then consumes its own closers.
+  ##
+  ## Module state rather than a TParser field: a field added to TParser
+  ## makes the nimony frontend abort with a nifcore body assertion while
+  ## compiling this very file. absorbUnit saves and clears the stack
+  ## around a nested unit parse, so nesting stays correct when a `uses`
+  ## clause sits inside a conditional.
+
 # ---------------------------------------------------------------------------
 # token plumbing
 
@@ -148,6 +163,25 @@ proc parWarning(p: var TParser, key, msg: string) =
 proc skipCom(p: var TParser) =
   while p.tok.xkind == pxComment:
     getTokP(p)
+
+proc skipDirectives(p: var TParser) =
+  ## Step over a conditional directive in EXPRESSION position, leaving the
+  ## taken branch's tokens for the caller:
+  ##   Value.TypeInfo := PropInfo^.PropType{$IFNDEF FPC} ^ {$ENDIF} ...
+  ##   SetFilePointer(h, Lo, {$IFDEF FPC}PLong(@r.Hi){$ELSE}@r.Hi{$ENDIF}, Origin)
+  ## A `{$IF}` that an earlier `declDirective` already consumed emits only
+  ## the trailing `{$ELSE}`/`{$ENDIF}`, and `declDirective` handles those
+  ## too, so one call covers both shapes. `ifend` is the Delphi spelling
+  ## for a `{$if}` group's close.
+  var guard = 0
+  while p.tok.xkind in {pxCurlyDirLe, pxStarDirLe} and guard < 64:
+    inc guard
+    let kw = p.tok.ident.toLowerAscii
+    if kw in ["ifdef", "ifndef", "if", "else", "endif", "ifend"]:
+      discard declDirective(p)
+    else:
+      break
+  skipCom(p)
 
 proc eat(p: var TParser, xkind: TTokKind) =
   if p.tok.xkind == xkind: getTokP(p)
@@ -226,12 +260,14 @@ proc exSymbol*(n: Node, isPublic: bool): Node =
 # compiler directives {$...}
 
 proc parseStmtList(p: var TParser): Node
+proc parseTypeDefList(p: var TParser): Node
+proc parseUsesList(p: var TParser): Node
 
 proc isHandledDirective(p: TParser): bool =
   result = false
   if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
     case p.tok.ident.toLowerAscii
-    of "else", "endif": result = false
+    of "else", "elseif", "endif", "ifend": result = false
     else: result = true
 
 proc definedExpr(p: var TParser): Node =
@@ -243,23 +279,67 @@ proc definedExpr(p: var TParser): Node =
   else:
     parError(p, "identifier expected in directive")
 
-proc parseIfDirAux(p: var TParser, result: Node) =
-  result[0].add(parseStmtList(p))
+const
+  cmStmt = 0   ## a conditional's arm holds statements
+  cmType = 1   ## a conditional's arm holds type definitions
+  cmUses = 2   ## a conditional's arm holds entries of a uses clause
+
+proc parseCondBody(p: var TParser, mode: int): Node =
+  ## the body of one arm of a forwarded `{$if <expr>}` group. `mode` says
+  ## which construct the group sits in, because the arm has to be parsed
+  ## as the SAME construct: a group opened between two type definitions
+  ## holds definitions, not statements.
+  if mode == cmType: result = parseTypeDefList(p)
+  elif mode == cmUses: result = parseUsesList(p)
+  else: result = parseStmtList(p)
+
+proc parseIfDirAux(p: var TParser, result: Node, mode = cmStmt) =
+  ## the arms of a `{$if <expr>}` group that is forwarded to Nim as a
+  ## `when`. Each arm is parsed as a complete body of the surrounding
+  ## construct, so every closer of THIS group is consumed here; the
+  ## declaration parsers inside an arm decline them (see declDirective
+  ## and condWhenStack).
+  result[0].add(parseCondBody(p, mode))
+  # `{$elseif <expr>}` adds another guarded arm (Delphi 2007+); the
+  # emitters render it as `elif` and walk every branch, so any number is
+  # fine.
+  while p.tok.xkind in {pxCurlyDirLe, pxStarDirLe} and p.tok.ident.toLowerAscii == "elseif":
+    let em = succ(p.tok.xkind)
+    let branch = newNodeP(nkElifBranch, p)
+    getTokP(p)                  # skip `{$elseif`
+    branch.add(parseExpr(p))
+    eatDirEnd(p, em)
+    branch.add(parseCondBody(p, mode))
+    result.add(branch)
   if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
     let endMarker = succ(p.tok.xkind)
     if p.tok.ident.toLowerAscii == "else":
       let s = newNodeP(nkElse, p)
-      while p.tok.xkind != pxEof and p.tok.xkind != endMarker: getTokP(p)
-      p.eat(endMarker)
-      s.add(parseStmtList(p))
+      eatDirEnd(p, endMarker)
+      s.add(parseCondBody(p, mode))
       result.add(s)
     if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
       let endMarker2 = succ(p.tok.xkind)
-      if p.tok.ident.toLowerAscii == "endif":
-        while p.tok.xkind != pxEof and p.tok.xkind != endMarker2: getTokP(p)
-        p.eat(endMarker2)
+      # Delphi 2007 closes a `{$if}` with `{$ifend}`; newer compilers
+      # accept `{$endif}` as well. Both end the same group here.
+      if p.tok.ident.toLowerAscii in ["endif", "ifend"]:
+        eatDirEnd(p, endMarker2)
       else:
-        parError(p, "{$endif} expected")
+        parError(p, "{$ifend} or {$endif} expected")
+
+proc eatDirEnd(p: var TParser; endMarker: TTokKind) =
+  ## consume the end marker of a compiler directive, tolerating a trailing
+  ## LABEL between the directive name and the marker.
+  ##
+  ## Delphi accepts a symbolic label there and real code uses it heavily:
+  ## `{$ENDIF CLR}`, `{$ELSE MSWINDOWS}`, `{$IFEND FPC}`, `{$ELSE
+  ## OS2GCC}`. The lexer delivers the whole `{$...}` as an opener token
+  ## plus the `}` end marker, so with a label present the marker is not
+  ## the very next token and a bare `eat` reports "expected } but got:
+  ## CLR" at the label.
+  while p.tok.xkind != pxEof and p.tok.xkind != endMarker:
+    getTokP(p)
+  p.eat(endMarker)
 
 proc parseCondName(p: var TParser): string =
   ## the conditional symbol inside `{$ifdef NAME}` (case-insensitive)
@@ -269,6 +349,7 @@ proc parseCondName(p: var TParser): string =
     getTokP(p)
   else:
     parError(p, "identifier expected in conditional directive")
+
 
 proc skipCondBranch(p: var TParser, endMarker: TTokKind): bool =
   ## skip tokens up to the branch end; true when a depth-0 `{$else}`
@@ -285,10 +366,13 @@ proc skipCondBranch(p: var TParser, endMarker: TTokKind): bool =
       of "else":
         if depth == 0:
           return true
-      of "endif":
+      of "endif", "ifend":
+        # Delphi closes a `{$IF}` with `{$IFEND}`; `{$ENDIF}` is accepted
+        # too (and is what FPC writes). Without `ifend` here the skip runs
+        # to EOF and swallows every following routine.
         if depth == 0:
           getTokP(p)
-          p.eat(em)
+          eatDirEnd(p, em)
           return false
         dec depth
       else: discard
@@ -311,7 +395,7 @@ proc parseCondDir(p: var TParser, endMarker: TTokKind, negate: bool): Node =
   template consumeDir() {.dirty.} =
     let emX = succ(p.tok.xkind)
     getTokP(p)
-    p.eat(emX)
+    eatDirEnd(p, emX)
   if taken:
     skipCom(p)
     while true:
@@ -362,14 +446,22 @@ proc parseIfdefDir(p: var TParser, endMarker: TTokKind): Node =
 proc parseIfndefDir(p: var TParser, endMarker: TTokKind): Node =
   parseCondDir(p, endMarker, true)
 
-proc parseIfDir(p: var TParser, endMarker: TTokKind): Node =
+proc parseIfDir(p: var TParser, endMarker: TTokKind, mode = cmStmt): Node =
+  ## `{$if <expr>}` is forwarded to Nim verbatim as a `when`: a frontend
+  ## cannot answer `declared()`, `sizeof()` or `CompilerVersion`, and
+  ## guessing a branch is worse than handing the condition to a real
+  ## compiler. `parseExpr` keeps it a Pascal expression, so the emitted
+  ## `when` carries a valid condition rather than a source-level hack.
   result = newNodeP(nkWhenExpr, p)
   let branch = newNodeP(nkElifBranch, p)
   getTokP(p)                    # skip `{$if`
   branch.add(parseExpr(p))
   result.add(branch)
-  p.eat(endMarker)
-  parseIfDirAux(p, result)
+  eatDirEnd(p, endMarker)
+  condWhenStack.add(1)          # this group's closers belong to us
+  parseIfDirAux(p, result, mode)
+  if condWhenStack.len > 0:
+    condWhenStack.setLen(condWhenStack.len - 1)
 
 proc parseDirective(p: var TParser): Node =
   result = emptyNode(p.tok.info)
@@ -385,16 +477,15 @@ proc parseDirective(p: var TParser): Node =
       let nm = parseCondName(p)
       p.syms.defines[nm] = true
       p.sourceDefines[nm] = true
-      p.eat(endMarker)
+      eatDirEnd(p, endMarker)
     of "undef":
       getTokP(p)
       let nm = parseCondName(p)
       p.syms.defines[nm] = false
-      p.eat(endMarker)
+      eatDirEnd(p, endMarker)
     else:
       # skip unknown compiler directive
-      while p.tok.xkind != pxEof and p.tok.xkind != endMarker: getTokP(p)
-      p.eat(endMarker)
+      eatDirEnd(p, endMarker)
   else:
     p.eat(endMarker)
 
@@ -422,9 +513,12 @@ proc absorbUnit*(p: var TParser, unitName: string) =
         break
     if unitFile.len > 0: break
   if unitFile.len == 0 or p.absorbed.files.hasKey(unitFile):
+    # `hasKey` covers both senses: a unit already parsed, and one whose
+    # parse is still on the stack. The second is a `uses` cycle and must
+    # be cut here - recursing into it never terminates.
     return
   p.unitFiles[unitName.toLowerAscii] = splitFile(unitFile).name
-  p.absorbed.files[unitFile] = true
+  p.absorbed.files[unitFile] = false   # wait marker, set true when done
   var up = default(TParser)
   # CLI defines propagate into units; source-level {$define}s stay
   # local to the unit that made them (Delphi-like scoping)
@@ -434,10 +528,16 @@ proc absorbUnit*(p: var TParser, unitName: string) =
       inheritedDefines.add(d)
   for sp in p.searchPaths:
     up.searchPaths.add(sp)
+  # the nested unit parses on its own conditional stack, so a `uses`
+  # inside an open `{$if}` of the importer cannot corrupt either side
+  let savedCond = condWhenStack
+  condWhenStack.setLen(0)
   openParser(up, unitFile, p.flags, inheritedDefines)
   up.absorbed = p.absorbed   # shared ref: cycle guard works across units
   discard parseUnit(up)
   closeParser(up)
+  condWhenStack = savedCond
+  p.absorbed.files[unitFile] = true    # fully parsed
   for k, ci in up.syms.classes:
     if not p.syms.classes.hasKey(k):
       p.syms.classes[k] = ci
@@ -624,54 +724,214 @@ proc declDirective(p: var TParser): bool =
   if p.tok.xkind notin {pxCurlyDirLe, pxStarDirLe}: return false
   let endMarker = succ(p.tok.xkind)
   case p.tok.ident.toLowerAscii
-  of "ifdef", "ifndef", "if":
-    let negate = p.tok.ident.toLowerAscii == "ifndef"
+  of "ifdef", "ifndef":
+    # Answerable at parse time: the target's symbol set comes from the
+    # command line (-d:MSWINDOWS ...) plus every {$define} seen so far,
+    # so a frontend can decide this branch honestly.
+    let kw = p.tok.ident.toLowerAscii
     getTokP(p)                  # skip the directive name
-    var name = ""
-    if p.tok.xkind == pxSymbol:
-      # `{$IF DEFINED(X)}` - the only supported {$IF} form here
-      if p.tok.ident.toLowerAscii == "defined":
-        getTokP(p)
-        p.eat(pxParLe)
-        name = parseCondName(p)
-        p.eat(pxParRi)
-      else:
-        name = parseCondName(p)
-    else:
-      parError(p, "identifier expected in conditional directive")
+    let name = parseCondName(p)
     let defined = p.syms.defines.getOrDefault(name, false)
-    let taken = if negate: not defined else: defined
-    p.eat(endMarker)            # closing brace
+    let taken = if kw == "ifndef": not defined else: defined
+    eatDirEnd(p, endMarker)     # closing brace (tolerates a label)
     if taken:
       # the live branch's tokens flow through the enclosing loop; its
-      # trailing {$else}/{$endif} are handled by the cases below
+      # trailing {$else}/{$endif} are handled by the cases below. The
+      # group is recorded as parse-time EVALUATED, so those closers are
+      # consumed here rather than left for an enclosing forwarded group.
+      condWhenStack.add(0)
       skipCom(p)
       return true
     if skipCondBranch(p, endMarker):
       # the dead branch ran to a {$else}: that branch is LIVE - consume
       # the directive so its tokens flow through the loop
       getTokP(p)
-      p.eat(endMarker)
+      eatDirEnd(p, endMarker)
+      condWhenStack.add(0)
       skipCom(p)
     # else: skipCondBranch consumed the {$endif}
     return true
-  of "else":
-    # the dead alternative of a previously taken branch: consume the
-    # {$else} token, then skipCondBranch runs to the {$endif}
+  of "if":
+    # `{$if <expr>}` is NOT answerable by a frontend: `declared()`,
+    # `sizeof(Pointer)`, `CompilerVersion` all need semantic knowledge
+    # that only a full Pascal compiler has. The construct is forwarded to
+    # Nim as a `when` instead: `parseDirective` -> `parseIfDir` builds an
+    # nkWhenExpr, emitted as `(when (elif COND BODY) ...)`. It is
+    # deliberately NOT handled here - returning false lets the caller
+    # fall through to `parseStmt`, where that node has a slot to land in.
+    # A caller with only a token-stream slot reports its own error rather
+    # than silently taking a branch that cannot be proven.
+    return false
+  of "else", "elseif":
+    if condWhenStack.len > 0 and condWhenStack[^1] != 0:
+      # the closer belongs to a group FORWARDED to Nim as a `when`:
+      # parseIfDirAux owns it, so leave it for the enclosing statement
+      # list to stop on.
+      return false
+    # the dead alternative of a branch evaluated at parse time: consume
+    # the {$else} token, then skipCondBranch runs to the {$endif}
     getTokP(p)
-    p.eat(endMarker)
+    eatDirEnd(p, endMarker)
     discard skipCondBranch(p, endMarker)
+    if condWhenStack.len > 0:
+      condWhenStack.setLen(condWhenStack.len - 1)
     skipCom(p)
     return true
-  of "endif":
-    # the closing token of a branch whose taken side flowed here
+  of "endif", "ifend":
+    if condWhenStack.len > 0 and condWhenStack[^1] != 0:
+      # the closer of a forwarded `when` group: parseIfDirAux consumes it
+      return false
+    # the closing token of a branch whose taken side flowed here.
+    # `ifend` is the Delphi/FPC spelling for a {$if} group, `endif` the
+    # newer one; both end the group identically.
     getTokP(p)
-    p.eat(endMarker)
+    eatDirEnd(p, endMarker)
+    if condWhenStack.len > 0:
+      condWhenStack.setLen(condWhenStack.len - 1)
     skipCom(p)
     return true
   else:
     discard parseDirective(p)
     return true
+
+proc parseUsesItem(p: var TParser, dest: Node): bool =
+  ## one entry of a uses clause appended to `dest`: `Unit`, a dotted
+  ## `System.SysUtils`, the `nim.x.y` nimony bridge, or `Unit in 'path'`.
+  ## Returns true when an entry was consumed. The caller has already
+  ## established that the token can start an entry.
+  result = false
+  var unitName = p.tok.ident
+  var parts = @[unitName]
+  getTokP(p)
+  skipCom(p)
+  # dotted unit names: keep the last component (System.SysUtils -> sysutils)
+  while p.tok.xkind == pxDot:
+    getTokP(p)
+    skipCom(p)
+    if p.tok.xkind == pxSymbol:
+      unitName = p.tok.ident
+      parts.add(unitName)
+      getTokP(p)
+      skipCom(p)
+    else:
+      parError(p, "identifier expected after '.' in uses clause")
+  # `uses Foo in '..\\Foo.pas';` - a source-file binding. It is
+  # informational here: a unit is resolved by looking next to the
+  # importer and along --path:<dir> for <Unit>.pas, so the path is
+  # parsed and discarded. Without this the `in` token reached the
+  # expression parser and the corpus's main program died with
+  # "identifier expected in uses clause".
+  if p.tok.xkind == pxIn:
+    getTokP(p)
+    skipCom(p)
+    if p.tok.xkind in {pxStrLit}:
+      getTokP(p)
+    elif p.tok.xkind == pxSymbol:
+      # an unquoted path (rare, but Delphi accepts it in some forms)
+      getTokP(p)
+    else:
+      parError(p, "file name expected after `in` in uses clause")
+    skipCom(p)
+  if parts[0].toLowerAscii == "nim":
+    # nimony-module bridge: `nim.std.strutils` (or generally
+    # `nim.<package.path>.<mod>`) imports the nimony module directly.
+    # Its API is used as-is, with the exact nimony spellings and no
+    # Delphi fidelity promises.
+    var path = ""
+    for i in 1 ..< parts.len:
+      if i > 1: path.add("/")
+      path.add(parts[i])
+    if path.len == 0:
+      parError(p, "module path expected after `nim.` in uses clause")
+    else:
+      dest.add(newIdentNode(path, p.tok.info))
+      absorbNimModule(p, path)
+      result = true
+  else:
+    case unitName.toLowerAscii
+    of "strutils":
+      # our Delphi-shaped shim unit (M3)
+      dest.add(newIdentNode("passtrutils", p.tok.info))
+      absorbNimModule(p, "passtrutils")
+      result = true
+    of "math":
+      dest.add(newIdentNode("pasmath", p.tok.info))
+      absorbNimModule(p, "pasmath")
+      result = true
+    of "dateutils":
+      # Delphi DateUtils naming layer over the TDateTime core (M3)
+      dest.add(newIdentNode("pasdateutils", p.tok.info))
+      absorbNimModule(p, "pasdateutils")
+      result = true
+    of "classes":
+      # TStringList shim (M3); the rest of Classes is future work
+      dest.add(newIdentNode("pasclasses", p.tok.info))
+      absorbNimModule(p, "pasclasses")
+      result = true
+    of "sysutils", "si_strings", "system", "variants":
+      # our runtime shim (systempas) provides the Delphi RTL helpers
+      dest.add(newIdentNode("systempas", p.tok.info))
+      result = true
+    of "windows":
+      # the Win32 compat shim carries the API surface the corpus's
+      # MSWINDOWS branches reference (M11 Delphi oracle tier); the
+      # spelling must match the shim's file name (Linux is
+      # case-sensitive)
+      dest.add(newIdentNode("Windows", p.tok.info))
+      absorbNimModule(p, "Windows")
+      result = true
+    of "registry":
+      # the Registry compat shim (runtime/placeholders/Registry.nim).
+      # one corpus unit names it in `uses` without taking a symbol;
+      # DBWebbrowser uses TRegistry directly. Explicit, like Windows, so
+      # the import spelling matches the file name
+      dest.add(newIdentNode("Registry", p.tok.info))
+      absorbNimModule(p, "Registry")
+      result = true
+    else:
+      # own unit: absorb its declarations, then import the module
+      absorbUnit(p, unitName)
+      if not p.unitFiles.hasKey(unitName.toLowerAscii):
+        # no Pascal source: a runtime/ or placeholder shim .nim may
+        # provide the unit (its exports seed routineArgs for the
+        # paren-less 0-arg call machinery)
+        absorbNimModule(p, unitName)
+      # the import name must match the translated FILE name (Linux is
+      # case-sensitive; Pascal unit/file casing may differ)
+      let canonical = p.unitFiles.getOrDefault(unitName.toLowerAscii,
+          p.syms.canonical(unitName))
+      dest.add(newIdentNode(canonical, p.tok.info))
+      result = true
+
+proc parseUsesList(p: var TParser): Node =
+  ## the entries of a uses clause contributed by ONE arm of a forwarded
+  ## `{$if <expr>}` group. The arm becomes an import statement of its own,
+  ## which the `when` then guards:
+  ##
+  ##   when declared(FormatSettings):
+  ##     import FormatSettings
+  ##
+  ## A frontend cannot answer `declared(...)`, so the group is handed to a
+  ## real compiler instead of being guessed at parse time.
+  result = newNodeP(nkStmtList, p)
+  let imp = newNodeP(nkImportStmt, p)
+  var any = false
+  while true:
+    skipCom(p)
+    if p.tok.xkind == pxEof: break
+    if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}: break  # closer / else
+    if p.tok.xkind == pxSemiColon: break
+    if p.tok.xkind == pxComma:
+      getTokP(p)
+      continue
+    if p.tok.xkind != pxSymbol: break
+    if parseUsesItem(p, imp): any = true
+    p.opt(pxComma)
+  if any:
+    result.add(imp)
+  else:
+    # an empty arm is an empty block to nimony; emit a real statement
+    result.add(newNodeP(nkDiscardStmt, p))
 
 proc parseUsesStmt*(p: var TParser): Node =
   result = newNodeP(nkImportStmt, p)
@@ -683,7 +943,15 @@ proc parseUsesStmt*(p: var TParser): Node =
     skipCom(p)
     if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
       # `{$IFDEF X} Unit, {$ENDIF}` inside the uses clause
+      let dir = p.tok.ident.toLowerAscii
+      if dir == "if":
+        # forwarded, not evaluated: a guarded import
+        result.add(parseIfDir(p, succ(p.tok.xkind), cmUses))
+        any = true
+        if p.tok.xkind in {pxSemiColon, pxEof}: break
+        continue
       if declDirective(p): continue
+      break
     if p.tok.xkind == pxComma:
       # comma-first continuation: `,\n  NextUnit` (Delphi style)
       getTokP(p)
@@ -692,83 +960,7 @@ proc parseUsesStmt*(p: var TParser): Node =
       break
     if p.tok.xkind != pxSymbol:
       parError(p, "identifier expected in uses clause")
-    var unitName = p.tok.ident
-    var parts = @[unitName]
-    getTokP(p)
-    skipCom(p)
-    # dotted unit names: keep the last component (System.SysUtils -> sysutils)
-    while p.tok.xkind == pxDot:
-      getTokP(p)
-      skipCom(p)
-      if p.tok.xkind == pxSymbol:
-        unitName = p.tok.ident
-        parts.add(unitName)
-        getTokP(p)
-        skipCom(p)
-      else:
-        parError(p, "identifier expected after '.' in uses clause")
-    if parts[0].toLowerAscii == "nim":
-      # nimony-module bridge: `nim.std.strutils` (or generally
-      # `nim.<package.path>.<mod>`) imports the nimony module directly.
-      # Its API is used as-is, with the exact nimony spellings and no
-      # Delphi fidelity promises.
-      var path = ""
-      for i in 1 ..< parts.len:
-        if i > 1: path.add("/")
-        path.add(parts[i])
-      if path.len == 0:
-        parError(p, "module path expected after `nim.` in uses clause")
-      else:
-        result.add(newIdentNode(path, p.tok.info))
-        absorbNimModule(p, path)
-        any = true
-    else:
-      case unitName.toLowerAscii
-      of "strutils":
-        # our Delphi-shaped shim unit (M3)
-        result.add(newIdentNode("passtrutils", p.tok.info))
-        absorbNimModule(p, "passtrutils")
-        any = true
-      of "math":
-        result.add(newIdentNode("pasmath", p.tok.info))
-        absorbNimModule(p, "pasmath")
-        any = true
-      of "dateutils":
-        # Delphi DateUtils naming layer over the TDateTime core (M3)
-        result.add(newIdentNode("pasdateutils", p.tok.info))
-        absorbNimModule(p, "pasdateutils")
-        any = true
-      of "classes":
-        # TStringList shim (M3); the rest of Classes is future work
-        result.add(newIdentNode("pasclasses", p.tok.info))
-        absorbNimModule(p, "pasclasses")
-        any = true
-      of "sysutils", "si_strings", "system", "variants":
-        # our runtime shim (systempas) provides the Delphi RTL helpers
-        result.add(newIdentNode("systempas", p.tok.info))
-        any = true
-      of "windows":
-        # the Win32 compat shim carries the API surface the corpus's
-        # MSWINDOWS branches reference (M11 Delphi oracle tier); the
-        # spelling must match the shim's file name (Linux is
-        # case-sensitive)
-        result.add(newIdentNode("Windows", p.tok.info))
-        absorbNimModule(p, "Windows")
-        any = true
-      else:
-        # own unit: absorb its declarations, then import the module
-        absorbUnit(p, unitName)
-        if not p.unitFiles.hasKey(unitName.toLowerAscii):
-          # no Pascal source: a runtime/ or placeholder shim .nim may
-          # provide the unit (its exports seed routineArgs for the
-          # paren-less 0-arg call machinery)
-          absorbNimModule(p, unitName)
-        # the import name must match the translated FILE name (Linux is
-        # case-sensitive; Pascal unit/file casing may differ)
-        let canonical = p.unitFiles.getOrDefault(unitName.toLowerAscii,
-            p.syms.canonical(unitName))
-        result.add(newIdentNode(canonical, p.tok.info))
-        any = true
+    if parseUsesItem(p, result): any = true
     # the comma is optional (comma-first continuations exist); the
     # loop head tolerates directives and further commas. `;` (and
     # Eof) end the clause - anything else falls to the loop head,
@@ -791,10 +983,116 @@ proc getPrecedence(kind: TTokKind): int =
   of pxAs: result = 5
   else: result = -1
 
+proc condArgsAux(p: var TParser; into: var seq[Node]) =
+  ## Parse the arguments contributed by a `{$IFDEF}`/`{$ELSE}`/`{$ENDIF}`
+  ## group that sits INSIDE an argument list, appending them to `into`.
+  ##
+  ## a corpus unit spells a call across a conditional:
+  ##   Int64Rec(Result).Lo := SetFilePointer(THandle(Handle),
+  ##     Int64Rec(Result).Lo,
+  ##   {$IFDEF FPC}
+  ##     PLONG(@Int64Rec(Result).Hi), Origin);
+  ##   {$ELSE}
+  ##     @Int64Rec(Result).Hi, Origin);
+  ##   {$ENDIF}
+  ## The dead arm embeds a whole call tail - including the closing `)` -
+  ## so it must be SKIPPED at the token level, never parsed. The taken
+  ## arm's arguments are spliced in place of the directive, which is what
+  ## this does; the caller's loop then continues with whatever follows
+  ## `{$ENDIF}` (there, the `;`). The `{$IF}`/`{$ELSEIF}` text-form
+  ## evaluator used for declarations is deliberately not reused here: an
+  ## argument cannot be an expression node without losing the delimiters
+  ## that live inside the arms.
+  var kw = ""
+  if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
+    kw = p.tok.ident.toLowerAscii
+  let endMarker = succ(p.tok.xkind)
+  var taken = false
+  if kw == "ifdef" or kw == "ifndef":
+    getTokP(p)
+    let d = p.syms.defines.getOrDefault(parseCondName(p), false)
+    taken = if kw == "ifdef": d else: not d
+    eatDirEnd(p, endMarker)
+  elif kw == "if":
+    # `{$if <expr>}` is not evaluable by a frontend. Here the arms hold
+    # argument delimiters (a dead arm embeds the closing `)`), so
+    # the group cannot be lowered to a Nim `when` expression either:
+    # refusing is the honest outcome and the Pascal source has to change.
+    parError(p, "{$if <expr>} cannot be evaluated by a frontend and " &
+      "cannot be lowered to a `when` in an argument list")
+  else:
+    return
+  skipCom(p)
+  var done = false
+  var inTaken = taken
+  while not done:
+    if p.tok.xkind == pxEof:
+      break
+    if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
+      let d = p.tok.ident.toLowerAscii
+      if d == "else":
+        eatDirEnd(p, succ(p.tok.xkind))
+        skipCom(p)
+        if taken:
+          discard skipCondBranch(p, endMarker)
+          done = true
+        else:
+          inTaken = true
+        continue
+      elif d == "endif":
+        eatDirEnd(p, succ(p.tok.xkind))
+        done = true
+        continue
+      elif d in ["ifdef", "ifndef", "if", "elseif"] and inTaken:
+        # a nested group inside a taken arm: recurse for its arguments
+        condArgsAux(p, into)
+        continue
+      elif inTaken:
+        eatDirEnd(p, succ(p.tok.xkind))
+        continue
+      else:
+        discard skipCondBranch(p, succ(p.tok.xkind))
+        continue
+    if not inTaken:
+      getTokP(p)
+      continue
+    var a = parseExpr(p)
+    if p.tok.xkind == pxColon:
+      # the same `e:w[:p]` width lowering exprListAux performs
+      getTokP(p)
+      skipCom(p)
+      let c = newNode(nkCall, a.info)
+      c.add(newIdentNode("pasW", a.info))
+      c.add(a)
+      c.add(parseExpr(p))
+      skipCom(p)
+      if p.tok.xkind == pxColon:
+        getTokP(p)
+        skipCom(p)
+        c.add(parseExpr(p))
+        skipCom(p)
+      a = c
+    into.add(a)
+    if p.tok.xkind in {pxComma, pxSemiColon}:
+      getTokP(p)
+      skipCom(p)
+    else:
+      done = true
+
 proc exprListAux(p: var TParser, endTok, sepTok: TTokKind, result: Node) =
   getTokP(p)
   skipCom(p)
   while true:
+    if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
+      # a conditional group inside the list
+      var spliced: seq[Node] = @[]
+      condArgsAux(p, spliced)
+      for sp in spliced:
+        result.add(sp)
+      if p.tok.xkind == endTok:
+        getTokP(p)
+        break
+      continue
     if p.tok.xkind == endTok:
       getTokP(p)
       break
@@ -1089,7 +1387,11 @@ proc identOrLiteral(p: var TParser): Node =
         result.add(pair)
       else:
         result.add(a)
-      if p.tok.xkind == pxComma:
+      if p.tok.xkind == pxComma or p.tok.xkind == pxSemiColon:
+        # a typed record constant separates its fields with `;`
+        # (`(Key: ''; Link: nil)`), while array/set constructors use
+        # `,`. Accept both: neither form is legal with the other
+        # separator, so this cannot swallow a real delimiter.
         getTokP(p)
         skipCom(p)
     p.eat(pxParRi)
@@ -1189,6 +1491,10 @@ proc primary(p: var TParser): Node =
     return
   result = p.withQualify(identOrLiteral(p))
   while true:
+    # Comments must go unconditionally; the costlier directive descent is
+    # guarded, because this runs for EVERY postfix operand.
+    skipCom(p)
+    if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}: skipDirectives(p)
     case p.tok.xkind
     of pxParLe:
       let a = result
@@ -1330,7 +1636,66 @@ proc primary(p: var TParser): Node =
         result.add(a)
       getTokP(p)               # skip '.'
       skipCom(p)
-      if p.tok.xkind == pxSymbol:
+      if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
+        # A conditional may select the member NAME itself, which is how
+        # a struct field that Delphi and POSIX name differently is
+        # spelled (a corpus unit):
+        #   Multicast6.ipv6mr_multiaddr.{$IFDEF POSIX}s6_addr{$ELSE}u6_addr8{$ENDIF}[n]
+        # The branch is chosen at parse time exactly as for
+        # declarations, and only the taken branch is parsed - the dead
+        # arm's identifier must not be emitted.
+        var kw = p.tok.ident.toLowerAscii
+        let em0 = succ(p.tok.xkind)
+        var taken = false
+        if kw == "ifdef" or kw == "ifndef":
+          getTokP(p)
+          let d = p.syms.defines.getOrDefault(parseCondName(p), false)
+          taken = if kw == "ifdef": d else: not d
+          eatDirEnd(p, em0)
+        elif kw == "if":
+          # a `{$if <expr>}` cannot select an identifier: the choice is
+          # semantic (declared()/sizeof()) and a frontend cannot make it.
+          parError(p, "{$if <expr>} cannot select an identifier; a " &
+            "frontend cannot evaluate the condition")
+        skipCom(p)
+        var chosen = false
+        while not chosen:
+          if p.tok.xkind == pxEof:
+            parError(p, "identifier expected after '.'")
+            break
+          if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
+            let d = p.tok.ident.toLowerAscii
+            if d == "else":
+              eatDirEnd(p, succ(p.tok.xkind))
+              skipCom(p)
+              taken = not taken
+              continue
+            elif d == "endif":
+              eatDirEnd(p, succ(p.tok.xkind))
+              break
+            elif taken and d in ["ifdef", "ifndef"]:
+              # a nested group guarding the name
+              let emN = succ(p.tok.xkind)
+              getTokP(p)
+              let dn = p.syms.defines.getOrDefault(parseCondName(p), false)
+              let tn = if d == "ifdef": dn else: not dn
+              eatDirEnd(p, emN)
+              if not tn:
+                discard skipCondBranch(p, succ(p.tok.xkind))
+              continue
+            else:
+              eatDirEnd(p, succ(p.tok.xkind))
+              continue
+          if taken:
+            if p.tok.xkind != pxSymbol:
+              parError(p, "identifier expected after '.'")
+              break
+            result.add(newIdentNode(p.tok.ident, p.tok.info))
+            getTokP(p)
+            chosen = true
+          else:
+            getTokP(p)
+      elif p.tok.xkind == pxSymbol:
         result.add(newIdentNode(p.tok.ident, p.tok.info))
         getTokP(p)
       else:
@@ -1436,6 +1801,18 @@ proc buildInComparisons(p: var TParser, x, setN: Node): Node =
 
 proc lowestExprAux(p: var TParser, v: var Node, limit: int): TTokKind =
   v = primary(p)
+  # A comment (or a conditional directive) may sit between an operand
+  # and its operator, and the operator may even be on the far side of a
+  # line break:
+  #   if (Length(right.FValue.FWord.FInput) > 0)
+  #     //or IsFunction(right)
+  #     or IsFunctionWithParam(right, nextOp)
+  #   then
+  # a corpus unit wraps exactly like that. Without skipCom the `or`
+  # is never seen as an operator, the parse stops after the comparison
+  # and the caller reports "expected then but got: or".
+  skipCom(p)
+  if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}: skipDirectives(p)
   var op = p.tok.xkind
   var opPred = getPrecedence(op)
   if p.context == conTypeDesc and op == pxEquals:
@@ -1917,16 +2294,266 @@ proc parseRoutineType*(p: var TParser): Node =
 # ---------------------------------------------------------------------------
 # declarations
 
+proc dirPicksName(p: var TParser): bool =
+  ## True when the current `{$IFDEF}`/`{$IF}` group selects a DECLARATION
+  ## NAME rather than wrapping statements:
+  ##   {$IFDEF POSIX}s6_addr{$ELSE}u6_addr8{$ENDIF}: Integer;
+  ## A record/class member loop cannot hand such a group to
+  ## declDirective: the taken identifier would parse as a STATEMENT and
+  ## the `:` is left stranded, which is exactly the corpus failure
+  ## "field or `case` expected in record body, got :".
+  ##
+  ## The test scans the raw source from the current position to the end of
+  ## the logical line: a `:` or `=` BEFORE any `;`, `)` or statement
+  ## keyword means a name followed by its type or `=`. Braced groups are
+  ## skipped whole, so the `else` of `{$ELSE}` is never mistaken for the
+  ## statement keyword; a group left open at the line end means the rest
+  ## of the declaration is on later lines, and the field parser handles
+  ## those (condPickIdent walks the tokens itself). Nothing is consumed.
+  result = false
+  if p.tok.xkind notin {pxCurlyDirLe, pxStarDirLe}:
+    return
+  # Only the forms a frontend can answer select a name. A `{$if <expr>}`
+  # is not one of them; it falls through to the ordinary directive path,
+  # which reports that it cannot be evaluated.
+  if p.tok.ident.toLowerAscii notin ["ifdef", "ifndef"]:
+    return
+  let buf = p.lex.buf
+  var i = p.lex.bufpos
+  var guard = 0
+  while i < buf.len and guard < 600:
+    inc guard
+    let c = buf[i]
+    if c == '\c' or c == '\l':
+      return                       # line ended with no `:`/`=`
+    if c == '{':
+      # skip the whole `{$...}` group, respecting nesting
+      var depth = 0
+      var ok = false
+      while i < buf.len:
+        if buf[i] == '{':
+          inc depth
+        elif buf[i] == '}':
+          dec depth
+          if depth == 0:
+            inc i
+            ok = true
+            break
+        elif buf[i] == '\c' or buf[i] == '\l':
+          return
+        inc i
+      if not ok:
+        return
+      continue
+    if c == '}':
+      inc i
+      continue
+    if c == ';' or c == ')':
+      return                       # a statement cell, not a name
+    if c == ':' or c == '=':
+      result = true
+      return
+    if c in {'a'..'z', 'A'..'Z', '_'}:
+      let a = i
+      while i < buf.len and (buf[i] in {'a'..'z', 'A'..'Z', '0'..'9', '_'}):
+        inc i
+      let w = buf[a ..< i].toLowerAscii
+      if w in ["begin", "end", "else", "case", "try", "for",
+               "while", "repeat", "record", "class", "type", "var",
+               "const", "procedure", "function", "property", "unit",
+               "implementation", "interface"]:
+        return
+      continue
+    inc i
+
+proc wordAt2(s: string; i: var int): string =
+  result = ""
+  while i < s.len and s[i] in {' ', '\t', '\r', '\n'}:
+    inc i
+  let a = i
+  while i < s.len and (s[i] in {'a'..'z', 'A'..'Z', '0'..'9', '_'}):
+    inc i
+  if i > a:
+    result = s[a ..< i]
+
+proc delimAfter(decl: string; startAt: int): int =
+  ## index of the `:` or `=` that terminates a declaration NAME, starting
+  ## at `startAt`. Whole `{$...}` groups are stepped over, so a conditional
+  ## between the name and the delimiter cannot supply a false hit.
+  result = decl.len
+  var i = startAt
+  while i < decl.len:
+    if decl[i] == '{':
+      while i < decl.len and decl[i] != '}':
+        inc i
+      if i < decl.len:
+        inc i
+      continue
+    if decl[i] in {':', '='}:
+      return i
+    inc i
+
+proc declTextToEol(L: TLexer; lineStart: var int): string =
+  ## the raw source of the declaration that starts at the current lexer
+  ## position, taken to the end of its line. The position is walked back
+  ## over the directive body already consumed, so a group that began
+  ## earlier on the line is included in full.
+  result = ""
+  let buf = L.buf
+  var i = L.bufpos
+  while i > 0 and buf[i - 1] notin {'\c', '\l'}:
+    dec i
+  # `lineStart` must point at the FIRST NON-BLANK character of the line,
+  # because the offsets `pickNameFromText` reports are indices into the
+  # returned text. Leaving indentation in would shift every offset and
+  # make the caller resume in the middle of the conditional.
+  var blank = i
+  while blank < buf.len and buf[blank] in {' ', '\t'}:
+    inc blank
+  i = blank
+  var e = i
+  while e < buf.len and buf[e] notin {'\c', '\l'}:
+    inc e
+  lineStart = i
+  if e > i:
+    result = buf[i ..< e]
+
+proc pickNameFromText(decl: string; p: var TParser;
+                      skipLen: var int): string =
+  ## the identifier the TAKEN arms of a name conditional contribute, read
+  ## straight from the declaration's source text:
+  ##   {$IFDEF POSIX}s6_addr{$ELSE}u6_addr8{$ENDIF}: Integer;
+  ## `skipLen` receives the offset just past the group that was consumed,
+  ## so the caller can continue at the type name.
+  result = ""
+  skipLen = 0
+  var arm = true
+  var i = 0
+  while i < decl.len:
+    if decl[i] in {' ', '\t', '\r', '\n'}:
+      inc i
+      continue
+    if decl[i] != '{' and arm:
+      # a plain identifier before any group: that IS the name
+      var k = i
+      let w = wordAt2(decl, k)
+      if w.len > 0:
+        result = w
+        skipLen = delimAfter(decl, k)
+        return result
+      inc i
+      continue
+    if decl[i] == '{':
+      let gs = i
+      inc i
+      let d = wordAt2(decl, i).toLowerAscii
+      # skip to the `}` that closes this group, then past it
+      while i < decl.len and decl[i] != '}':
+        inc i
+      var ge = i
+      if ge < decl.len:
+        ge += 1
+      if d in ["ifdef", "ifndef"]:
+        var k = gs + 1
+        let nm2 = wordAt2(decl, k).toLowerAscii
+        let def = p.syms.defines.getOrDefault(nm2, false)
+        arm = if d == "ifdef": def else: not def
+      elif d == "else":
+        # the braces sit around the keyword: `{$ELSE}`
+        discard
+      elif d == "endif":
+        return result
+      if d in ["else", "elseif"]:
+        # opposite of the branch that ran before this `{$ELSE}`
+        arm = not arm
+        if arm:
+          # the taken arm begins right after the `}`
+          var k = ge
+          let w = wordAt2(decl, k)
+          if w.len > 0:
+            result = w
+            skipLen = delimAfter(decl, k)
+            return result
+          i = ge
+          continue
+        i = ge
+        continue
+      i = ge
+      continue
+    if arm and decl[i] notin {' ', '\t', '\r', '\n'}:
+      var k = i
+      let w = wordAt2(decl, k)
+      if w.len > 0:
+        result = w
+        # `k` has advanced past the identifier, so this offset is the first
+        # character AFTER the name. The lexer must resume exactly there:
+        # landing INSIDE the following `{$...}` would make `getTok` read it
+        # as a directive opener instead of the `:` that ends the field.
+        skipLen = k
+        return result
+      inc i
+      continue
+    inc i
+  result = result
+
+proc condPickIdent(p: var TParser): string =
+  ## the declaration NAME a `{$IFDEF}`/`{$IFNDEF}` group selects, e.g.
+  ##   {$IFDEF POSIX}s6_addr{$ELSE}u6_addr8{$ENDIF}: Integer;
+  ##
+  ## The name is read from the declaration's SOURCE TEXT rather than by
+  ## walking tokens. The lexer's `{$...}` handling stops the opener after
+  ## the directive name and re-scans the tail, so a token walk sees
+  ## phantom openers (`{$` carrying the NEXT directive's name) and cannot
+  ## reliably find the `}` that ends the group. Text has none of those
+  ## artefacts: the arm that is taken is selected by evaluating the
+  ## directives in order, and only that arm's identifier is produced.
+  ## On success the lexer is moved past the whole group, so the caller
+  ## continues at the `:` (or `=`).
+  result = ""
+  if p.tok.xkind notin {pxCurlyDirLe, pxStarDirLe}:
+    return
+  let kwd = p.tok.ident.toLowerAscii
+  if kwd notin ["ifdef", "ifndef"]:
+    if kwd == "if":
+      # Not answerable by a frontend. Nim could express this as a `when`
+      # around the field, but that is a different emission (two whole
+      # field declarations, not one name), so refuse instead of guessing.
+      parError(p, "{$if <expr>} cannot select a declaration name; a " &
+        "frontend cannot evaluate the condition")
+    return
+  var lineStart = 0
+  let text = declTextToEol(p.lex, lineStart)
+  var skipLen = 0
+  let nm = pickNameFromText(text, p, skipLen)
+  if nm.len == 0:
+    return
+  # `skipLen` is an offset into `text`, which begins at the first
+  # non-blank character of the declaration's line, so translate it with
+  # `lineStart` and rewind the lexer there via `rewindTo` (which also
+  # clears the lexer's pending end marker). Resuming exactly ON the `:`
+  # matters: a position inside the following `{$...}` would make `getTok`
+  # read that group as a directive opener instead of the `:`.
+  let target = lineStart + skipLen
+  p.lex.rewindTo(target)
+  p.lex.getTok(p.tok)
+  skipCom(p)
+  result = nm
+
 proc parseIdentColonEquals*(p: var TParser; withVis: bool): Node =
   ## `a, b: Type = init;`  (var/field declaration group)
   result = newNodeP(nkIdentDefs, p)
   let exportNames = p.section == seInterface and p.visibility != visPrivate
   while true:
-    if p.tok.xkind != pxSymbol:
-      parError(p, "identifier expected, got " & $p.tok)
-    p.syms.declareName(p.tok.ident)
-    result.add(exSymbol(newIdentNode(p.tok.ident, p.tok.info), exportNames))
-    getTokP(p)
+    var fieldName = ""
+    if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
+      fieldName = condPickIdent(p)
+    if fieldName.len == 0:
+      if p.tok.xkind != pxSymbol:
+        parError(p, "identifier expected, got " & $p.tok)
+      fieldName = p.tok.ident
+      getTokP(p)
+    p.syms.declareName(fieldName)
+    result.add(exSymbol(newIdentNode(fieldName, p.tok.info), exportNames))
     skipCom(p)
     if p.tok.xkind == pxComma:
       getTokP(p)
@@ -1963,6 +2590,36 @@ proc parseVarSection*(p: var TParser): Node =
       break
     let defs = parseIdentColonEquals(p, false)
     skipCom(p)
+    if p.tok.xkind == pxSymbol and p.tok.ident.toLowerAscii == "absolute":
+      # `Name: T absolute Target;` binds a SECOND NAME to an existing
+      # variable (the corpus uses only this form - no absolute
+      # addresses). Nim has no `absolute`, but a template whose body is
+      # the target reads and writes through to it, at module and local
+      # scope alike. The alias REPLACES the declaration, and `template`
+      # may not sit inside a `var` block, so the renderers hoist it out.
+      getTokP(p)
+      skipCom(p)
+      let target = parseExpr(p)
+      for i in 0 ..< defs.len - 2:
+        if defs[i].kind != nkIdent:
+          continue
+        let t = newNode(nkTemplateDef, defs[i].info)
+        t.add(exSymbol(newIdentNode(defs[i].strVal, defs[i].info),
+                       defs[i].exported))
+        t.add(emptyNode(defs[i].info))
+        let params = newNode(nkFormalParams, defs[i].info)
+        # `defs` is discarded here, so its type node has no other parent
+        params.add(defs[defs.len - 2])
+        t.add(params)
+        t.add(emptyNode(defs[i].info))
+        t.add(emptyNode(defs[i].info))
+        let body = newNode(nkStmtList, defs[i].info)
+        body.add(target)
+        t.add(body)
+        result.add(t)
+      p.opt(pxSemiColon)
+      skipCom(p)
+      continue
     result.add(defs)
     p.opt(pxSemiColon)
     skipCom(p)
@@ -2015,15 +2672,19 @@ proc parseVarSection*(p: var TParser): Node =
         for i in 0 ..< defs.len - 2:
           if defs[i].kind == nkIdent:
             p.procVarTypes[defs[i].strVal.toLowerAscii] = true
-      if p.syms.isClass(tyKey):
-        for i in 0 ..< defs.len - 2:
-          if defs[i].kind == nkIdent:
-            p.varTypes[defs[i].strVal.toLowerAscii] = "class:" & tyKey
-      elif p.recordTypes.hasKey(tyKey):
+      # a record is registered in the class registry too (so its
+      # members resolve), but it is a VALUE type: test it FIRST, or a
+      # record variable is filed as "class:" and `with` lowering then
+      # binds a hidden temp whose writes never reach the original.
+      if p.recordTypes.hasKey(tyKey):
         for i in 0 ..< defs.len - 2:
           if defs[i].kind == nkIdent:
             # record vars carry their spelling for `with` lowering
             p.varTypes[defs[i].strVal.toLowerAscii] = "record:" & tyNode.strVal
+      elif p.syms.isClass(tyKey):
+        for i in 0 ..< defs.len - 2:
+          if defs[i].kind == nkIdent:
+            p.varTypes[defs[i].strVal.toLowerAscii] = "class:" & tyKey
       else:
         let mapped = rtlSpelling(tyKey)
         if mapped.len > 0:
@@ -2071,6 +2732,23 @@ proc parseConstSection*(p: var TParser): Node =
     p.eat(pxEquals)
     skipCom(p)
     def.add(parseExpr(p))
+    # A Pascal typed RECORD constant `(Key: ''; Link: nil)` parses as an
+    # `nkPar` of `kv` pairs, which is not a record constructor in any
+    # target: the NIF shape is `(oconstr TY (kv K V) ...)`. Real code
+    # depends on this (`nilTemplate: TStrListRec = (Key: ''; Link: nil)`
+    # in a corpus type), and rendering it as a plain list emits the
+    # invalid `(kv(Key, ""), ...)`. A `kv` pair is nkCall
+    # [kv-ident, name, value].
+    if def.len > 2 and def[2].kind == nkPar and
+        def[1].kind == nkIdent and def[2].len > 0 and
+        def[2][0].kind == nkCall and def[2][0].len == 3 and
+        def[2][0][0].kind == nkIdent and def[2][0][0].strVal == "kv" and
+        p.recordTypes.hasKey(def[1].strVal.toLowerAscii):
+      let oc = newNode(nkOconstr, def[2].info)
+      oc.add(def[1])
+      for pair in def[2].sons:
+        oc.add(pair)
+      def[2] = oc
     # `const Values: array[Boolean] of string = ('0', '1')`: char
     # literals in a string-element array const become strings
     if def[1].kind == nkArrayTy and def[1].len > 0 and
@@ -2255,24 +2933,79 @@ proc parseTypeDesc*(p: var TParser, definition: Node): Node =
     result = parseRoutineType(p)
   of pxRecord:
     # anonymous record -> object type
+    let oldSelfClass = p.selfClass
     result = newNodeP(nkObjectTy, p)
     result.isRecordType = true
     getTokP(p)
     skipCom(p)
     if definition.kind == nkIdent:
       p.recordTypes[definition.strVal.toLowerAscii] = true
+      # `record` bodies are parsed HERE (not by parseRecordBody, which
+      # serves `class`/`object`), so this is where the self-class must
+      # be published before the fields. The field registry below only
+      # records a field when p.selfClass is set, and a record method's
+      # bare field reference self-qualifies only if it is recorded.
+      p.selfClass = definition.strVal
+      # Register the record in the CLASS registry too. It is a value
+      # type (`isRef = false`), but the member registry is shared: the
+      # field/routine sets hung off a class entry are what
+      # `isMemberName` consults, and `selfQualifyAll` only rewrites a
+      # bare field reference to `self.X` when that lookup succeeds.
+      # Without this, a record method's `X := a` stays unqualified and
+      # nimony rejects it with "undeclared identifier: X" - verified on
+      # TRec.Init. `addField` also requires the entry to exist, so this
+      # must happen before the body is parsed. Records have no class
+      # ancestor: the root is `RootObj`, matching the object emission.
+      p.syms.registerClass(definition.strVal, "RootObj", false)
     result.add(emptyNode(p.tok.info))     # no inheritance
     let body = newNode(nkRecList, p.tok.info)
     while p.tok.xkind != pxEnd and p.tok.xkind != pxEof:
       case p.tok.xkind
       of pxCurlyDirLe, pxStarDirLe:
         # conditionals between record members
-        # ({$IFDEF X} field {$ELSE} field {$ENDIF})
+        # ({$IFDEF X} field {$ELSE} field {$ENDIF}) - but a group that
+        # selects the field NAME (`{$IFDEF POSIX}s6_addr{$ELSE}u6_addr8
+        # {$ENDIF}: Integer;`, a corpus unit) must go to the field parser,
+        # which condPickIdent handles.
+        if dirPicksName(p):
+          body.add(parseIdentColonEquals(p, false))
+          skipCom(p)
+          p.opt(pxSemiColon)
+          skipCom(p)
+          continue
         if not declDirective(p):
           break
         skipCom(p)
       of pxSymbol:
         let defs = parseIdentColonEquals(p, false)
+        # Register the fields, exactly as parseRecordBody does for
+        # `class`/`object` bodies. `isMemberName` reads the field set to
+        # decide whether a bare name inside a method is `self.X`, so
+        # without this a record method's `FX := a` stays unqualified and
+        # nimony rejects the member. `classFieldTypes` additionally
+        # records the field's class, which the `with` and member-access
+        # qualifiers consult.
+        if p.selfClass.len > 0 and defs[1].kind != nkProcTy:
+          for i in 0 ..< defs.len - 2:
+            if defs[i].kind != nkIdent:
+              continue
+            p.syms.addField(p.selfClass, defs[i].strVal)
+            let fkey = p.selfClass.toLowerAscii & "." &
+                       defs[i].strVal.toLowerAscii
+            var fcls = ""
+            if defs[1].kind == nkIdent:
+              fcls = p.syms.classSpelling(defs[1].strVal)
+              if fcls.len == 0:
+                fcls = p.arrayAliases.getOrDefault(
+                    defs[1].strVal.toLowerAscii, "")
+            if fcls.len == 0 and defs[1].kind in {nkArrayTy, nkSeqTy} and
+                defs[1].len > 0 and defs[1][defs[1].len - 1].kind == nkIdent:
+              fcls = p.syms.classSpelling(defs[1][defs[1].len - 1].strVal)
+              if fcls.len == 0 and p.recordTypes.hasKey(
+                  defs[1][defs[1].len - 1].strVal.toLowerAscii):
+                fcls = defs[1][defs[1].len - 1].strVal
+            if fcls.len > 0:
+              p.classFieldTypes[fkey] = fcls
         # field types for 1-based string indexing (`rec.field[i]`)
         let mty = p.mappedTypeName(defs[defs.len - 2])
         if definition.kind == nkIdent and mty.len > 0:
@@ -2297,10 +3030,40 @@ proc parseTypeDesc*(p: var TParser, definition: Node): Node =
         body.add(defs)
         p.opt(pxSemiColon)
         skipCom(p)
+      of pxProperty:
+        # `property` inside a `record`/`object` body:
+        #   property At[i: Integer]: AnsiChar read GetChar; default;
+        #   property Content: AnsiString read _s;
+        # Three corpus units declare properties on
+        # value types. parseProperty already handles the accessor
+        # lowering; the record path simply never called it.
+        discard parseProperty(p)
+        p.opt(pxSemiColon)
+        skipCom(p)
+      of pxFunction, pxProcedure, pxConstructor, pxDestructor:
+        # Methods declared INSIDE a `record`/`object` body:
+        #   TSingleLinkedList = record
+        #     FFirst: PSingleLinkedItem;
+        #     procedure Init;
+        #     function Step(out AItem): Boolean; inline;
+        #   end;
+        # Delphi value types with methods are pervasive in the corpus
+        # (72 sites across 21 units). The bodiless
+        # declaration stays in the body: the emitter already hoists an
+        # `nkProcDef` out of an object type into a module-level forward,
+        # and the implementation (`procedure TSingleLinkedList.Init`)
+        # defines it. Field access inside those bodies self-qualifies
+        # through the field registry, which is why p.selfClass is set.
+        # `class procedure/function` is handled in the pxClass branch.
+        body.add(parseRoutine(p, true))
+        p.opt(pxSemiColon)
+        skipCom(p)
       of pxCase:
         let flat = parseRecordCase(p)
         for k in 0 ..< flat.len:
           body.add(flat[k])
+        p.opt(pxSemiColon)
+        skipCom(p)
       of pxComment:
         skipCom(p)
       of pxPublic:
@@ -2344,6 +3107,7 @@ proc parseTypeDesc*(p: var TParser, definition: Node): Node =
         parError(p, "field or `case` expected in record body, got " & $p.tok)
     p.eat(pxEnd)
     skipCom(p)
+    p.selfClass = oldSelfClass
     result.add(body)
   of pxObject:
     # `object` type inside a type section body (already parsed by
@@ -2616,6 +3380,18 @@ proc parseRecordBody(p: var TParser, result: Node, definition: Node) =
           p.classVarHoist.add(vh)
         p.opt(pxSemiColon)
         skipCom(p)
+      elif pk == pxProperty:
+        # `class property Name[id: Integer]: String read getName;`
+        # (hashBtree, threadpool). A class property is a property whose
+        # accessors are class routines; parseProperty already lowers the
+        # accessor pair, and the accessor names were registered by the
+        # `class function` declarations above, so no extra lowering is
+        # needed - only the `class` prefix has to be consumed here.
+        getTokP(p)                  # consume `class`
+        skipCom(p)
+        discard parseProperty(p)
+        p.opt(pxSemiColon)
+        skipCom(p)
       elif pk in {pxProcedure, pxFunction, pxOperator}:
         let rd = parseRoutine(p, true)
         if rd.kind == nkProcDef and rd.len > 0 and
@@ -2663,6 +3439,45 @@ proc parseRecordOrObject*(p: var TParser, kind: NodeKind,
     record = result
   getTokP(p)                    # skip `class`/`object`
   skipCom(p)
+  # Delphi class/record HELPER:
+  #   TFooHelper = class helper for TFoo
+  #     procedure CallClearFixups; inline;
+  #   end;
+  # A helper adds methods to the helped type without changing it
+  # (three corpus units use them). The
+  # translation lowers the helper to a class OF the helped type, so
+  # p.syms.registerClass below records the inheritance and every method
+  # body resolves `self` against the real class. For a `record helper`
+  # the helped type is a value type; the same lowering applies, since
+  # the emitter already models records as objects.
+  if p.tok.xkind == pxHelper:
+    getTokP(p)
+    skipCom(p)
+    # the optional helper KIND: `class helper`, `record helper`,
+    # `type helper` - already consumed the `class`/`object` above
+    if p.tok.xkind == pxFor:
+      getTokP(p)
+      skipCom(p)
+      if p.tok.xkind == pxSymbol:
+        # publish the helped type as the parent before the body, so the
+        # helper's methods inherit field/method resolution from it
+        let helped = p.tok.ident
+        getTokP(p)
+        skipCom(p)
+        block:
+          let ofInh = newNode(nkOfInherit, definition.info)
+          ofInh.add(newIdentNode(helped, definition.info))
+          if kind == nkRefTy:
+            record.add(ofInh)
+          else:
+            record.add(ofInh)
+        p.syms.registerClass(definition.strVal, helped, kind == nkRefTy)
+        parseRecordBody(p, record, definition)
+        p.opt(pxSemiColon)
+        return result
+      parError(p, "type name expected after `helper for`")
+    else:
+      parError(p, "`for` expected after `helper`")
   if p.tok.xkind == pxOf:
     # metaclass type: `TPersistentClass = class of TPersistent;` and
     # `procedure Foo(A: TComponentClass)` - a class-reference type;
@@ -2811,11 +3626,30 @@ proc parseProperty*(p: var TParser): Node =
         if p.tok.xkind == pxSymbol:
           decl.readId = p.tok.ident
           getTokP(p)
+          # A dotted accessor (`read slice.Last`, `read FValue.VBoolean`)
+          # reads THROUGH a field. genPropertyAccessors only needs the
+          # final component as the accessor name; keeping the field path
+          # is the qualifier machinery's job, and the whole path here is
+          # a value-type member chain, so the last component suffices.
+          while p.tok.xkind == pxDot:
+            getTokP(p)
+            skipCom(p)
+            if p.tok.xkind != pxSymbol:
+              parError(p, "identifier expected after '.' in property accessor")
+            decl.readId = p.tok.ident
+            getTokP(p)
       elif word == "write":
         getTokP(p)
         if p.tok.xkind == pxSymbol:
           decl.writeId = p.tok.ident
           getTokP(p)
+          while p.tok.xkind == pxDot:
+            getTokP(p)
+            skipCom(p)
+            if p.tok.xkind != pxSymbol:
+              parError(p, "identifier expected after '.' in property accessor")
+            decl.writeId = p.tok.ident
+            getTokP(p)
       elif word == "default":
         getTokP(p)
         if p.tok.xkind != pxSemiColon:
@@ -2825,6 +3659,14 @@ proc parseProperty*(p: var TParser): Node =
           decl.isDefault = true
       elif word == "nodefault":
         getTokP(p)
+      elif word == "implements":
+        # `property List: TAdrList read FList implements IAdrList;`
+        # - a COM interface delegation. v1 has no
+        # interface plumbing, so the clause is parsed and dropped.
+        getTokP(p)
+        while p.tok.xkind == pxSymbol or p.tok.xkind == pxDot:
+          getTokP(p)
+        skipCom(p)
       elif word == "readonly" or word == "writeonly":
         # COM automation access specifiers (StdVCL): v1 no-op
         getTokP(p)
@@ -3134,15 +3976,29 @@ proc parseTypeDef*(p: var TParser): Node =
     p.syms.registerSpecializedAlias(result[2][0].strVal, name)
   p.curTypeParams = @[]
 
-proc parseTypeSection*(p: var TParser): Node =
+proc parseTypeDefList(p: var TParser): Node =
+  ## the interior of a `type` section: definitions until something that
+  ## cannot start one. A forwarded `{$if <expr>}` group is kept INSIDE
+  ## the section as an nkWhenExpr so a conditional may wrap definitions
+  ## the way Delphi allows; the module renderer splits the section around
+  ## it, because nimony rejects a `when` inside `type`.
   result = newNodeP(nkTypeSection, p)
-  getTokP(p)                    # skip `type`
-  skipCom(p)
   while true:
     skipCom(p)                  # comments between definitions
     # directives between type definitions ({$EXTERNALSYM ...},
     # conditionals) must not close the section
     if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
+      let dir = p.tok.ident.toLowerAscii
+      # a closer is only OURS when the enclosing group is forwarded to
+      # Nim; a parse-time group ({$IFDEF}/{$IFNDEF}) owns its own closer
+      # and declDirective below consumes it (same rule as there).
+      if dir in ["else", "elseif", "endif", "ifend"] and
+          condWhenStack.len > 0 and condWhenStack[^1] != 0:
+        break
+      if dir == "if":
+        # forwarded, not evaluated: the arm holds TYPE DEFINITIONS
+        result.add(parseIfDir(p, succ(p.tok.xkind), cmType))
+        continue
       if declDirective(p):
         continue
       break
@@ -3167,6 +4023,13 @@ proc parseTypeSection*(p: var TParser): Node =
         p.arrayAliases[def[0].strVal.toLowerAscii] =
           def[2][def[2].len - 1].strVal
     result.add(def)
+
+proc parseTypeSection*(p: var TParser): Node =
+  result = newNodeP(nkTypeSection, p)
+  getTokP(p)                    # skip `type`
+  skipCom(p)
+  let body = parseTypeDefList(p)
+  for d in body.sons: result.add(d)
 
 # ---------------------------------------------------------------------------
 # routines
@@ -3891,7 +4754,34 @@ proc parseInherited*(p: var TParser): Node =
       skipCom(p)
       result = newNode(nkEmpty, info)
       return
-    parError(p, "no parent class for `inherited`")
+    # `inherited` in a method of a type with NO ancestor. Delphi allows
+    # this and it means "the same-named method of the parent", which for
+    # a parentless record is simply "this method" - the standard
+    # idiom is a record whose Add calls `inherited Add(Item)`, i.e. the
+    # implementation the record's own class provides (vStrLst:
+    # `result := inherited Add(Item)`). Static dispatch, so leave the
+    # call unqualified; selfQualifyAll turns it into `self.Add(...)`,
+    # which is the very method being defined. Emitting a diagnostic
+    # instead would drop the assignment and lose the result.
+    if p.classOfProc.len > 0 and p.tok.xkind == pxSymbol:
+      let nm = p.tok.ident
+      getTokP(p)
+      skipCom(p)
+      result = newNode(nkCall, info)
+      result.noQualCallee = true
+      result.add(newIdentNode(nm, info))
+      if p.tok.xkind == pxParLe:
+        getTokP(p)
+        skipCom(p)
+        while p.tok.xkind != pxParRi and p.tok.xkind != pxEof:
+          result.add(parseExpr(p))
+          skipCom(p)
+          if p.tok.xkind == pxComma:
+            getTokP(p)
+            skipCom(p)
+        p.eat(pxParRi)
+    else:
+      parError(p, "no parent class for `inherited`")
   let selfNode = newIdentNode("self", info)
   # cast[], not the T(x) call form: the call form trips nimsem's
   # nil-proof when the parent lives in another module
@@ -4205,8 +5095,12 @@ proc parseTry*(p: var TParser): Node =
       p.eat(pxDo)
       skipCom(p)
       var handler: Node
-      if p.tok.xkind == pxElse:
-        # `on X do { nothing }; else ...` - an empty on-handler body
+      if p.tok.xkind == pxElse or p.tok.xkind == pxSemiColon:
+        # `on X do { nothing }; else ...` - an empty on-handler body.
+        # A bare `;` is the same thing (`on Exception do ;`, a corpus unit)
+        # and must NOT be left to the enclosing block: parseStmt would
+        # read it as an empty statement, and the `end` that follows then
+        # misparses.
         handler = newNode(nkDiscardStmt, p.tok.info)
         handler.add(emptyNode(p.tok.info))
       else:
@@ -5495,9 +6389,34 @@ proc parseStmt*(p: var TParser): Node =
   case p.tok.xkind
   of pxEof:
     result = emptyNode(p.tok.info)
+  of pxSemiColon:
+    # Delphi's EMPTY STATEMENT. It appears in real code in two shapes:
+    #   `on Exception do ;`            an empty exception handler
+    #   `{$IFDEF X}...{$ENDIF};`       a stray `;` after a conditional
+    # GLocks.pas:212 is the second: a vertical {$IFDEF}/{$ELSE}
+    # /{$ENDIF} group ends with `{$ENDIF};`, and the conditional token
+    # loop leaves the `;` for the enclosing block. Consume it here so it
+    # never reaches the expression parser ("expression expected, got ;").
+    result = emptyNode(p.tok.info)
+    getTokP(p)
   of pxComment:
     result = newNode(nkCommentStmt, p.tok.info)
     result.strVal = p.tok.literal
+    getTokP(p)
+  of pxCommand:
+    # `{@exclude}` and the other documentation directives are annotations,
+    # not declarations, and carry no semantics. Skipping one is what
+    # Delphi does; leaving it unconsumed made the unit-level loop call
+    # skipCom forever (a corpus unit, and every unit absorbing it).
+    # The lexer stops the opener right after its name, so the closing
+    # brace arrives as a token of its own.
+    result = emptyNode(p.tok.info)
+    getTokP(p)
+  of pxCurlyDirRi:
+    # the closing brace of a directive the lexer handed over separately
+    # (`{@exclude}`: opener, then `}`). A brace with no opener left is
+    # nothing to declare.
+    result = emptyNode(p.tok.info)
     getTokP(p)
   of pxCurlyDirLe, pxStarDirLe:
     if isHandledDirective(p):
@@ -5523,6 +6442,16 @@ proc parseStmt*(p: var TParser): Node =
       if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
         if declDirective(p):
           continue
+        if p.tok.ident.toLowerAscii == "if":
+          # `{$if <expr>}` cannot be answered here: forward it as a
+          # `when` INSIDE the block and let a real compiler choose.
+          # Breaking out instead would end the block early and report
+          # "expected end but got: {$" (a conditional inside a begin block).
+          result.add(parseIfDir(p, succ(p.tok.xkind)))
+          if p.tok.xkind == pxSemiColon:
+            getTokP(p)
+            skipCom(p)
+          continue
         break
       let s = parseStmt(p)
       if s.kind != nkEmpty: result.add(s)
@@ -5538,6 +6467,13 @@ proc parseStmt*(p: var TParser): Node =
       let branch = newNodeP(nkElifBranch, p)
       skipCom(p)
       branch.add(parseExpr(p))
+      # A comment may sit between the condition and `then`:
+      #   if (Stack = nil) or (pfBINDRIGHT in flags)   // comment
+      #   then begin
+      # two corpus units wrap that way. parseExpr
+      # leaves the comment as the current token, and without this the
+      # `then` check reports "expected then but got: # comment".
+      skipCom(p)
       p.eat(pxThen)
       skipCom(p)
       while p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
@@ -6810,6 +7746,7 @@ proc parseUnit*(p: var TParser): Node =
   # exported spellings for case-insensitive resolution
   absorbNimModule(p, "systempas")
   absorbNimModule(p, "pasdatetime")
+  var skippedTokens = 0
   while p.tok.xkind != pxEof:
     if p.tok.xkind == pxEnd:
       # unit/program terminator: a bare `end.` with no begin-block
@@ -6822,7 +7759,28 @@ proc parseUnit*(p: var TParser): Node =
       # whose tokens already flowed are consumed, the rest skipped
       if declDirective(p):
         continue
+      # A closer that declDirective declines belongs to an ENCLOSING
+      # group. parseStmt would return without consuming it, so the loop
+      # below would call skipCom forever - an apparent hang with no
+      # output at all. Stop and let the owner of the group see it.
+      if p.tok.ident.toLowerAscii in ["else", "elseif", "endif", "ifend"]:
+        break
+    let dLine = p.tok.info.line
+    let dCol = p.tok.info.col
     let s = parseStmt(p)
+    if p.tok.info.line == dLine and p.tok.info.col == dCol and
+        p.tok.xkind != pxEof:
+      # A statement that consumes nothing spins here forever, with NO
+      # output at all - the worst failure mode for a batch translation.
+      # Report the token, step over it, and give up if that keeps
+      # happening, so the unit fails loudly instead of hanging.
+      parWarning(p, "unit-noprogress-" & $p.tok.xkind,
+                 renderInfo(p.tok.info) & " Warning: skipping token the " &
+                 "statement parser did not consume (" & $p.tok.xkind & ")")
+      inc skippedTokens
+      if skippedTokens > 32:
+        parError(p, "too many unconsumed tokens at unit level")
+      getTokP(p)
     # a conditional directive's branch statements arrive as an
     # nkStmtList - splice them so unit-level declarations register
     if s.kind == nkStmtList and s.strVal == "#condsplice":
