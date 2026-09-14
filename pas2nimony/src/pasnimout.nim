@@ -528,26 +528,22 @@ proc renderDef(s: var TRendor, n: Node) =
     s.line(renderDefSig(s, n))
     return
   var sig = renderDefSig(s, n)
-  # forward accepted routine pragmas (inline, cdecl, stdcall);
-  # `raises` is deliberately skipped here - the M4 machinery
-  # pre-stuffs it into the pragma node and containsRaise decides
-  var havePrag = false
+  # forward accepted routine pragmas (inline, cdecl, stdcall) and the
+  # `raises` decision (the M4 machinery pre-stuffs it into the pragma
+  # node, containsRaise owns it). nimony's front end rejects two ADJACENT
+  # pragma blocks on one definition - `proc E() {.closure.} {.raises.} =`
+  # dies with "invalid indentation" - so collect every pragma and emit a
+  # single `{.a, b.}` block. (Masks.pas, VHelper.pas.)
+  var prags: seq[string] = @[]
   if n.len >= 4 and n[3].kind == nkPragma:
     for pi in 0 ..< n[3].len:
       if n[3][pi].kind == nkIdent and n[3][pi].strVal != "raises":
-        havePrag = true
-  if havePrag:
-    sig.add(" {.")
-    var first = true
-    for pi in 0 ..< n[3].len:
-      if n[3][pi].kind == nkIdent and n[3][pi].strVal != "raises":
-        if not first: sig.add(", ")
-        sig.add(n[3][pi].strVal)
-        first = false
-    sig.add(".}")
+        prags.add(n[3][pi].strVal)
   if containsRaise(body):
     # nimony: raising procs must announce it (ErrorCode model)
-    sig.add(" {.raises.}")
+    prags.add("raises")
+  if prags.len > 0:
+    sig.add(" {." & prags.join(", ") & ".}")
   s.line(sig & " =")
   emitBranchBody(s, body)
 

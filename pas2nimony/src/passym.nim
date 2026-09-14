@@ -525,7 +525,7 @@ const RtlNames* = [
   ("byte", "uint8"), ("word", "uint16"), ("single", "float32"),
   ("double", "float64"), ("real", "float64"), ("extended", "float64"),
   ("comp", "int64"), ("currency", "float64"), ("boolean", "bool"),
-  ("char", "char"), ("ansichar", "char"), ("pchar", "cstring"),
+  ("char", "char"), ("ansichar", "char"), ("pchar", "cstring"), ("pansichar", "cstring"), ("pwidechar", "cstring"),
   ("pointer", "pointer"), ("tobject", "RootRef"),
   ("hresult", "int32"), ("dword", "uint32"), ("qword", "uint64"),
   ("nativeint", "int"), ("nativeuint", "uint"),

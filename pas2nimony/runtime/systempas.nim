@@ -799,6 +799,42 @@ const
 proc pasFind*(s: string; sub: string): int32 = int32(find(s, sub))
 proc pasFind*(s: string; sub: char): int32 = int32(find(s, sub))
 
+# Delphi `StringReplace`/`TReplaceFlags`. The generated call passes the
+# flags in a Pascal set literal (`[rfReplaceAll]`), which the emitter
+# renders as a Nim array; taking `openArray[TReplaceFlag]` accepts that
+# spelling directly (an `set` parameter would not).
+type
+  TReplaceFlag* = enum
+    rfReplaceAll, rfIgnoreCase
+  TReplaceFlags* = set[TReplaceFlag]
+
+proc StringReplace*(s, old, new: string; flags: openArray[TReplaceFlag]): string =
+  ## Delphi semantics: replace every occurrence with `rfReplaceAll`,
+  ## otherwise only the first. `rfIgnoreCase` matches case-insensitively.
+  result = ""
+  if old.len == 0:
+    result = s
+    return
+  var all = false
+  var ic = false
+  for f in flags:
+    if f == rfReplaceAll: all = true
+    elif f == rfIgnoreCase: ic = true
+  var src = s
+  while true:
+    let p =
+      if ic: int32(find(toLowerAscii(src), toLowerAscii(old)))
+      else: int32(find(src, old))
+    if p < 0: break
+    result.add(substr(src, 0, p - 1))
+    result.add(new)
+    src = substr(src, p + old.len, src.len - 1)
+    if not all: break
+  result.add(src)
+
+proc StringReplace*(s, old, new: string): string =
+  result = StringReplace(s, old, new, [rfReplaceAll])
+
 proc StrToFloat*(s: string): float64 = StrToFloatDef(s, 0.0)
 
 proc StrToFloatDef*(s: char; def: float64): float64 =

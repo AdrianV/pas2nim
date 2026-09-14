@@ -76,6 +76,10 @@ type
     setTypes*: Table[string, bool]  ## lowercase set-alias type names
     arrayAliases*: Table[string, string] ## array alias -> element spelling
     arrayVarElems*: Table[string, string] ## array var -> element spelling
+    arrayVarElemTypes*: Table[string, string]
+    ## array/open-array var/param -> ELEMENT type spelling (any element
+    ## kind, not just class/record): drives the assignment narrowing cast
+    ## for `digest[i] = i + 1` on an `array of Byte`.
     pointerAliases*: Table[string, string] ## P = ^T alias -> element
     routineReturns*: Table[string, string] ## routine name -> return spelling
     routineParams*: Table[string, seq[string]] ## routine name -> param spellings
@@ -652,8 +656,6 @@ proc absorbUnit*(p: var TParser, unitName: string) =
   for d, v in p.syms.defines:
     if v and not p.sourceDefines.hasKey(d):
       inheritedDefines.add(d)
-  for sp in p.searchPaths:
-    up.searchPaths.add(sp)
   # the nested unit parses on its own conditional stack, so a `uses`
   # inside an open `{$if}` of the importer cannot corrupt either side
   let savedCond = condWhenStack
@@ -662,7 +664,10 @@ proc absorbUnit*(p: var TParser, unitName: string) =
   # not inherit (or drain) the importer's splice stack
   let savedInc = includeStack
   includeStack.setLen(0)
-  openParser(up, unitFile, p.flags, inheritedDefines)
+  # the CLI --path dirs must reach the nested unit: openParser assigns
+  # searchPaths, so passing them here (not pre-filling up.searchPaths) is
+  # what lets a used unit's own {$I}/{$INCLUDE} resolve along the path
+  openParser(up, unitFile, p.flags, inheritedDefines, p.searchPaths)
   up.absorbed = p.absorbed   # shared ref: cycle guard works across units
   discard parseUnit(up)
   closeParser(up)
@@ -1746,8 +1751,18 @@ proc primary(p: var TParser): Node =
     result.add(primary(p))
     return
   elif p.tok.xkind == pxAt:
-    result = newNodeP(nkAddr, p)
+    let atInfo = p.tok.info
     getTokP(p)
+    if p.tok.xkind == pxSymbol and
+        p.syms.routineArgs.hasKey(p.tok.ident.toLowerAscii):
+      # `@F` where F is a routine: Pascal takes the routine's ADDRESS, but
+      # in Nim the routine name already IS the proc value and
+      # `addr(F)` is rejected ("invalid expression for `addr` operation").
+      # Lower to the bare name so method-pointer / callback arguments
+      # type-check (synacode's `@MD5Transform`).
+      result = primary(p)
+      return
+    result = newNode(nkAddr, atInfo)
     result.add(primary(p))
     return
   elif p.tok.xkind in {pxProcedure, pxFunction}:
@@ -1857,6 +1872,20 @@ proc primary(p: var TParser): Node =
             argTypes = p.routineParams.getOrDefault(
               a[0].strVal.toLowerAscii & "." & a[1].strVal.toLowerAscii)
         for ai in 1 ..< result.len:
+          if ai - 1 < argTypes.len:
+            let pta = argTypes[ai - 1].toLowerAscii
+            if pta == "set" or pta.startsWith("set:") or
+                p.setTypes.hasKey(pta):
+              # a Pascal set literal passed to a set-typed parameter must
+              # be `{...}`: nimony's `[...]` is an array and does not
+              # coerce. The literal can be an operand of a set
+              # union/difference (`['='] + NonAsciiChar`).
+              if result[ai].kind == nkBracket:
+                result[ai].kind = nkCurly
+              elif result[ai].kind == nkInfix and result[ai].len == 3:
+                for oi in 1 ..< result[ai].len:
+                  if result[ai][oi].kind == nkBracket:
+                    result[ai][oi].kind = nkCurly
           if result[ai].kind == nkCharLit:
             if ai - 1 < argTypes.len and
                 argTypes[ai - 1].toLowerAscii in ["char", "ansichar", "widechar"]:
@@ -2965,6 +2994,9 @@ proc parseVarSection*(p: var TParser): Node =
       if tyNode.len > 0 and tyNode[tyNode.len - 1].kind == nkIdent:
         elty2 = tyNode[tyNode.len - 1].strVal
       if elty2.len > 0:
+        for i in 0 ..< defs.len - 2:
+          if defs[i].kind == nkIdent:
+            p.arrayVarElemTypes[defs[i].strVal.toLowerAscii] = elty2
         let elKey2 = elty2.toLowerAscii
         if p.syms.isClass(elKey2) or p.recordTypes.hasKey(elKey2):
           for i in 0 ..< defs.len - 2:
@@ -2999,6 +3031,7 @@ proc parseVarSection*(p: var TParser): Node =
         for i in 0 ..< defs.len - 2:
           if defs[i].kind == nkIdent:
             p.arrayVarElems[defs[i].strVal.toLowerAscii] = aliasEl
+            p.arrayVarElemTypes[defs[i].strVal.toLowerAscii] = aliasEl
       # a record is registered in the class registry too (so its
       # members resolve), but it is a VALUE type: test it FIRST, or a
       # record variable is filed as "class:" and `with` lowering then
@@ -3095,6 +3128,16 @@ proc parseConstSection*(p: var TParser): Node =
       for pair in def[2].sons:
         oc.add(pair)
       def[2] = oc
+    # a `[...]` initializer whose declared type is a SET must become
+    # `{...}`: nimony's `[...]` is an array literal and will not coerce
+    # to `set[T]` ("got: array[0..15, char] but wanted: set[char]").
+    # Covers both an inline `set of X` and a named alias registered in
+    # `p.setTypes` (`TSpecials = set[char]`).
+    if def.len > 2 and def[2].kind == nkBracket and
+        (def[1].kind == nkSetTy or
+         (def[1].kind == nkIdent and
+          p.setTypes.hasKey(def[1].strVal.toLowerAscii))):
+      def[2].kind = nkCurly
     # `const Values: array[Boolean] of string = ('0', '1')`: char
     # literals in a string-element array const become strings
     if def[1].kind == nkArrayTy and def[1].len > 0 and
@@ -3116,6 +3159,7 @@ proc parseConstSection*(p: var TParser): Node =
     elif def.len > 2 and def[1].kind in {nkArrayTy, nkSeqTy} and
         def[1].len > 0 and def[1][def[1].len - 1].kind == nkIdent:
       let el = def[1][def[1].len - 1].strVal
+      p.arrayVarElemTypes[name.toLowerAscii] = el
       if p.recordTypes.hasKey(el.toLowerAscii) or
           p.syms.isClass(el.toLowerAscii):
         p.arrayVarElems[name.toLowerAscii] = el
@@ -5167,6 +5211,9 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
         if pty.kind in {nkOpenArrayTy, nkSeqTy} and pty.len > 0 and
             pty[pty.len - 1].kind == nkIdent:
           let el = pty[pty.len - 1].strVal
+          for j in 0 ..< d.len - 2:
+            if d[j].kind == nkIdent:
+              p.arrayVarElemTypes[d[j].strVal.toLowerAscii] = el
           if p.syms.isClass(el.toLowerAscii) or
               p.recordTypes.hasKey(el.toLowerAscii):
             for j in 0 ..< d.len - 2:
@@ -7792,13 +7839,26 @@ proc parseStmt*(p: var TParser): Node =
           c.add(newIdentNode(opName, b.info))
           c.add(b)
           result[1] = c
-      if a.kind == nkIdent and b.kind in {nkInfix, nkCall, nkPrefix}:
+      if a.kind in {nkIdent, nkIndexExpr} and
+          b.kind in {nkInfix, nkCall, nkPrefix}:
         # (nkPrefix: a negative literal like `-512` types as int in
         # nimony - an int32 target needs the width cast too)
         # Pascal computes Integer arithmetic in the declared width;
         # nimony types pure-literal arithmetic as int (64), so
         # `x = 21 * 2` on an int32 x needs an explicit cast
-        let lhsTy = p.varTypes.getOrDefault(a.strVal.toLowerAscii)
+        var lhsTy = ""
+        if a.kind == nkIdent:
+          lhsTy = p.varTypes.getOrDefault(a.strVal.toLowerAscii)
+        elif a.len >= 1 and a[0].kind == nkIdent:
+          # an ARRAY ELEMENT target: `digest[i] = i + 1`,
+          # `Ar[i] = Value and 255`. The element type comes from the
+          # dedicated registry (class/record elements live in
+          # arrayVarElems, a different namespace).
+          let el = p.arrayVarElemTypes.getOrDefault(
+              a[0].strVal.toLowerAscii, "")
+          if el.len > 0:
+            lhsTy = p.syms.canonical(el).toLowerAscii
+            if lhsTy.len == 0: lhsTy = el.toLowerAscii
         if lhsTy in ["int8", "uint8", "int16", "uint16", "int32",
                     "uint32", "int64", "uint64"]:
           let castN = newNode(nkCall, b.info)
@@ -8750,6 +8810,63 @@ proc wrapMemberCalls*(p: var TParser, n: Node): Node =
       n.sons[i] = wrapMemberCalls(p, n.sons[i])
   return n
 
+const routineDefKinds = {nkProcDef, nkFuncDef, nkMethodDef, nkTemplateDef}
+
+proc formalTypeKey(n: Node): string =
+  ## a structural key for a formal's TYPE node (spelling + shape)
+  result = $n.kind
+  if n.strVal.len > 0: result.add(":" & n.strVal)
+  for c in n.sons: result.add("/" & formalTypeKey(c))
+
+proc routineFormalKey(n: Node): string =
+  ## name + flattened formal types. Needed because two overloads can
+  ## share a name AND arity (`WeakSlice.Assign` vs `PartialString.Assign`),
+  ## and a name/arity key would let one clobber the other.
+  result = n[0].strVal.toLowerAscii & "("
+  var first = true
+  for j in 1 ..< n[2].len:
+    let d = n[2][j]
+    if d.kind != nkIdentDefs: continue
+    let tk = formalTypeKey(d[d.len - 2])
+    for k in 0 ..< d.len - 2:
+      if d[k].kind == nkIdent:
+        if not first: result.add(",")
+        first = false
+        result.add(tk)
+  result.add(")")
+
+proc collectImplFormals(n: Node; tbl: var Table[string, seq[string]]) =
+  ## bodied routine definitions, keyed by name + formal types -> names
+  if n.kind in routineDefKinds and n.len >= 3 and
+      n[n.len - 1].kind != nkEmpty and n[2].kind == nkFormalParams:
+    var names: seq[string] = @[]
+    for j in 1 ..< n[2].len:
+      let d = n[2][j]
+      if d.kind != nkIdentDefs: continue
+      for k in 0 ..< d.len - 2:
+        if d[k].kind == nkIdent: names.add(d[k].strVal)
+    tbl[routineFormalKey(n)] = names
+  for c in n.sons: collectImplFormals(c, tbl)
+
+proc applyForwardFormals(n: Node; tbl: Table[string, seq[string]]) =
+  ## nimony's routine identity includes PARAMETER NAMES, so a forward
+  ## declaration left with the Pascal names and its implementation
+  ## renamed to `pasV_X` by lowerMutableValueParams register as two
+  ## overloads and every call is "ambiguous call". Reuse the
+  ## implementation's formal names on the matching bodiless declaration.
+  if n.kind in routineDefKinds and n.len >= 3 and
+      n[n.len - 1].kind == nkEmpty and n[2].kind == nkFormalParams:
+    var idents: seq[Node] = @[]
+    for j in 1 ..< n[2].len:
+      let d = n[2][j]
+      if d.kind != nkIdentDefs: continue
+      for k in 0 ..< d.len - 2:
+        if d[k].kind == nkIdent: idents.add(d[k])
+    let impl = tbl.getOrDefault(routineFormalKey(n))
+    if impl.len == idents.len:
+      for k in 0 ..< idents.len: idents[k].strVal = impl[k]
+  for c in n.sons: applyForwardFormals(c, tbl)
+
 proc parseUnit*(p: var TParser): Node =
   ## parse a whole unit/program; returns the module statement list with
   ## all post-passes applied
@@ -8984,4 +9101,8 @@ proc parseUnit*(p: var TParser): Node =
       m2.add(wrapper)
     else:
       m2.add(n)
+  block:
+    var implFormals = initTable[string, seq[string]]()
+    collectImplFormals(m2, implFormals)
+    applyForwardFormals(m2, implFormals)
   result = m2
