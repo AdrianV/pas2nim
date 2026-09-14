@@ -112,8 +112,7 @@ other language frontend would.
 
 1. **Self-test suite** - `cd pas2nimony && ./test/run.sh` runs every sample through
    **both** pipelines (the `.nim` path and the pasler NIF path) and reports pass/fail;
-   currently 86 sections, all green apart from the two known NIF `withalias`/`withptr` shapes,
-   with 15 differential oracle samples alongside. New language semantics get locked in as a sample the
+   currently 86 sections, all green, with 15 differential oracle samples alongside. New language semantics get locked in as a sample the
    moment they work, so the suite doubles as a regression net and an executable
    feature list.
 

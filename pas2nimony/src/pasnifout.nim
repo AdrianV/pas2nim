@@ -221,6 +221,15 @@ proc emitExpr(e: var NifEmitter; n: Node) =
           e.emitExpr(n[0])
           for j in 1 ..< n.len:
             e.emitExpr(n[j])
+  of nkAddr:
+    # `addr(x)`: nifler parses it as a plain call to the addr builtin
+    e.buf.copyInto(globalTags.registerTag("call"), i):
+      e.buf.addIdent("addr", i)
+      e.emitExpr(n[0])
+  of nkDeref:
+    # `x[]`: nifler emits (at x) with no index operand
+    e.buf.copyInto(globalTags.registerTag("at"), i):
+      e.emitExpr(n[0])
   of nkCast:
     # nifler parses `cast[T](x)` as (cast T x)
     e.buf.copyInto(globalTags.registerTag("cast"), e.info(n)):
@@ -302,7 +311,9 @@ proc emitTypeDesc(e: var NifEmitter; n: Node) =
     e.buf.copyInto(globalTags.registerTag("mut"), i):
       e.emitTypeDesc(n[0])
   of nkPtrTy, nkRefTy:
-    e.buf.addIdent("ptr", i)
+    # nifler: (ptr TARGET) - a bare "ptr" ident is an undeclared name
+    e.buf.copyInto(globalTags.registerTag("ptr"), i):
+      e.emitTypeDesc(n[0])
   of nkProcTy:
     # inline procedure type: (proctype .... (params ...) ret . . .)
     e.buf.copyInto(globalTags.registerTag("proctype"), i):

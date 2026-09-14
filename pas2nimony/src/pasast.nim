@@ -75,6 +75,7 @@ type
     exported*: bool     ## interface-section name: emit an export marker
     isRecordType*: bool ## type came from the Pascal `record` keyword
     isOutParam*: bool   ## `out` parameter (not `var`): no init proof
+    isImmutable*: bool  ## `const` parameter: read-only `with` base
 
 proc `[]`*(n: Node; i: int): Node {.inline.} = n.sons[i]
 proc `[]=`*(n: Node; i: int; c: Node) {.inline.} = n.sons[i] = c

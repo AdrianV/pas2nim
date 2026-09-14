@@ -91,6 +91,8 @@ type
     genericArgDepth*: int  ## > 0 while parsing `<...>` generic args
     withTemps*: seq[string]     ## hidden per-with temporaries by depth
     withClasses*: seq[string]   ## class spelling per with depth
+    withPtrs*: seq[bool]        ## with temp is an `addr` temp (needs `[]`)
+    withIdxNames*: seq[string]  ## ptr-array with: index temp ("" = none)
     withDepth*: int             ## active with-scope count
     withCounter*: int           ## unique temp-name source
     methodPtrTypes*: Table[string, Node] ## method-ptr type name -> its formal params
@@ -106,6 +108,8 @@ type
     nestedProcs*: seq[string]   ## nested routine names of the current proc
     arrayTypeLows*: Table[string, int]  ## alias type name -> declared low
     typeAliasTargets*: Table[string, string] ## simple alias -> target spelling
+    constTypes*: Table[string, string] ## typed const name -> Pascal type spelling
+    constParams*: Table[string, bool] ## current routine's `const` params
     withTempOwners*: Table[string, string] ## hidden with temp -> class spelling
     setElemTexts*: Table[string, string] ## set var -> nimony element type text
     procTyReturns*: Table[string, string]  ## plain proc-type alias -> return spelling
@@ -2453,6 +2457,7 @@ proc parseParamList*(p: var TParser): Node =
     while p.tok.xkind != pxParRi and p.tok.xkind != pxEof:
       var isVar = false
       var isOut = false
+      var isConst = false
       if p.tok.xkind == pxVar:
         isVar = true
         getTokP(p)
@@ -2463,8 +2468,9 @@ proc parseParamList*(p: var TParser): Node =
         isOut = true
         getTokP(p)
       elif p.tok.xkind == pxConst:
-        # treat `const` params as plain params; the mutability distinction
-        # does not matter for the generated code
+        # `const` param: a plain param for codegen, but read-only for the
+        # writability check that chooses a `with` temp (address vs copy)
+        isConst = true
         getTokP(p)
       skipCom(p)
       # names
@@ -2524,6 +2530,7 @@ proc parseParamList*(p: var TParser): Node =
             let rr = p.procTyReturns.getOrDefault(pty)
             if rr.len > 0: p.procVarReturns[n.toLowerAscii] = rr
         let d = newNode(nkIdentDefs, p.tok.info)
+        d.isImmutable = isConst
         d.add(newIdentNode(n, p.tok.info))
         if isVar:
           let vt = newNode(nkVarTy, p.tok.info)
@@ -3102,6 +3109,16 @@ proc parseConstSection*(p: var TParser): Node =
             sd.strVal = ""
             sd.strVal.add(arr.sons[ei].strVal[0])
             arr.sons[ei] = sd
+    # a typed const's type spelling: `with C do` must classify the base
+    # (a const is absent from varTypes) and treat it as read-only
+    if def.len > 2 and def[1].kind == nkIdent:
+      p.constTypes[name.toLowerAscii] = def[1].strVal
+    elif def.len > 2 and def[1].kind in {nkArrayTy, nkSeqTy} and
+        def[1].len > 0 and def[1][def[1].len - 1].kind == nkIdent:
+      let el = def[1][def[1].len - 1].strVal
+      if p.recordTypes.hasKey(el.toLowerAscii) or
+          p.syms.isClass(el.toLowerAscii):
+        p.arrayVarElems[name.toLowerAscii] = el
     result.add(def)
     p.opt(pxSemiColon)
     skipCom(p)
@@ -5118,10 +5135,16 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
     # param types for 1-based string indexing inside the body
     let savedParamTypes = p.paramTypes
     let savedMethodPtrVars = p.methodPtrVars
+    let savedConstParams = p.constParams
     p.paramTypes = initTable[string, string]()
+    p.constParams = initTable[string, bool]()
     for i in 1 ..< params.len:
       let d = params[i]
       if d.kind == nkIdentDefs:
+        if d.isImmutable:
+          for j in 0 ..< d.len - 2:
+            if d[j].kind == nkIdent:
+              p.constParams[d[j].strVal.toLowerAscii] = true
         var mty = p.mappedTypeName(d[d.len - 2])
         if mty.len == 0 and d[d.len - 2].kind == nkIdent and
             p.syms.classes.hasKey(d[d.len - 2].strVal.toLowerAscii):
@@ -5189,6 +5212,7 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
     p.outerParams = savedOuterParams
     p.paramTypes = savedParamTypes
     p.methodPtrVars = savedMethodPtrVars
+    p.constParams = savedConstParams
     p.classOfProc = oldClass
   # virtual/override -> method definition
   if isVirtual and isMethod:
@@ -6994,6 +7018,21 @@ proc withExprClass(p: var TParser, e: Node): string =
         if not ci.isRef:
           return ""   # value objects copy: v1 gap (needs ptr lowering)
       return sp
+    let ct = p.constTypes.getOrDefault(e.strVal.toLowerAscii)
+    if ct.len > 0:
+      # a typed const's Pascal type: resolve record / class / ptr-alias /
+      # array-alias exactly like a var's raw type, so `with C do`
+      # classifies its body instead of leaving the fields unqualified
+      let ctk = ct.toLowerAscii
+      if p.recordTypes.hasKey(ctk): return ct
+      if p.syms.isClass(ctk): return p.syms.classSpelling(ct)
+      let pel = p.pointerAliases.getOrDefault(ctk, "")
+      if pel.len > 0:
+        var sp = p.syms.classSpelling(pel)
+        if sp.len == 0: sp = p.arrayAliases.getOrDefault(pel.toLowerAscii, "")
+        return (if sp.len > 0: sp else: pel)
+      let ael = p.arrayAliases.getOrDefault(ctk, "")
+      if ael.len > 0: return ael
     # a pointer-typed base (`n: PNode`) names the pointee record/class
     # through its alias; without this `with n.Items[x] do` cannot
     # classify the body and leaves every field unqualified
@@ -7129,6 +7168,53 @@ proc withBaseText(p: TParser; e: Node): string =
   of nkIntLit: result = $e.intVal
   else: result = ""
 
+proc withBaseWritable(p: var TParser; e: Node): bool =
+  ## is a with base a WRITABLE designator? Only then may the lowering
+  ## bind an address temp. A const/immutable base must use a value copy:
+  ## valid Pascal never writes through one, and nimony addr of
+  ## const/immutable storage either fails late (scalar const, in C
+  ## codegen) or silently violates immutability (writing through the
+  ## address of a const record segfaults at run, a let record is mutated).
+  case e.kind
+  of nkIdent:
+    let k = e.strVal.toLowerAscii
+    if k in ["nil", "true", "false"]: return false
+    if p.constTypes.hasKey(k) or p.constParams.hasKey(k): return false
+    result = true
+  of nkDotExpr:
+    result = false
+    if e.len == 2 and e[1].kind == nkIdent:
+      var ro = false
+      if e[0].kind == nkIdent:
+        let cls = p.chainRecordSpelling(e[0]).toLowerAscii
+        for pr in p.props:
+          if pr.cls.toLowerAscii == cls and
+              pr.name.toLowerAscii == e[1].strVal.toLowerAscii:
+            ro = pr.writeId.len == 0
+            break
+      if not ro: result = withBaseWritable(p, e[0])
+  of nkIndexExpr, nkBracket:
+    result = e.len >= 2 and withBaseWritable(p, e[0])
+  of nkDeref:
+    result = e.len == 1 and withBaseWritable(p, e[0])
+  else:
+    result = false
+
+proc withTempBase(p: var TParser; i: int; info: TLineInfo): Node =
+  ## the expression a with-body qualifies against; an address temp (or a
+  ## captured pointer) is deref-qualified so field writes go through to
+  ## the original designator, and a captured index selects the element
+  result = newIdentNode(p.withTemps[i], info)
+  if i < p.withPtrs.len and p.withPtrs[i]:
+    let d = newNode(nkDeref, info)
+    d.add(result)
+    result = d
+  if i < p.withIdxNames.len and p.withIdxNames[i].len > 0:
+    let at = newNode(nkIndexExpr, info)
+    at.add(result)
+    at.add(newIdentNode(p.withIdxNames[i], info))
+    result = at
+
 
 proc setElemTypeText(p: var TParser, en: Node): string =
   ## the nimony type spelling of a set's element, for the narrowing cast
@@ -7155,17 +7241,17 @@ proc withQualify(p: var TParser, n: Node): Node =
     while c.len > 0 and guard < 100:
       # records qualify through the fieldTypes map
       if p.fieldTypes.hasKey(c & "." & k):
-        return newDotP(newIdentNode(p.withTemps[i], n.info), n.strVal)
+        return newDotP(withTempBase(p, i, n.info), n.strVal)
       let ci = p.syms.classes.getOrDefault(c)
       if ci.spelling.len == 0: break
       if ci.fieldSet.hasKey(k) or ci.routineSet.hasKey(k) or
           ci.ctorSet.hasKey(k):
-        return newDotP(newIdentNode(p.withTemps[i], n.info), n.strVal)
+        return newDotP(withTempBase(p, i, n.info), n.strVal)
       # properties of the class qualify too
       for pr in p.props:
         if pr.params == nil and pr.cls.toLowerAscii == c and
             pr.name.toLowerAscii == k:
-          return newDotP(newIdentNode(p.withTemps[i], n.info), n.strVal)
+          return newDotP(withTempBase(p, i, n.info), n.strVal)
       c = ci.parent
       inc guard
     dec i
@@ -7202,42 +7288,84 @@ proc parseWith(p: var TParser): Node =
     inc p.withCounter
     let temp = "pasW" & $p.withCounter
     let info = p.tok.info
-    # record withs are qualified DIRECTLY against the original
-    # expression: records copy by value, so a hidden temp would
-    # receive writes Delphi applies to the original
-    var isRecord = p.recordTypes.hasKey(cls.toLowerAscii)
-    # push the scope (fixed-size stack: nimony seqs have no pop);
-    # record withs use the original expression as the qualifier
-    var qualifier = temp
+    # Every with must evaluate its base exactly ONCE, and writes must
+    # reach the original designator (FPC binds a hidden address for an
+    # lvalue base and a value copy for an rvalue/const base).
+    #
+    # The temp KIND is chosen from the base shape:
+    #   * record designator addr can address directly -> address temp
+    #     var w = addr(base); the body qualifies w[].field;
+    #   * record reached through a raw pointer (P^, or a pointer-array
+    #     element X[][i]) -> capture the POINTER (and the index) in temps:
+    #     nimony rejects addr of an explicit-deref operand (addr(P[]) and
+    #     addr(X[][1]) are errors), while p[][i].field writes through.
+    #     Capturing the index too stops a body that reassigns it from
+    #     retargeting the qualifier;
+    #   * class/ref -> typed temp (a ref copy: already one evaluation);
+    #   * const / rvalue -> value-copy temp (one evaluation; valid Pascal
+    #     never writes through an immutable base).
+    # The old text-qualification re-evaluated a record base at every field
+    # access, so a base whose sub-state changed in the body wrote elsewhere.
+    let isRecord = p.recordTypes.hasKey(cls.toLowerAscii)
+    var wantPtr = false
+    var ptrInit = e          # non-nil at the d.add below (overridden below)
+    var idxName = ""
+    if isRecord and withBaseWritable(p, e):
+      if e.kind == nkDeref and e.len == 1:
+        # with P^ do: the pointer value already IS the address
+        ptrInit = e[0]
+        wantPtr = true
+      elif e.kind == nkIndexExpr and e.len >= 2 and e[0].kind == nkDeref and
+          e[0].len == 1:
+        # pointer-array element: capture the pointer and the index
+        ptrInit = e[0][0]
+        wantPtr = true
+        inc p.withCounter
+        idxName = "pasI" & $p.withCounter
+      else:
+        let ad = newNode(nkAddr, info)
+        ad.add(e)
+        ptrInit = ad
+        wantPtr = true
+    let vd = newNode(nkVarSection, info)
+    let d = newNode(nkIdentDefs, info)
+    d.add(newIdentNode(temp, info))
     if isRecord:
-      # record withs qualify against the original expression text
-      qualifier = withBaseText(p, e)
-      if qualifier.len == 0:
-        # complex record expression: fall back to the temp (v1:
-        # writes through the with go to the temp, not the original)
-        qualifier = temp
-        isRecord = false
-    if not isRecord:
-      # class (or fallback) withs bind a hidden temp var; an unknown
-      # class emits no type node so the type is inferred
-      let vd = newNode(nkVarSection, info)
-      let d = newNode(nkIdentDefs, info)
-      d.add(newIdentNode(temp, info))
-      if cls.len > 0:
+      if not wantPtr and cls.len > 0:
         d.add(newIdentNode(cls, info))
       else:
+        # the temp infers its type from its initializer
         d.add(emptyNode(info))
-      d.add(e)
-      vd.add(d)
-      result.add(vd)
-    if qualifier.len > 0 and cls.len > 0:
-      p.withTempOwners[qualifier.toLowerAscii] = cls
-    if p.withDepth < p.withTemps.len:
-      p.withTemps[p.withDepth] = qualifier
-      p.withClasses[p.withDepth] = cls
+    elif cls.len > 0:
+      d.add(newIdentNode(cls, info))
     else:
-      p.withTemps.add(qualifier)
+      d.add(emptyNode(info))
+    if wantPtr:
+      d.add(ptrInit)
+    else:
+      d.add(e)
+    vd.add(d)
+    result.add(vd)
+    if idxName.len > 0:
+      let vd2 = newNode(nkVarSection, info)
+      let d2 = newNode(nkIdentDefs, info)
+      d2.add(newIdentNode(idxName, info))
+      d2.add(emptyNode(info))
+      d2.add(e[e.len - 1])
+      vd2.add(d2)
+      result.add(vd2)
+    if cls.len > 0:
+      p.withTempOwners[temp.toLowerAscii] = cls
+    if p.withDepth < p.withTemps.len:
+      p.withTemps[p.withDepth] = temp
+      p.withClasses[p.withDepth] = cls
+      p.withPtrs[p.withDepth] = wantPtr
+      p.withIdxNames[p.withDepth] = idxName
+    else:
+      p.withTemps.add(temp)
       p.withClasses.add(cls)
+      p.withPtrs.add(wantPtr)
+      p.withIdxNames.add(idxName)
     inc p.withDepth
     inc pushed
     skipCom(p)

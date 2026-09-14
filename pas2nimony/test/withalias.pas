@@ -7,8 +7,9 @@ program WithAlias;
   nimony rejected them ("undeclared identifier: Node/Value/Key" in
   tplbtree.inc's `with n.Items[x] do`).
 
-  The with-body must write through the ORIGINAL expression - records
-  are values, so a hidden temp would swallow the write. *)
+  The with-body now qualifies through a hidden ADDRESS temp
+  (`var w = addr(r[1])`): the base is evaluated once and writes reach
+  the original element (a plain value temp would swallow the write). *)
 
 type
   TRec = record

@@ -1266,8 +1266,52 @@ Two harness/robustness fixes were prerequisites for trusting the census at all:
 New samples pin each fix: `inctest` (nested/quoted includes with `.inc` companions),
 `addrparam`, `iftypesec`, `localif`, `msgwhen`, `uscore`, `dotparent`, `inharith`,
 `uscmethod`, `multidim`, `mathfn`, `sysmem`, `shortstr`, `localtype`, and the NIF-shape
-probes `withalias`/`withptr`/`withptrparam` (the first two still fail on the NIF path).
+probes `withalias`/`withptr`/`withptrparam` (the first two still failed on the NIF path at the time; fixed in M16).
 
 **Status: 5 of the 55 corpus units now type-check and build.** The rest were only ever
 translated, not compiled, so the next milestone walks the same census loop across the
 remaining units.
+
+## M16 - `with` binds its base once (address / pointer capture)
+
+Pascal's `with` evaluates its base designator **exactly once** and binds a hidden
+**address** when the base is an lvalue (writes go through to the original) and a
+**value copy** when it is an rvalue or a `const` (valid Pascal never writes through
+one). The old lowering qualified the body against the *text* of the base, so every
+field access re-evaluated it. FPC on
+
+```pascal
+with Arr[i] do begin i := 1; A := A + 1; B := 7 end
+```
+
+evaluates `Arr[0]` once (`a0=101 a1=200 b0=7 b1=0`); the text lowering re-read
+`Arr[i]` with the new `i` and wrote `Arr[1]` (`a0=100 a1=201 b0=0`). The probe
+`with P^ do begin P := @R2; A := A + 10 end` was wrong the same way (`r1=1 r2=12`
+against FPC's `r1=11 r2=2`).
+
+The lowering now always binds a hidden temp, its kind chosen from the base:
+
+- **writable record designator** -> address temp `var w = addr(base)`; the body
+  qualifies `w[].field`. Covers `with rec do`, `with Arr[i] do`, `with X.Field do`.
+- **record reached through a raw pointer** -> capture the pointer (and the index):
+  nimony rejects `addr` of an explicit-deref operand (`addr(P[])` and
+  `addr(X[][1])` report `invalid expression for addr operation`), so `with P^ do`
+  becomes `var w = P` and `with X[][i] do` becomes `var w = X; var ix = i`,
+  qualified `w[].field` / `w[][ix].field`. Capturing the index too keeps a body
+  that reassigns it from retargeting the qualifier.
+- **class / ref** -> typed temp (a reference copy is already one evaluation).
+- **const / rvalue** -> value-copy temp. `addr` of const storage is unsafe: nimony
+  compiles a write through `addr(constRecord)` and it **segfaults**, while a
+  `let` record is silently mutated. A `const` parameter is marked on the AST
+  (`Node.isImmutable`) and a typed const's type is recorded (`constTypes`) so the
+  base still *classifies* (its members qualify) without taking an address.
+
+That also fixed `with C do` on a typed const, which previously emitted an unused
+`var w = C` and left the body unqualified (`type mismatch: got: auto but wanted: int32`).
+
+The parsed-NIF writer gained the two shapes the new AST uses - `(call addr x)` and
+the deref `(at x)` (probed against nifler) - and a real `(ptr T)` type descriptor
+(a bare `ptr` ident was an undeclared name). `pasler-withalias` and
+`pasler-withptr` now both pass, so the suite is **86 sections, all green**, the
+oracle is 15/15, and the five `lazyBtree*` modules still build at 0 errors. The
+`withalias` / `withptr` sample comments were updated to describe the capture.

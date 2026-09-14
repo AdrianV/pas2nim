@@ -7,8 +7,11 @@ program WithPtr;
   Node/Value/Key".
 
   The element spelling of such a field has to follow one pointer level
-  and then the array alias; the resolved record makes the with-body
-  qualify against the ORIGINAL expression (records are values). *)
+  and then the array alias. The lowering captures the pointer and the
+  index in temps (`var w = r.Items; var i = 1`) and qualifies
+  `w[][i].field`: the base is evaluated once and writes go through.
+  (nimony rejects `addr` of an explicit-deref operand such as
+  `addr(r.Items[][1])`, so the pointer is captured instead.) *)
 
 type
   PRec = ^TRec;
