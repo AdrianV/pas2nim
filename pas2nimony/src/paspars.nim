@@ -33,6 +33,7 @@ type
     typ*: Node                  ## property type
     params*: Node               ## array property: param defs (nkIdentDefs)
     readId, writeId*: string    ## accessor names ("" if absent)
+    readPath*: seq[string]      ## dotted `read a.b` field path (empty if simple)
     isDefault*: bool
     isPublic*: bool
 
@@ -3066,6 +3067,20 @@ proc parseVarSection*(p: var TParser): Node =
           if defs[i].kind == nkIdent:
             p.varRawTypes[defs[i].strVal.toLowerAscii] = tyKey
 
+proc foldLiteralConcat(n: Node): Node =
+  ## Pascal's `AnsiChar + AnsiChar` builds a string (`#$40 +#$40 ...`,
+  ## ReTablebase64 in synacode). nimony has no char+char concatenation, so
+  ## fold an all-literal `+` chain into one string literal.
+  result = n
+  if n.kind == nkInfix and n.len == 3 and n[0].kind == nkIdent and
+      n[0].strVal == "+":
+    let a = foldLiteralConcat(n[1])
+    let b = foldLiteralConcat(n[2])
+    if a.kind in {nkCharLit, nkStrLit} and b.kind in {nkCharLit, nkStrLit}:
+      let s = newNode(nkStrLit, n.info)
+      s.strVal = a.strVal & b.strVal
+      return s
+
 proc parseConstSection*(p: var TParser): Node =
   result = newNodeP(nkConstSection, p)
   getTokP(p)                    # skip const/resourcestring
@@ -3100,7 +3115,7 @@ proc parseConstSection*(p: var TParser): Node =
       def.add(emptyNode(info))
     p.eat(pxEquals)
     skipCom(p)
-    def.add(parseExpr(p))
+    def.add(foldLiteralConcat(parseExpr(p)))
     # an untyped integer const that fits in int32 is an Integer in Pascal
     # (context-adaptive). nimony types a bare literal as int64 (its int),
     # which does not coerce to an int32 field/local on assignment.
@@ -4092,18 +4107,18 @@ proc parseProperty*(p: var TParser): Node =
         getTokP(p)
         if p.tok.xkind == pxSymbol:
           decl.readId = p.tok.ident
+          decl.readPath = @[p.tok.ident]
           getTokP(p)
           # A dotted accessor (`read slice.Last`, `read FValue.VBoolean`)
-          # reads THROUGH a field. genPropertyAccessors only needs the
-          # final component as the accessor name; keeping the field path
-          # is the qualifier machinery's job, and the whole path here is
-          # a value-type member chain, so the last component suffices.
+          # reads THROUGH a field. Keep the whole path: the getter must be
+          # `self.slice.last`, not a bare `self.last`.
           while p.tok.xkind == pxDot:
             getTokP(p)
             skipCom(p)
             if p.tok.xkind != pxSymbol:
               parError(p, "identifier expected after '.' in property accessor")
             decl.readId = p.tok.ident
+            decl.readPath.add(p.tok.ident)
             getTokP(p)
       elif word == "write":
         getTokP(p)
@@ -6108,6 +6123,20 @@ proc mapStringBuiltins*(p: var TParser, n: Node): Node =
     # cast - which sign-extends a negative int32 exactly like FPC's
     # `Pointer(-1)` -> $FFFFFFFFFFFFFFFF
     if n.len == 2:
+      # `Pointer(AnsiString)`: Delphi yields the address of the string
+      # data. nimony has neither a `pointer(string)` conversion nor a
+      # string<->pointer cast, so route it through the shim (which handles
+      # toCString's needs-var parameter).
+      var sot = rhsExprType(p, n[1]).toLowerAscii
+      if sot.len == 0 and n[1].kind == nkIdent:
+        sot = p.paramTypes.getOrDefault(
+            n[1].strVal.toLowerAscii).toLowerAscii
+      if sot in ["string", "ansistring", "widestring", "shortstring",
+                 "utf8string"]:
+        var sc = newNode(nkCall, n.info)
+        sc.add(newIdentNode("pasPAnsiChar", n.info))
+        sc.add(n[1])
+        return sc
       # a numeric operand (`Pointer(1)`, `Pointer(Integer(x))`,
       # `Pointer(NativeInt(x))`) or a ref operand crosses domains: cast.
       # `Pointer(somePtr)` and an unknown operand stay a conversion.
@@ -6377,7 +6406,11 @@ proc rhsExprType(p: var TParser, n: Node): string =
   of nkCall:
     if n.len > 0 and n[0].kind == nkIdent:
       let ck = n[0].strVal.toLowerAscii
-      if p.pointerAliases.hasKey(ck):
+      if ck in ["pointer", "addr"]:
+        # `Pointer(x)` / `addr(x)`: a raw address (the cstring rule
+        # needs to see it to insert the cast at a cstring target)
+        result = "pointer"
+      elif p.pointerAliases.hasKey(ck):
         result = n[0].strVal
       else:
         result = p.routineReturns.getOrDefault(ck,
@@ -6389,6 +6422,9 @@ proc rhsExprType(p: var TParser, n: Node): string =
       result = p.routineReturns.getOrDefault(ck & "." & rk,
           p.routineReturns.getOrDefault(rk, ""))
     else: result = ""
+  of nkAddr:
+    # `addr(x)` / `@x`: a raw address, same as `Pointer(x)`
+    result = "pointer"
   of nkPar:
     if n.len > 0:
       result = rhsExprType(p, n[0])
@@ -6424,6 +6460,7 @@ proc ptrKindOf(p: TParser, t: string): string =
     if alias.toLowerAscii == "pointer": return "pointer"
     return "ptr:" & alias
   if tl == "pointer": return "pointer"
+  if tl == "cstring": return "cstring"
   if p.pointerAliases.hasKey(tl): return "ptr:" & t
   if t.startsWith("class:"): return "ref:" & t[6 .. ^1]
   if p.typeAliasTargets.hasKey(tl):
@@ -6502,9 +6539,22 @@ proc coercePtrAsgns*(p: var TParser, n: Node) =
       if rk == "pointer":
         n[1] = convPtrNode(alias, n[1])
         return
+      elif rk == "cstring":
+        n[1] = hardCastNode(alias, n[1])
+        return
       elif rk.startsWith("ptr:") and rk != lk:
         n[1] = hardCastNode(alias, n[1])
         return
+    elif lk == "cstring":
+      # PAnsiChar := Pointer / typed pointer / `addr` result: nimony has
+      # no coercion, so take the raw cast. A string source already
+      # arrives as cstring (literal / toCString) and is left alone.
+      if rk.len > 0 and rk != "cstring":
+        n[1] = hardCastNode("cstring", n[1])
+        return
+    elif lk == "pointer" and rk == "cstring":
+      n[1] = hardCastNode("pointer", n[1])
+      return
     elif lk == "pointer" and rk.startsWith("ptr:"):
       n[1] = convPtrNode("pointer", n[1])
       return
@@ -8260,22 +8310,39 @@ proc initValueResult(p: var TParser, module: Node) =
     if def.kind in {nkProcDef, nkFuncDef, nkMethodDef} and
         def.len >= 3 and def[2].kind == nkFormalParams:
       let ret = def[2][0]
-      if ret.kind == nkIdent and
-          (p.recordTypes.hasKey(ret.strVal.toLowerAscii) or
-           ret.strVal.toLowerAscii == "variant") and
-          def.len > 0 and def[def.len - 1].kind == nkStmtList and
-          def[def.len - 1].len > 0:
-        let body = def[def.len - 1]
-        var asgn = newNode(nkAsgn, ret.info)
-        asgn.add(newIdentNode("result", ret.info))
+      if ret.kind != nkIdent: continue
+      let rk = ret.strVal.toLowerAscii
+      # a value-object result (record OR the object keyword, which is NOT
+      # in recordTypes) whose fields are assigned, and a string builder
+      # that calls setLen/add before assigning, both fail the proof
+      var isValue = p.recordTypes.hasKey(rk) or rk == "variant"
+      if not isValue:
+        let ci = p.syms.classes.getOrDefault(rk)
+        isValue = ci.spelling.len > 0 and not ci.isRef
+      # the AST keeps the Pascal spelling; AnsiString/WideString map to
+      # nimony's string
+      let canon = p.syms.canonical(ret.strVal).toLowerAscii
+      let isStr = canon == "string" or rk in
+          ["string", "ansistring", "widestring", "shortstring", "utf8string"]
+      if not (isValue or isStr): continue
+      if def.len == 0 or def[def.len - 1].kind != nkStmtList or
+          def[def.len - 1].len == 0: continue
+      let body = def[def.len - 1]
+      var asgn = newNode(nkAsgn, ret.info)
+      asgn.add(newIdentNode("result", ret.info))
+      if isStr:
+        let empty = newNode(nkStrLit, ret.info)
+        empty.strVal = ""
+        asgn.add(empty)
+      else:
         var dcall = newNode(nkCall, ret.info)
         dcall.add(newIdentNode("default", ret.info))
         dcall.add(ret)
         asgn.add(dcall)
-        var rebuilt: seq[Node] = @[asgn]
-        for s in body.sons:
-          rebuilt.add(s)
-        body.sons = rebuilt
+      var rebuilt: seq[Node] = @[asgn]
+      for s in body.sons:
+        rebuilt.add(s)
+      body.sons = rebuilt
 
 proc selfQualifyAll*(p: var TParser, module: Node) =
   for i in 0 ..< module.len:
@@ -8567,9 +8634,18 @@ proc genPropertyAccessors*(p: var TParser, module: Node) =
         var isRoutine = false
         let ciRead = p.syms.classes.getOrDefault(clsKey)
         isRoutine = ciRead.routineSet.hasKey(readLower)
-        let access = newNode(nkDotExpr, pr.typ.info)
-        access.add(newIdentNode("self", pr.typ.info))
-        access.add(newIdentNode(pr.readId, pr.typ.info))
+        var access: Node
+        if pr.readPath.len > 0:
+          access = newIdentNode("self", pr.typ.info)
+          for comp in pr.readPath:
+            let d = newNode(nkDotExpr, pr.typ.info)
+            d.add(access)
+            d.add(newIdentNode(comp, pr.typ.info))
+            access = d
+        else:
+          access = newNode(nkDotExpr, pr.typ.info)
+          access.add(newIdentNode("self", pr.typ.info))
+          access.add(newIdentNode(pr.readId, pr.typ.info))
         if isRoutine:
           let call = newNode(nkCall, pr.typ.info)
           call.add(access)

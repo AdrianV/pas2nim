@@ -433,6 +433,14 @@ proc Len32*[T](x: openArray[T]): int32 =
   ## Pascal Length(array) = Integer (int32)
   result = int32(len(x))
 
+proc Length*(s: string): int32 =
+  ## `System.Length(s)` arrives QUALIFIED, so the unqualified rewrite to
+  ## Len32 does not see it; this exported spelling covers that path.
+  result = Len32(s)
+
+proc Length*[T](x: openArray[T]): int32 =
+  result = Len32(x)
+
 # SysUtils locale separators (v1 constants - locale read/write is a
 # documented divergence)
 var TimeSeparator*: char = ':'
@@ -520,6 +528,33 @@ proc Dispose*(p: pointer) =
 # answers nil and the corpus's binary-stream paths stay compile-only
 proc pasCStr*(a: int32): cstring =
   result = nil
+
+# Delphi's PAnsiChar semantics. nimony splits them between two types:
+# cstring has `P[i]` and the C ABI but neither arithmetic nor `P^`;
+# ptr char has arithmetic and `P^` but no indexing. Add the missing
+# operators to cstring so PAnsiChar keeps its exact Delphi surface
+# (Pointer itself stays arithmetic-free, as in Delphi). A *distinct*
+# type would compile the arithmetic too, but would force a
+# `cast[cstring]` at every Win32 call boundary.
+proc `+`*(p: cstring; n: int32): cstring =
+  result = cast[cstring](cast[uint](p) + uint(n))
+
+proc `-`*(p: cstring; n: int32): cstring =
+  result = cast[cstring](cast[uint](p) - uint(n))
+
+proc `[]`*(p: cstring): var char =
+  ## `P^`: nimony's cstring has no deref of its own
+  result = cast[ptr char](cast[uint](p))[]
+
+proc pasPAnsiChar*(s: string): cstring =
+  ## Delphi's `Pointer(AnsiString)` / `PAnsiChar(AnsiString)`: the
+  ## address of the string data. nimony's toCString needs a `var string`
+  ## and rejects a value parameter, so take a local: the buffer is
+  ## refcounted and an unmutated local shares it with the caller (exactly
+  ## Delphi's refcounted AnsiString), so the pointer stays valid as long
+  ## as the caller's string does.
+  var v = s
+  result = toCString(v)
 
 # pasLineEnding: the platform's native line terminator. Probed: nimony's
 # syncio is a pure-Nimony layer with NO text-mode translation, so even a
