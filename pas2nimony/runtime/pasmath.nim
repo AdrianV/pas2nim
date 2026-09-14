@@ -11,6 +11,12 @@
 
 import std/math
 
+# re-export the transcendental surface Delphi's Math unit shares with
+# std/math: `sin`, `cos`, `arcsin`, `arccos`, `arctan`, `ln`, `exp`,
+# `PI`, ... Without this an importer sees only the wrappers below and
+# `Sin`/`ArcSin`/`PI` fail with "undeclared identifier".
+export math
+
 proc Floor*(x: float64): int64 = int64(floor(x))
 proc Floor*(x: float32): int64 = int64(floor(x))
 proc Ceil*(x: float64): int64 = int64(ceil(x))

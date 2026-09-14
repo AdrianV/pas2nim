@@ -512,6 +512,9 @@ proc New*[T](p: var ptr T) =
 proc Dispose*[T](p: ptr T) =
   discard
 
+proc Dispose*(p: pointer) =
+  discard
+
 # pasCStr: Delphi's `PChar(Integer(P) + N)` pointer arithmetic has no
 # nimony spelling (int<->cstring casts are rejected); the v1 shim
 # answers nil and the corpus's binary-stream paths stay compile-only
@@ -679,6 +682,9 @@ const
   varUString* = TVarType(0x0102)  # FPC / Delphi 2009+
   varArray* = TVarType(0x2000)    # OR'd into the tag of a variant array
   varParam* = TVarType(0x4000)    # OR'd in for an untyped `var` parameter
+
+type
+  PVariant* = ptr Variant
 
 # The three special values. Measured: Null is Null but NOT clear; Unassigned
 # is both Empty and Clear; EmptyParam is a varError variant carrying
@@ -1810,3 +1816,56 @@ proc VarArrayRedim*(v: var Variant; highBound: int32) =
     a.values.setLen(total)
     for j in old ..< total:
       a.values[j] = Variant(VType: elem)
+
+# ---------------------------------------------------------------------------
+# Delphi memory management
+#
+# Delphi's `AllocMem`/`FreeMem`/`ReallocMem` family maps onto nimony's
+# allocator (`alloc0`/`realloc`/`dealloc`); the Pascal spellings take a
+# size in any Integer width, and `AllocMem` is the zero-filling one.
+# `Move`/`FillChar` are the untyped pair - they take the *value* (not an
+# address) and are emitted generically, with `var` on the destination so
+# a dereferenced pointer (`p[]`) or an array element binds directly. They
+# are spelled `pasMove`/`pasFillChar` (see RtlNames) so the generic
+# `var`-parameter overloads cannot hijack a user method named `Move`.
+
+proc AllocMem*(size: int32): pointer = alloc0(int(size))
+proc AllocMem*(size: uint32): pointer = alloc0(int(size))
+proc AllocMem*(size: int64): pointer = alloc0(int(size))
+proc AllocMem*(size: uint64): pointer = alloc0(int(size))
+
+proc FreeMem*(p: pointer) = dealloc(p)
+proc FreeMem*(p: pointer; size: int32) = dealloc(p)
+proc FreeMem*(p: pointer; size: uint32) = dealloc(p)
+proc FreeMem*(p: pointer; size: int64) = dealloc(p)
+proc FreeMem*(p: pointer; size: uint64) = dealloc(p)
+proc FreeMemory*(p: pointer) = dealloc(p)
+
+proc ReallocMem*(p: var pointer; size: int32) = p = realloc(p, int(size))
+proc ReallocMem*(p: var pointer; size: uint32) = p = realloc(p, int(size))
+proc ReallocMemory*(p: pointer; size: int32): pointer = realloc(p, int(size))
+proc ReallocMemory*(p: pointer; size: uint32): pointer = realloc(p, int(size))
+proc ReallocMemory*(p: pointer; size: int64): pointer = realloc(p, int(size))
+proc ReallocMemory*(p: pointer; size: uint64): pointer = realloc(p, int(size))
+
+proc pasMove*[S, D](src: var S; dest: var D; count: int32) =
+  moveMem(addr dest, addr src, int(count))
+proc pasMove*[S, D](src: var S; dest: var D; count: int64) =
+  moveMem(addr dest, addr src, int(count))
+proc pasMove*[S, D](src: var S; dest: var D; count: uint32) =
+  moveMem(addr dest, addr src, int(count))
+
+proc pasFillChar*[D](dest: var D; count: int32; value: uint8) =
+  var p = addr dest
+  var i: int32 = 0
+  while i < count:
+    cast[ptr uint8](cast[uint](p) + uint(i))[] = value
+    i = i + 1
+proc pasFillChar*[D](dest: var D; count: int64; value: uint8) =
+  pasFillChar(dest, int32(count), value)
+proc pasFillChar*[D](dest: var D; count: uint32; value: uint8) =
+  pasFillChar(dest, int32(count), value)
+proc pasFillChar*[D](dest: var D; count: int32; value: string) =
+  # Delphi accepts a 1-char string where a Byte is expected
+  let v = if value.len > 0: uint8(value[0]) else: uint8(0)
+  pasFillChar(dest, count, v)

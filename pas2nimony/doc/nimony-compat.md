@@ -1208,3 +1208,66 @@ One corpus unit had `:` where `;` belongs, and another needed the nested `goto` 
 
 **Status: nothing in this tier has been type-checked.** Translation is reach; compilation
 is the next milestone.
+
+## M15 - the lazyBtree tier type-checks (P4-P7)
+
+Translation was reach; this milestone opens the compile tier. The first target is the
+five `lazyBtree*` modules (`lazyBtree`, `lazyBtreeInt64`, `lazyBtreeDateTime`,
+`lazyBtreeString`, `lazyBtreeText`), the generic-container core of the corpus. They go
+from **197 nimony `Error:` lines to 0** - each module now builds a binary (`nimony c`
+exit 0). The suite grows to 86 sections and stays otherwise green (the only failures are
+the pre-existing NIF shapes `pasler-withalias` / `pasler-withptr`), so no regression was
+traded for the tier.
+
+The work was a census-driven sequence of error classes:
+
+- **P4 - literal and size widths.** `sizeof`/`high`/`low` results coerced to their
+  declared int32 context; untyped integer constants that fit int32 emit as `int32(N)`;
+  non-literal `case` labels are wrapped so nimony can range-check them.
+- **P5 - Pointer / typed-pointer / ref boundaries.** Delphi lets `Pointer`, typed
+  pointers and object refs pass implicitly; nimony needs explicit conversions, so
+  `coercePtrArgs` and `coercePtrAsgns` insert `T(x)` / `cast[T](x)` at routine
+  boundaries, driven by the `typeAliasTargets` / `varRawTypes` registries. Set-element
+  narrowing (`Include`, `in`) casts to the declared subrange.
+- **P6 - method pointers (`procedure … of object`).** The `T = object evProc, evObj`
+  lowering now carries the function return type, represents `evObj`/`self` as `pointer`
+  (so `TMethod(v).Code`/`.Data` assign to a plain proc type without a forbidden
+  proc-to-proc cast), rewrites `TMethod(x).Code`/`.Data` to `evProc`/`evObj`, and keeps
+  the record-proc-type field spelling so the assignment knows its target.
+- **P7 - `PVariant`.** The shim gains `PVariant* = ptr Variant` and a pointer
+  `Dispose` overload; `absorbNimModule` records shim `X* = ptr Y` aliases so a
+  `v: PVariant` participates in the pointer coercions. `isVariantExpr` recognises `v^`
+  (deref of a `ptr Variant`), and `initValueResult` covers `Variant` returns
+  (`result = default(Variant)` = `varEmpty`, matching Pascal's uninitialised `Result`).
+
+Fixing those revealed four **general** lowering bugs that the earlier errors had masked:
+
+- **Nested routines that capture outer locals** need an explicit `{.closure.}`; nested
+  routines now get one.
+- **`out` parameters.** Pascal `out` was lowered as `var`, which made nimony demand an
+  initialised argument at the call site. It now emits `out` (a new `Node.isOutParam`
+  flag, rendered by the source writer; the NIF writer still emits `mut`).
+- **Pascal value parameters are mutable**, nimony's are not. A value parameter that is
+  directly reassigned has its formal renamed and a `var <name> = <fresh>` local copy
+  prepended, so the body keeps its own mutable local and call sites stay by-value.
+- **A variable typecast passed to a `var` parameter** (`TValueType(Value)` as an
+  argument) is an lvalue in Delphi, but a plain cast is not passable by `var`; it lowers
+  to the address-cast lvalue `cast[ptr T](addr x)[]`.
+
+Two harness/robustness fixes were prerequisites for trusting the census at all:
+
+- `test/run.sh` piped every build through `grep … || true`, so a failing build exited 0
+  and the runner printed `-- ok` - a false positive that had hidden failures. Builds now
+  capture the real exit status and the runner asserts it.
+- A missing `{$I file}` is now a hard error (`include file not found: …`) instead of a
+  silent skip, which only resurfaced later as an undeclared identifier. Locked in by
+  `test/negative/missing_include.pas`.
+
+New samples pin each fix: `inctest` (nested/quoted includes with `.inc` companions),
+`addrparam`, `iftypesec`, `localif`, `msgwhen`, `uscore`, `dotparent`, `inharith`,
+`uscmethod`, `multidim`, `mathfn`, `sysmem`, `shortstr`, `localtype`, and the NIF-shape
+probes `withalias`/`withptr`/`withptrparam` (the first two still fail on the NIF path).
+
+**Status: 5 of the 55 corpus units now type-check and build.** The rest were only ever
+translated, not compiled, so the next milestone walks the same census loop across the
+remaining units.

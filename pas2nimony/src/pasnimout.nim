@@ -177,8 +177,10 @@ proc expr(s: var TRendor, n: Node): string =
       let callee = if n.noQualCallee and n[0].kind == nkIdent:
                      # inherited callees must not lose their member
                      # spelling to the canon (the corpus's `Insert`
-                     # would rename to the string shim `strInsert`)
-                     n[0].strVal
+                     # would rename to the string shim `strInsert`) -
+                     # but a leading-underscore member still has to be
+                     # escaped or it is not a legal nimony identifier
+                     escapeNimonyName(n[0].strVal)
                    else:
                      s.expr(n[0])
       result = callee & "("
@@ -274,6 +276,8 @@ proc expr(s: var TRendor, n: Node): string =
     result.add("}")
   of nkRange:
     result = s.expr(n[0]) & ".." & s.expr(n[1])
+  of nkPtrTy:
+    result = "ptr " & s.typeStr(n[0])
   of nkCast:
     result = "cast[" & s.expr(n[0]) & "](" & s.expr(n[1]) & ")"
   of nkAsgn:
@@ -404,12 +408,13 @@ proc typeStr(s: var TRendor, n: Node): string =
     result = "range[" & s.expr(n[0][0]) & ".." & s.expr(n[0][1]) & "]"
   of nkIndexExpr:
     # `string[N]` (Pascal short string): the length prefix has no
-    # nimony model - keep the unbounded string (documented divergence)
+    # nimony model - keep the unbounded string (documented divergence).
+    # The bound must be DROPPED here: falling through to the index loop
+    # below rendered it as `string# unhandled type kind: nkIntLit]`.
     if n[0].kind == nkIdent and n[0].strVal.toLowerAscii == "string":
-      result = "string"
-    else:
-      # generic instantiation in a type position
-      result = s.typeStr(n[0]) & "["
+      return "string"
+    # generic instantiation in a type position
+    result = s.typeStr(n[0]) & "["
     for i in 1 ..< n.len:
       if i > 1: result.add(", ")
       result.add(s.typeStr(n[i]))
@@ -440,7 +445,10 @@ proc typeStr(s: var TRendor, n: Node): string =
       if cc.len > 0:
         result.add(" {." & cc & ".}")
   of nkVarTy:
-    result = "var " & s.typeStr(n[0])
+    result = (if n.isOutParam: "out " else: "var ") & s.typeStr(n[0])
+  of nkIntLit, nkInt64Lit, nkFloatLit:
+    # a bare literal in a type position (an index bound)
+    result = s.expr(n)
   else:
     result = "# unhandled type kind: " & $n.kind
 
@@ -493,7 +501,14 @@ proc renderDefSig(s: var TRendor, n: Node): string =
            of nkFuncDef: "func"
            of nkMethodDef: "method"
            else: "template"
-  result = kw & " " & tickName(s.canon(nameNode.strVal))
+  # member names must not take the type-tier RTL map: a Pascal method
+  # named `Move` is not the `pasMove` memory shim. `defClass` marks
+  # a method definition, so render it with member canon.
+  let nm = if n.defClass.len > 0 and s.syms != nil:
+             s.syms[].canonicalMember(nameNode.strVal)
+           else:
+             s.canon(nameNode.strVal)
+  result = kw & " " & tickName(nm)
   result.add(s.typeParamsSuffix(n))
   if exported: result.add("*")
   if n.len >= 3 and n[2].kind == nkFormalParams:
@@ -805,7 +820,26 @@ proc stmt(s: var TRendor, n: Node) =
       else:
         s.line("const " & tickName(name) & star & " = " & valStr)
   of nkTypeSection:
-    discard
+    # a routine-LOCAL type section: Nim allows `type` inside a proc, so
+    # render the definitions in place. This case used to be a bare
+    # discard, which silently dropped e.g. tplbtree.inc's local `RPath`
+    # and left every use of it undeclared. Module-level sections are
+    # rendered by renderModule, not here.
+    var anyDef = false
+    for def in n.sons:
+      if def.kind == nkTypeDef and def[2].kind != nkCommentStmt:
+        anyDef = true
+        break
+    if anyDef:
+      s.line("type")
+      s.indent = s.indent + 1
+      var lhoisted: seq[Node] = @[]
+      for def in n.sons:
+        if def.kind != nkTypeDef: continue
+        s.renderTypeDef(def, lhoisted)
+      s.indent = s.indent - 1
+      for h in lhoisted:
+        s.stmt(h)
   of nkProcDef, nkFuncDef, nkMethodDef, nkTemplateDef:
     # nested definitions render in place; class-body defs were hoisted
     if n[n.len - 1].kind == nkEmpty:
@@ -884,11 +918,13 @@ proc typeBlock(s: var TRendor, defs: seq[Node], hoisted: var seq[Node]) =
     s.renderTypeDef(def, hoisted)
   s.indent = s.indent - 1
 
-proc whenInTypeSection(s: var TRendor, n: Node, hoisted: var seq[Node]) =
-  ## render a forwarded conditional that sits between type definitions.
-  ## nimony rejects `when` INSIDE a `type` section, so the conditional is
-  ## hoisted to module level and every arm body becomes its own nested
-  ## `type` block:
+proc renderTypeSectionBody(s: var TRendor, defs: seq[Node],
+                           hoisted: var seq[Node]) =
+  ## emit the body of one `type` section. A forwarded `{$if <expr>}`
+  ## group may sit between the definitions, and nimony rejects `when`
+  ## INSIDE a `type` section - so each run of definitions becomes its own
+  ## `type` block and the conditional is hoisted between them, its arm
+  ## bodies rendered as nested type-section bodies:
   ##
   ##   when sizeof(pointer) == 8:
   ##     type
@@ -896,24 +932,48 @@ proc whenInTypeSection(s: var TRendor, n: Node, hoisted: var seq[Node]) =
   ##   else:
   ##     type
   ##       IntPtr = int32
-  for i in 0 ..< n.len:
-    let branch = n[i]
-    if branch.kind == nkElifBranch:
-      s.line((if i == 0: "when " else: "elif ") & s.expr(branch[0]) & ":")
-      s.indent = s.indent + 1
-      if branch[1].kind == nkTypeSection:
-        typeBlock(s, branch[1].sons, hoisted)
-      else:
-        s.stmt(branch[1])
-      s.indent = s.indent - 1
-    elif branch.kind == nkElse:
-      s.line("else:")
-      s.indent = s.indent + 1
-      if branch[0].kind == nkTypeSection:
-        typeBlock(s, branch[0].sons, hoisted)
-      else:
-        s.stmt(branch[0])
-      s.indent = s.indent - 1
+  ##
+  ## The recursion matters: an arm may itself hold a conditional. Calling
+  ## the flat `typeBlock` there silently DROPPED the inner group (the
+  ## `{$IF not defined(IntPtr)} {$IF sizeof(Pointer) = 4} ...` shape in
+  ## p4nHelper.pas). Self-recursion keeps that reachable without a
+  ## forward declaration, which this toolchain does not have.
+  var run: seq[Node] = @[]
+  for def in defs:
+    if def.kind != nkWhenExpr:
+      run.add(def)
+      continue
+    typeBlock(s, run, hoisted)
+    run.setLen(0)
+    for i in 0 ..< def.len:
+      let branch = def[i]
+      if branch.kind == nkElifBranch:
+        s.line((if i == 0: "when " else: "elif ") & s.expr(branch[0]) & ":")
+        s.indent = s.indent + 1
+        # an arm may render NOTHING: its only content can be a `{$Message}`
+        # diagnostic (no semantics to emit) or a type body with no real
+        # definition left. An empty arm is "nestable statement requires
+        # indentation" to nimony, so fall back to a discard.
+        let before = s.buf.len
+        if branch[1].kind == nkTypeSection:
+          renderTypeSectionBody(s, branch[1].sons, hoisted)
+        else:
+          s.stmt(branch[1])
+        if s.buf.len == before:
+          s.line("discard")
+        s.indent = s.indent - 1
+      elif branch.kind == nkElse:
+        s.line("else:")
+        s.indent = s.indent + 1
+        let before = s.buf.len
+        if branch[0].kind == nkTypeSection:
+          renderTypeSectionBody(s, branch[0].sons, hoisted)
+        else:
+          s.stmt(branch[0])
+        if s.buf.len == before:
+          s.line("discard")
+        s.indent = s.indent - 1
+  typeBlock(s, run, hoisted)
 
 proc renderModule*(module: Node, syms: var SymTab, infile, outfile: string,
                    flags: set[TParserFlag]) =
@@ -929,19 +989,12 @@ proc renderModule*(module: Node, syms: var SymTab, infile, outfile: string,
   for top in module.sons:
     case top.kind
     of nkTypeSection:
-      # a forwarded `{$if <expr>}` group may sit between the definitions.
-      # Each run of definitions is emitted as its own `type` section and
-      # the conditional is hoisted between them (see whenInTypeSection).
+      # a forwarded `{$if <expr>}` group may sit between the definitions,
+      # at any nesting depth. Each run of definitions is emitted as its
+      # own `type` section and the conditional is hoisted between them
+      # (see renderTypeSectionBody / whenInTypeSection).
       var allHoisted: seq[Node] = @[]
-      var run: seq[Node] = @[]
-      for def in top.sons:
-        if def.kind == nkWhenExpr:
-          typeBlock(s, run, allHoisted)
-          run.setLen(0)
-          whenInTypeSection(s, def, allHoisted)
-        else:
-          run.add(def)
-      typeBlock(s, run, allHoisted)
+      renderTypeSectionBody(s, top.sons, allHoisted)
       s.buf.add("\n")
       for h in allHoisted:
         s.renderDef(h)

@@ -43,7 +43,7 @@ type
                                   ## is cut instead of recursing forever
 
   TParser* = object
-    lex*: TLexer
+    lex*: ref TLexer
     tok*: TToken
     aheadTok*: TToken
     hasAhead*: bool
@@ -105,6 +105,12 @@ type
     qualClass*: string          ## class context of the self-qualify pass
     nestedProcs*: seq[string]   ## nested routine names of the current proc
     arrayTypeLows*: Table[string, int]  ## alias type name -> declared low
+    typeAliasTargets*: Table[string, string] ## simple alias -> target spelling
+    withTempOwners*: Table[string, string] ## hidden with temp -> class spelling
+    setElemTexts*: Table[string, string] ## set var -> nimony element type text
+    procTyReturns*: Table[string, string]  ## plain proc-type alias -> return spelling
+    procTyParams*: Table[string, Node]     ## plain proc-type alias -> formal params
+    procVarReturns*: Table[string, string] ## proc-typed var/param -> return spelling
 
 var condWhenStack: seq[int] = @[]
   ## One entry per OPEN conditional group of the parser currently running,
@@ -121,18 +127,97 @@ var condWhenStack: seq[int] = @[]
 # ---------------------------------------------------------------------------
 # token plumbing
 
+var includeStack: seq[ref TLexer] = @[]
+  ## One parked lexer per OPEN `{$I ...}`/`{$INCLUDE ...}` splice,
+  ## outermost first. The included file is lexed by its own lexer, so every
+  ## token keeps its real file name and line - unlike a textual
+  ## pre-expansion, which would shift every position after the include.
+  ## The stack is module state for the same reason condWhenStack is (a
+  ## TParser field breaks the nimony frontend compiling this file);
+  ## openParser clears it and absorbUnit saves it around a nested parse.
+  ##
+  ## `seq[ref TLexer]`, not `seq[TLexer]`: a sequence of the inherited
+  ## object type itself makes nimony's final codegen die inside the
+  ## openArray array-converter ("expected expression but got: (baseobj
+  ## ... BaseLexer ... dest)"). A sequence of refs sidesteps it.
+
+proc includePop(p: var TParser): bool =
+  ## the current lexer ran to EOF and belongs to an include: close it and
+  ## resume the including file. False when the EOF is the real one.
+  if includeStack.len == 0: return false
+  closeLexer(p.lex[])
+  p.lex = includeStack.pop()
+  result = true
+
+proc includeGetTok(p: var TParser, tok: var TToken) =
+  ## getTok across include boundaries: an included file's EOF is not the
+  ## end of the token stream, it is the return to the parent.
+  while true:
+    getTok(p.lex[], tok)
+    if tok.xkind != pxEof or not includePop(p):
+      break
+
+proc includeNext(p: var TParser): TToken =
+  ## read one token across include boundaries. Goes through a local so the
+  ## `var` argument never aliases a field of the `var` parser parameter
+  ## (nimony rejects that alias outright).
+  result = default(TToken)
+  includeGetTok(p, result)
+
+proc resolveInclude(p: TParser, name: string): string =
+  ## absolute path of an include file, or "" when it cannot be found.
+  ## The caller turns "" into a hard parser error (except for the
+  ## `{$I+}`/`{$I-}` switches, filtered before the call).
+  ##
+  ## Search order: the including file's directory, the CLI search paths,
+  ## then a `package` subdirectory of either (Delphi projects keep shared
+  ## includes beside the units, in `package/`, and those directories are
+  ## not themselves on --path).
+  if name.len == 0: return ""
+  let nm = name.replace('\\', '/')
+  var dirs: seq[string] = @[]
+  let base = splitFile(p.lex.filename).dir
+  if base.len > 0: dirs.add(base)
+  dirs.add(".")
+  for sp in p.searchPaths:
+    if sp notin dirs: dirs.add(sp)
+  var cands: seq[string] = @[]
+  for d in dirs: cands.add(d / nm)
+  for d in dirs: cands.add(d / "package" / nm)
+  for c in cands:
+    if fileExists(c): return c
+    if splitFile(nm).ext.len == 0 and fileExists(c & ".inc"):
+      return c & ".inc"
+  result = ""
+
 proc getTokP(p: var TParser) =
   if p.hasAhead:
     p.tok = p.aheadTok
     p.hasAhead = false
   else:
-    getTok(p.lex, p.tok)
+    p.tok = includeNext(p)
 
 proc peekTok*(p: var TParser): TToken =
   if not p.hasAhead:
-    getTok(p.lex, p.aheadTok)
+    p.aheadTok = includeNext(p)
     p.hasAhead = true
   result = p.aheadTok
+
+proc pushInclude(p: var TParser, name: string): bool =
+  ## splice an include in place: the current lexer is parked on the stack
+  ## and the included file's first token becomes p.tok. Reads the first
+  ## token directly (not through getTokP) so the helpers stay ordered
+  ## without a forward declaration, which this toolchain lacks.
+  let f = resolveInclude(p, name)
+  if f.len == 0: return false
+  var sub: ref TLexer
+  new(sub)
+  sub[].openLexer(f)
+  includeStack.add(p.lex)
+  p.lex = sub
+  p.hasAhead = false
+  p.tok = includeNext(p)
+  result = true
 
 proc removeNextTok(p: var TParser) =
   if p.hasAhead:
@@ -199,8 +284,11 @@ proc newIdentNameNodeP(name: string, p: TParser): Node =
 proc openParser*(p: var TParser, filename: string, flags: set[TParserFlag],
                  defines: seq[string] = @[],
                  searchPaths: seq[string] = @[]) =
-  p.lex = TLexer()
-  p.lex.openLexer(filename)
+  new(p.lex)
+  p.lex[].openLexer(filename)
+  # a fresh unit starts on a fresh include stack: a leftover entry from a
+  # previous parse in the same process would close the wrong lexer
+  includeStack.setLen(0)
   p.flags = flags
   p.syms = initSymTab()
   for d in defines:
@@ -233,7 +321,7 @@ proc openParser*(p: var TParser, filename: string, flags: set[TParserFlag],
   getTokP(p)
 
 proc closeParser*(p: var TParser) =
-  closeLexer(p.lex)
+  closeLexer(p.lex[])
 
 proc parseExpr*(p: var TParser): Node
 proc parseStmt*(p: var TParser): Node
@@ -262,6 +350,19 @@ proc exSymbol*(n: Node, isPublic: bool): Node =
 proc parseStmtList(p: var TParser): Node
 proc parseTypeDefList(p: var TParser): Node
 proc parseUsesList(p: var TParser): Node
+
+proc typeLeafName(n: Node): string =
+  ## the bare spelling of a possibly unit-QUALIFIED type name. The corpus
+  ## writes `TaStringList = class(vStrLst.TaTemplateList)` in an
+  ## implementation section; the ancestor registry is keyed by the leaf
+  ## name, so a dotted parent used to be recorded as no parent at all -
+  ## and `inherited IndexOf(x)` then emitted `cast[](self)`.
+  if n.kind == nkIdent:
+    result = n.strVal
+  elif n.kind == nkDotExpr and n.len >= 1:
+    result = typeLeafName(n[n.len - 1])
+  else:
+    result = ""
 
 proc isHandledDirective(p: TParser): bool =
   result = false
@@ -483,6 +584,27 @@ proc parseDirective(p: var TParser): Node =
       let nm = parseCondName(p)
       p.syms.defines[nm] = false
       eatDirEnd(p, endMarker)
+    of "i", "include":
+      # `{$I file}` / `{$INCLUDE file}`: splice the file in at this point.
+      # The lexer already captured the name (quoted or bare) into
+      # tok.literal and left the close marker as the next token.
+      #
+      # Not every `{$I...}` is a file include. Delphi also spells the I/O
+      # checking switches `{$I+}` / `{$I-}` with the same letter, and the
+      # lexer's bare-name capture yields "+"/"-" for them; compiler-variable
+      # includes look like `{$I %DATE%}`. Those are left alone. A REAL
+      # include whose file does not exist is a hard error: the old
+      # skip-it path silently dropped declarations and failed much later
+      # with a confusing "undeclared identifier" on the use site.
+      let nm = p.tok.literal
+      let dirInfo = p.tok.info
+      getTokP(p)                  # the close marker
+      let isSwitch = nm.len == 0 or nm in ["+", "-"] or nm.startsWith("%")
+      if isSwitch:
+        getTokP(p)
+      elif not pushInclude(p, nm):
+        p.tok.info = dirInfo
+        parError(p, "include file not found: " & nm)
     else:
       # skip unknown compiler directive
       eatDirEnd(p, endMarker)
@@ -532,11 +654,16 @@ proc absorbUnit*(p: var TParser, unitName: string) =
   # inside an open `{$if}` of the importer cannot corrupt either side
   let savedCond = condWhenStack
   condWhenStack.setLen(0)
+  # same for includes: a unit absorbed from inside an included file must
+  # not inherit (or drain) the importer's splice stack
+  let savedInc = includeStack
+  includeStack.setLen(0)
   openParser(up, unitFile, p.flags, inheritedDefines)
   up.absorbed = p.absorbed   # shared ref: cycle guard works across units
   discard parseUnit(up)
   closeParser(up)
   condWhenStack = savedCond
+  includeStack = savedInc
   p.absorbed.files[unitFile] = true    # fully parsed
   for k, ci in up.syms.classes:
     if not p.syms.classes.hasKey(k):
@@ -564,6 +691,20 @@ proc scanNimExports(ln: string; s: var SymTab) =
     while j < t.len and t[j] in {' ', '\t'}: inc j
     if j < t.len and t[j] in {'=', '{', '[', '.'}:
       s.declareName(name)
+      if t.find("= ptr ") >= 0 or t.find("= ^") >= 0:
+        var ppe = t.find("= ptr ")
+        if ppe >= 0: ppe = ppe + 6
+        else:
+          ppe = t.find("= ^")
+          if ppe >= 0: ppe = ppe + 4
+        if ppe >= 0:
+          var e = ppe
+          while e < t.len and t[e] in {' ', '\t'}: inc e
+          var el = ""
+          while e < t.len and t[e] in {'a'..'z', 'A'..'Z', '0'..'9', '_'}:
+            el.add(t[e]); inc e
+          if el.len > 0:
+            s.ptrAliases.add(name.toLowerAscii & ":" & el)
       # exported ref-object type: register as a class so receiver-typed
       # logic (varTypes "class:<t>", per-class method return keys) sees
       # shim types like TStringList; the `of Parent` spelling feeds the
@@ -710,6 +851,9 @@ proc absorbNimModule(p: var TParser, modpath: string) =
         while eol < contents.len and contents[eol] != '\n': inc eol
         scanNimExports(contents[cur ..< eol], p.syms)
         cur = eol + 1
+      for k in p.syms.ptrAliases:
+        let c = k.find(":")
+        if c > 0: p.pointerAliases[k[0 ..< c]] = k[c + 1 ..< k.len]
       break
 
 proc declDirective(p: var TParser): bool =
@@ -1312,9 +1456,132 @@ proc operandDomain(p: var TParser; a: Node): string =
   if isPointerishSpelling(ty): return "ref"
   result = ""
 
+proc recordOfType(p: TParser; ty: string): string =
+  ## the record/class spelling a Pascal type spelling denotes, following
+  ## one pointer level (`PNode` -> `RNode`); "" for a non-record type
+  result = ""
+  if ty.len == 0: return
+  if ty.startsWith("record:"):
+    return ty[7 .. ^1]
+  if ty.startsWith("class:"):
+    let cs = p.syms.classSpelling(ty[6 .. ^1])
+    return (if cs.len > 0: cs else: ty[6 .. ^1])
+  let el = p.pointerAliases.getOrDefault(ty.toLowerAscii, "")
+  if el.len > 0:
+    let cs = p.syms.classSpelling(el)
+    return (if cs.len > 0: cs else: el)
+
+proc baseOwnerSpelling(p: TParser; name: string): string =
+  ## the record/class spelling a bare base name denotes, following one
+  ## pointer level: `n: PNode` where `PNode = ^RNode` resolves to
+  ## `RNode`. Params record a pointer alias as `ptr:PNode` in varTypes,
+  ## var-section locals as the raw alias in varRawTypes; a plain
+  ## record/class base reads straight from varTypes. "" when unknown.
+  let k = name.toLowerAscii
+  # a with-qualifier: for a RECORD with the qualifier is the original
+  # expression TEXT ('Path[h]') stored as an ident, so resolve it to the
+  # scope's class before anything else
+  for i in 0 ..< p.withDepth:
+    if p.withTemps[i].toLowerAscii == k and p.withClasses[i].len > 0:
+      return p.withClasses[i]
+  let vt = p.varTypes.getOrDefault(k, "")
+  if vt.startsWith("record:"):
+    return vt[7 .. ^1]
+  if vt.startsWith("class:"):
+    return p.syms.classSpelling(vt[6 .. ^1])
+  var alias = ""
+  if vt.startsWith("ptr:"):
+    alias = vt[4 .. ^1]
+  else:
+    alias = p.varRawTypes.getOrDefault(k, "")
+    if alias.len == 0:
+      alias = p.paramTypes.getOrDefault(k, "")
+  if alias.len == 0 and p.withDepth > 0:
+    # a bare FIELD of the active with-scope ('with Path[h] do'
+    # 'Nd.Items[x]'): its type is registered against the scope class
+    var i = p.withDepth - 1
+    while i >= 0 and alias.len == 0:
+      alias = p.fieldTypes.getOrDefault(
+          p.withClasses[i].toLowerAscii & "." & k, "")
+      dec i
+  result = p.recordOfType(alias)
+
+proc chainRecordSpelling(p: TParser; e: Node): string =
+  ## record/class spelling of an expression used as the OWNER of a field
+  ## access, following one pointer level. Handles a bare name, a
+  ## qualified chain ('Path[h].Nd') and an indexed element ('Path[h]').
+  ## The with-qualifier runs while the primary is parsed, so by the time
+  ## the index builder sees 'Path[h].Nd.Items' the owner is already a
+  ## NESTED dot expression, not a bare name.
+  result = ""
+  case e.kind
+  of nkIdent:
+    result = p.baseOwnerSpelling(e.strVal)
+  of nkDotExpr:
+    if e.len == 2 and e[1].kind == nkIdent:
+      let own = p.chainRecordSpelling(e[0])
+      if own.len > 0:
+        result = p.recordOfType(p.fieldTypes.getOrDefault(
+            own.toLowerAscii & "." & e[1].strVal.toLowerAscii, ""))
+  of nkIndexExpr, nkBracket:
+    if e.len >= 2:
+      if e[0].kind == nkIdent:
+        result = p.arrayVarElems.getOrDefault(
+            e[0].strVal.toLowerAscii, "")
+      if result.len == 0 and e[0].kind == nkDotExpr and e[0].len == 2 and
+          e[0][1].kind == nkIdent:
+        let own = p.chainRecordSpelling(e[0][0])
+        if own.len > 0:
+          result = p.classFieldTypes.getOrDefault(
+              own.toLowerAscii & "." & e[0][1].strVal.toLowerAscii, "")
+  of nkDeref:
+    if e.len == 1:
+      result = p.chainRecordSpelling(e[0])
+  else:
+    discard
+
+proc ptrToArraySpelling(p: TParser; e: Node): string =
+  ## Pascal type spelling of `e` when it is known, "" otherwise; used to
+  ## recognise a pointer-to-array base under `[]`.
+  result = ""
+  if e.kind == nkIdent:
+    let k = e.strVal.toLowerAscii
+    result = p.varRawTypes.getOrDefault(k, "")
+    if result.len == 0:
+      result = p.paramTypes.getOrDefault(k, "")
+    if result.len == 0:
+      result = p.varTypes.getOrDefault(k, "")
+  elif e.kind == nkDotExpr and e.len == 2 and e[1].kind == nkIdent:
+    # `r.Items`: field types are keyed by the OWNER's spelling, so the
+    # owner (a bare name, a qualified chain or an index) is resolved
+    # first. The owner may be a pointer alias, which chainRecordSpelling
+    # follows one level.
+    let cls = p.chainRecordSpelling(e[0])
+    if cls.len > 0:
+      result = p.fieldTypes.getOrDefault(
+          cls.toLowerAscii & "." & e[1].strVal.toLowerAscii, "")
+
 proc bracketExprList(p: var TParser, first: Node): Node =
-  result = newNode(nkIndexExpr, first.info)
-  result.add(first)
+  ## `a[i]`, `a[i, j]`, ... A MULTI-index access is built as nested
+  ## one-index nodes (`a[i][j]`): nimony has no multi-index `[]`, and
+  ## `a[i, j]` there resolves the head once and then fails to match the
+  ## second argument. The generic-instantiation `[...]` spelling comes
+  ## from the `<...>` path, so it is unaffected.
+  ##
+  ## A POINTER-to-array base needs an explicit deref: Pascal (like
+  ## Nim 1) auto-derefs `n.Items[x]`, but nimony rejects indexing a
+  ## `ptr array` ("ptr array[..] does not match constraint T"), so emit
+  ## `n.Items[][x]`. `pointerAliases` knows the `P = ^T` aliases and
+  ## the base's recorded spelling identifies one.
+  var head = first
+  if head.kind != nkDeref:
+    var sp = p.ptrToArraySpelling(head).toLowerAscii
+    if sp.startsWith("ptr:"): sp = sp[4 .. ^1]
+    if sp.len > 0 and p.pointerAliases.hasKey(sp):
+      let d = newNode(nkDeref, head.info)
+      d.add(head)
+      head = d
+  var idxs: seq[Node] = @[]
   getTokP(p)
   skipCom(p)
   while true:
@@ -1329,10 +1596,16 @@ proc bracketExprList(p: var TParser, first: Node): Node =
     if p.tok.xkind == pxComma:
       getTokP(p)
       skipCom(p)
-    result.add(a)
+    idxs.add(a)
   # Delphi strings are 1-based; nimony's `string` is 0-based
-  if result.len == 2 and stringBaseType(p, result[0]) == "string":
-    result[1] = decIndex(p, result[1])
+  if idxs.len == 1 and stringBaseType(p, head) == "string":
+    idxs[0] = decIndex(p, idxs[0])
+  result = head
+  for x in idxs:
+    let ie = newNode(nkIndexExpr, head.info)
+    ie.add(result)
+    ie.add(x)
+    result = ie
 
 proc identOrLiteral(p: var TParser): Node =
   while p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}:
@@ -1606,6 +1879,30 @@ proc primary(p: var TParser): Node =
             if narrow.len > 0:
               let wc = newNode(nkCall, result[ai].info)
               wc.add(newIdentNode(narrow, result[ai].info))
+              wc.add(result[ai])
+              result[ai] = wc
+          elif result[ai].kind == nkCall and result[ai].len == 2 and
+              result[ai][0].kind == nkIdent and
+              result[ai][0].strVal.toLowerAscii == "sizeof" and
+              ai - 1 < argTypes.len:
+            # Pascal SizeOf is an Integer (int32) that converts implicitly
+            # at the call boundary; nimony's sizeof types int64, so a
+            # fixed-width declared param needs the conversion here
+            let st = argTypes[ai - 1].toLowerAscii
+            var width = ""
+            case st
+            of "int8", "shortint": width = "int8"
+            of "uint8", "byte": width = "uint8"
+            of "int16", "smallint": width = "int16"
+            of "uint16", "word": width = "uint16"
+            of "int32", "integer", "longint": width = "int32"
+            of "uint32", "cardinal", "longword", "dword": width = "uint32"
+            of "int64": width = "int64"
+            of "uint64": width = "uint64"
+            else: discard
+            if width.len > 0:
+              let wc = newNode(nkCall, result[ai].info)
+              wc.add(newIdentNode(width, result[ai].info))
               wc.add(result[ai])
               result[ai] = wc
       if result.len > 1 and a.kind == nkIdent:
@@ -2155,14 +2452,15 @@ proc parseParamList*(p: var TParser): Node =
     p.inParamList = true
     while p.tok.xkind != pxParRi and p.tok.xkind != pxEof:
       var isVar = false
+      var isOut = false
       if p.tok.xkind == pxVar:
         isVar = true
         getTokP(p)
       elif p.tok.xkind == pxOut:
-        # Delphi `out` params: v1 lowers them like `var` - the callee
-        # sees the caller's variable; initialization semantics
-        # (callee must not read before writing) are not modeled
+        # Delphi `out` params: nimony's `out` also sees the caller's
+        # variable but needs no init proof at the call site
         isVar = true
+        isOut = true
         getTokP(p)
       elif p.tok.xkind == pxConst:
         # treat `const` params as plain params; the mutability distinction
@@ -2223,10 +2521,13 @@ proc parseParamList*(p: var TParser): Node =
             let rtl = rtlSpelling(pty)
             if rtl.len > 0:
               p.varTypes[n.toLowerAscii] = rtl
+            let rr = p.procTyReturns.getOrDefault(pty)
+            if rr.len > 0: p.procVarReturns[n.toLowerAscii] = rr
         let d = newNode(nkIdentDefs, p.tok.info)
         d.add(newIdentNode(n, p.tok.info))
         if isVar:
           let vt = newNode(nkVarTy, p.tok.info)
+          vt.isOutParam = isOut
           if lastType.kind != nkEmpty: vt.add(lastType)
           else:
             # Delphi `var X;` (untyped buffer param): nimony rejects
@@ -2522,7 +2823,7 @@ proc condPickIdent(p: var TParser): string =
         "frontend cannot evaluate the condition")
     return
   var lineStart = 0
-  let text = declTextToEol(p.lex, lineStart)
+  let text = declTextToEol(p.lex[], lineStart)
   var skipLen = 0
   let nm = pickNameFromText(text, p, skipLen)
   if nm.len == 0:
@@ -2534,8 +2835,8 @@ proc condPickIdent(p: var TParser): string =
   # matters: a position inside the following `{$...}` would make `getTok`
   # read that group as a directive opener instead of the `:`.
   let target = lineStart + skipLen
-  p.lex.rewindTo(target)
-  p.lex.getTok(p.tok)
+  p.lex[].rewindTo(target)
+  p.lex[].getTok(p.tok)
   skipCom(p)
   result = nm
 
@@ -2630,6 +2931,12 @@ proc parseVarSection*(p: var TParser): Node =
       for i in 0 ..< defs.len - 2:
         if defs[i].kind == nkIdent:
           p.varTypes[defs[i].strVal.toLowerAscii] = "set"
+      if tyNode.len > 0:
+        let et = setElemTypeText(p, tyNode[0])
+        if et.len > 0:
+          for i in 0 ..< defs.len - 2:
+            if defs[i].kind == nkIdent:
+              p.setElemTexts[defs[i].strVal.toLowerAscii] = et
     elif tyNode.kind == nkIdent and
         tyNode.strVal.toLowerAscii in ["boolean", "bool"]:
       for i in 0 ..< defs.len - 2:
@@ -2669,9 +2976,22 @@ proc parseVarSection*(p: var TParser): Node =
             p.methodPtrVars[defs[i].strVal.toLowerAscii] =
               p.methodPtrTypes.getOrDefault(tyKey)
       if p.procTyTypes.hasKey(tyKey):
+        let rr = p.procTyReturns.getOrDefault(tyKey)
         for i in 0 ..< defs.len - 2:
           if defs[i].kind == nkIdent:
             p.procVarTypes[defs[i].strVal.toLowerAscii] = true
+            p.varRawTypes[defs[i].strVal.toLowerAscii] = tyNode.strVal
+            if rr.len > 0:
+              p.procVarReturns[defs[i].strVal.toLowerAscii] = rr
+      # a NAMED array alias (`var r: TArr` where `TArr = array[..] of
+      # TRec`): the element spelling has to reach `arrayVarElems` too,
+      # or `with r[i] do` cannot resolve the record and emits bare
+      # field names ("undeclared identifier: Node/Value/Key")
+      let aliasEl = p.arrayAliases.getOrDefault(tyKey, "")
+      if aliasEl.len > 0:
+        for i in 0 ..< defs.len - 2:
+          if defs[i].kind == nkIdent:
+            p.arrayVarElems[defs[i].strVal.toLowerAscii] = aliasEl
       # a record is registered in the class registry too (so its
       # members resolve), but it is a VALUE type: test it FIRST, or a
       # record variable is filed as "class:" and `with` lowering then
@@ -2681,6 +3001,15 @@ proc parseVarSection*(p: var TParser): Node =
           if defs[i].kind == nkIdent:
             # record vars carry their spelling for `with` lowering
             p.varTypes[defs[i].strVal.toLowerAscii] = "record:" & tyNode.strVal
+      elif p.pointerAliases.hasKey(tyKey):
+        # a typed-pointer local: the assignment site needs the pointee
+        # alias to insert the Pointer->ptr conversion (`it2 = MemAlloc(..)`).
+        # varRawTypes keeps the bare alias the deref pass (bracketExprList)
+        # keys on, so `it2[x]` still lowers to the explicit `it2[][x]`.
+        for i in 0 ..< defs.len - 2:
+          if defs[i].kind == nkIdent:
+            p.varTypes[defs[i].strVal.toLowerAscii] = "ptr:" & tyNode.strVal
+            p.varRawTypes[defs[i].strVal.toLowerAscii] = tyKey
       elif p.syms.isClass(tyKey):
         for i in 0 ..< defs.len - 2:
           if defs[i].kind == nkIdent:
@@ -2732,6 +3061,16 @@ proc parseConstSection*(p: var TParser): Node =
     p.eat(pxEquals)
     skipCom(p)
     def.add(parseExpr(p))
+    # an untyped integer const that fits in int32 is an Integer in Pascal
+    # (context-adaptive). nimony types a bare literal as int64 (its int),
+    # which does not coerce to an int32 field/local on assignment.
+    if def.len > 2 and def[1].kind == nkEmpty and
+        def[2].kind in {nkIntLit, nkInt64Lit} and
+        def[2].intVal >= -2147483648 and def[2].intVal <= 2147483647:
+      let wc = newNode(nkCall, def[2].info)
+      wc.add(newIdentNode("int32", def[2].info))
+      wc.add(def[2])
+      def[2] = wc
     # A Pascal typed RECORD constant `(Key: ''; Link: nil)` parses as an
     # `nkPar` of `kv` pairs, which is not a record constructor in any
     # target: the NIF shape is `(oconstr TY (kv K V) ...)`. Real code
@@ -2767,6 +3106,34 @@ proc parseConstSection*(p: var TParser): Node =
     p.opt(pxSemiColon)
     skipCom(p)
 
+proc elemAliasSpelling(p: var TParser; ty: Node): string =
+  ## element spelling of an array-shaped declaration, following ONE
+  ## pointer level: `Items: PItems` where `PItems = ^TItemArray` and
+  ## `TItemArray = array[..] of TItem` yields `TItem`. The
+  ## `with X.Field[i] do` resolver looks the member up through
+  ## `classFieldTypes`, so without this the tplbtree node layout
+  ## (`with n.Items[x] do`) emitted the body's bare field names
+  ## ("undeclared identifier: Node/Value/Key").
+  result = ""
+  if ty.kind == nkIdent:
+    result = p.syms.classSpelling(ty.strVal)
+    if result.len == 0:
+      result = p.arrayAliases.getOrDefault(ty.strVal.toLowerAscii, "")
+    if result.len == 0:
+      # a pointer alias: deref once, then try the array alias
+      let deref = p.pointerAliases.getOrDefault(ty.strVal.toLowerAscii, "")
+      if deref.len > 0:
+        result = p.syms.classSpelling(deref)
+        if result.len == 0:
+          result = p.arrayAliases.getOrDefault(deref.toLowerAscii, "")
+  elif ty.kind == nkPtrTy and ty.len > 0:
+    result = p.elemAliasSpelling(ty[ty.len - 1])
+  elif ty.kind in {nkArrayTy, nkSeqTy} and ty.len > 0 and
+      ty[ty.len - 1].kind == nkIdent:
+    let el = ty[ty.len - 1].strVal
+    if p.syms.isClass(el.toLowerAscii) or p.recordTypes.hasKey(el.toLowerAscii):
+      result = el
+
 proc parseInterfaceType(p: var TParser, definition: Node): Node =
   ## `IFoo = interface [(IBase)] ... end` - a Delphi interface lowered
   ## to an abstract ref class whose methods are nimony `method`s with
@@ -2781,8 +3148,7 @@ proc parseInterfaceType(p: var TParser, definition: Node): Node =
     getTokP(p)
     skipCom(p)
     parentTy = parseTypeDesc(p, emptyNode(p.tok.info))
-    if parentTy.kind == nkIdent:
-      parent = parentTy.strVal
+    parent = typeLeafName(parentTy)
     p.eat(pxParRi)
     skipCom(p)
   let defName = definition.strVal
@@ -2998,6 +3364,8 @@ proc parseTypeDesc*(p: var TParser, definition: Node): Node =
               if fcls.len == 0:
                 fcls = p.arrayAliases.getOrDefault(
                     defs[1].strVal.toLowerAscii, "")
+              if fcls.len == 0:
+                fcls = p.elemAliasSpelling(defs[1])
             if fcls.len == 0 and defs[1].kind in {nkArrayTy, nkSeqTy} and
                 defs[1].len > 0 and defs[1][defs[1].len - 1].kind == nkIdent:
               fcls = p.syms.classSpelling(defs[1][defs[1].len - 1].strVal)
@@ -3013,12 +3381,34 @@ proc parseTypeDesc*(p: var TParser, definition: Node): Node =
             if defs[i].kind == nkIdent:
               p.fieldTypes[definition.strVal.toLowerAscii & "." &
                            defs[i].strVal.toLowerAscii] = mty
+        elif definition.kind == nkIdent and defs[1].kind == nkIdent and
+            p.pointerAliases.hasKey(defs[1].strVal.toLowerAscii):
+          # pointer-to-array field: the index site needs the explicit
+          # deref (`Items: PItems` -> `Items[][x]`)
+          for i in 0 ..< defs.len - 2:
+            if defs[i].kind == nkIdent:
+              p.fieldTypes[definition.strVal.toLowerAscii & "." &
+                           defs[i].strVal.toLowerAscii] = defs[1].strVal
+        elif definition.kind == nkIdent and
+            defs[defs.len - 2].kind == nkIdent and
+            (p.procTyTypes.hasKey(defs[defs.len - 2].strVal.toLowerAscii) or
+             p.methodPtrTypes.hasKey(defs[defs.len - 2].strVal.toLowerAscii)):
+          # a proc-typed record field (`call: TVisitLeaveCall`): remember
+          # the spelling so the TMethod(...).Code assignment can cast
+          for i in 0 ..< defs.len - 2:
+            if defs[i].kind == nkIdent:
+              p.fieldTypes[definition.strVal.toLowerAscii & "." &
+                           defs[i].strVal.toLowerAscii] =
+                defs[defs.len - 2].strVal
         # array-of-class/record fields: element type for with-index
         if definition.kind == nkIdent:
           var fel = p.syms.classSpelling(defs[1].strVal)
           if fel.len == 0 and defs[1].kind == nkIdent:
             fel = p.arrayAliases.getOrDefault(
                 defs[1].strVal.toLowerAscii, "")
+          if fel.len == 0 and defs[1].kind in
+              {nkIdent, nkPtrTy, nkArrayTy, nkSeqTy}:
+            fel = p.elemAliasSpelling(defs[1])
           if fel.len == 0 and defs[1].kind in {nkArrayTy, nkSeqTy}:
             if defs[1][defs[1].len - 1].kind == nkIdent:
               fel = defs[1][defs[1].len - 1].strVal
@@ -3147,17 +3537,18 @@ proc parseTypeDesc*(p: var TParser, definition: Node): Node =
       if dims.len == 1:
         result.add(idx)
       else:
-        # keep dims[0] on the outer node; the remaining dims nest
-        # (the innermost link receives the element type later)
+        # `array[a..b, c..d] of T` -> `array[.] of array[.] of T`: each
+        # dimension contributes exactly one link, the first on `result`.
+        # The old loop never added dims[0], so the second dimension
+        # landed in the INDEX slot and the emitted type was
+        # `array[<array>, T]` - nifler's "expected: ']', but got: ...".
+        result.add(dims[0])
         var prev: Node = result
-        for i in countdown(dims.len - 1, 1):
+        for i in 1 ..< dims.len:
           var outer = newNode(nkArrayTy, p.tok.info)
           outer.add(dims[i])
           outer.add(emptyNode(p.tok.info))
-          if i == dims.len - 1:
-            result.add(outer)
-          else:
-            prev[1] = outer
+          prev.add(outer)
           prev = outer
     elif p.inParamList:
       if p.peekTok.xkind == pxConst:
@@ -3174,9 +3565,15 @@ proc parseTypeDesc*(p: var TParser, definition: Node): Node =
     p.eat(pxOf)
     skipCom(p)
     let elemTy = parseTypeDesc(p, emptyNode(p.tok.info))
-    if result.len == 2 and result[1].kind == nkArrayTy and
-        result[1].len == 2 and result[1][1].kind == nkEmpty:
-      result[1][1] = elemTy
+    if result.len == 2 and result[1].kind == nkArrayTy:
+      # a multi-dimension chain built just above: walk to the innermost
+      # link (only those links carry an nkArrayTy in the element slot
+      # while the element type is still missing) and attach it there
+      var link = result
+      while link.len == 2 and link[1].kind == nkArrayTy and
+          link[1].len == 2:
+        link = link[1]
+      link[1] = elemTy
     else:
       result.add(elemTy)
   of pxSet:
@@ -3279,11 +3676,20 @@ proc parseRecordBody(p: var TParser, result: Node, definition: Node) =
             if mty.len > 0:
               p.fieldTypes[p.selfClass.toLowerAscii & "." &
                            defs[i].strVal.toLowerAscii] = mty
+            elif defs[1].kind == nkIdent and
+                p.pointerAliases.hasKey(defs[1].strVal.toLowerAscii):
+              # a pointer-to-array field: record the ALIAS spelling so
+              # the index site can tell it needs an explicit deref
+              # (`n.Items[][x]` - nimony cannot index a `ptr array`)
+              p.fieldTypes[p.selfClass.toLowerAscii & "." &
+                           defs[i].strVal.toLowerAscii] = defs[1].strVal
             var fcls = p.syms.classSpelling(defs[1].strVal)
             if fcls.len == 0 and defs[1].kind == nkIdent:
               # array-alias field: `FBuckets: TBucketArray` -> element
               fcls = p.arrayAliases.getOrDefault(defs[1].strVal.toLowerAscii, "")
-            if fcls.len == 0 and defs[1].kind in {nkArrayTy, nkSeqTy}:
+            if fcls.len == 0 and defs[1].kind in
+                {nkIdent, nkPtrTy, nkArrayTy, nkSeqTy}:
+              fcls = p.elemAliasSpelling(defs[1])
               # array-of-class/record field: `with Buckets[i] do`
               # resolves to the ELEMENT type (the index case unwraps
               # the array)
@@ -3502,16 +3908,16 @@ proc parseRecordOrObject*(p: var TParser, kind: NodeKind,
     getTokP(p)
     skipCom(p)
     let parentTy = parseTypeDesc(p, emptyNode(p.tok.info))
-    if parentTy.kind == nkIdent:
-      parent = parentTy.strVal
+    parent = typeLeafName(parentTy)
     # Delphi implements list: (Parent, IIntf1, IInt2)
     var interfaces: seq[string] = @[]
     while p.tok.xkind == pxComma:
       getTokP(p)
       skipCom(p)
       let itfTy = parseTypeDesc(p, emptyNode(p.tok.info))
-      if itfTy.kind == nkIdent:
-        interfaces.add(itfTy.strVal)
+      let itfName = typeLeafName(itfTy)
+      if itfName.len > 0:
+        interfaces.add(itfName)
     let ofInh = newNode(nkOfInherit, parentTy.info)
     if interfaces.len > 0:
       # v1: the implements list is plumbing - the class body declares
@@ -3721,13 +4127,16 @@ proc methodPtrRecord(p: var TParser; nameNode, procTy: Node): Node =
   ## `T = object evProc: proc(self: RootRef; ...); evObj: RootRef`
   let params = procTy[0]
   p.methodPtrTypes[nameNode.strVal.toLowerAscii] = params
+  p.recordTypes[nameNode.strVal.toLowerAscii] = true
+  p.fieldTypes[nameNode.strVal.toLowerAscii & ".evproc"] = "proc:ev"
+  p.fieldTypes[nameNode.strVal.toLowerAscii & ".evobj"] = "pointer"
   let info = nameNode.info
   var recList = newNode(nkRecList, info)
   var fp = newNode(nkFormalParams, info)
-  fp.add(emptyNode(info))            # return slot
+  fp.add(params[0])                  # return type (function method-ptrs)
   var sd = newNode(nkIdentDefs, info)
   sd.add(newIdentNode("self", info))
-  sd.add(newIdentNode("RootRef", info))
+  sd.add(newIdentNode("pointer", info))
   sd.add(emptyNode(info))
   fp.add(sd)
   for i in 1 ..< params.len:
@@ -3742,7 +4151,7 @@ proc methodPtrRecord(p: var TParser; nameNode, procTy: Node): Node =
   recList.add(fd)
   var od = newNode(nkIdentDefs, info)
   od.add(newIdentNode("evObj", info))
-  od.add(newIdentNode("RootRef", info))
+  od.add(newIdentNode("pointer", info))
   od.add(emptyNode(info))
   recList.add(od)
   result = newNode(nkObjectTy, info)
@@ -3760,10 +4169,10 @@ proc methodPtrThunk(p: var TParser; cls, handler: string; params: Node;
   def.add(newIdentNode(result, info))
   def.add(emptyNode(info))           # generic params
   var fp = newNode(nkFormalParams, info)
-  fp.add(emptyNode(info))            # return slot
+  fp.add(params[0])                  # return type (function method-ptrs)
   var sd = newNode(nkIdentDefs, info)
   sd.add(newIdentNode("self", info))
-  sd.add(newIdentNode("RootRef", info))
+  sd.add(newIdentNode("pointer", info))
   sd.add(emptyNode(info))
   fp.add(sd)
   for i in 1 ..< params.len:
@@ -3782,7 +4191,13 @@ proc methodPtrThunk(p: var TParser; cls, handler: string; params: Node;
     if params[i].kind == nkIdentDefs:
       call.add(newIdentNode(params[i][0].strVal, info))
   var body = newNode(nkStmtList, info)
-  body.add(call)
+  if params.len > 0 and params[0].kind != nkEmpty:
+    var ra = newNode(nkAsgn, info)
+    ra.add(newIdentNode("result", info))
+    ra.add(call)
+    body.add(ra)
+  else:
+    body.add(call)
   def.add(body)
   p.module.add(def)
 
@@ -3841,7 +4256,7 @@ proc rewriteMethodPtrAsgn(p: var TParser; a, b: Node; info: TLineInfo): Node =
         procAsgn.add(newIdentNode(tname, info))
         objAsgn = newNode(nkAsgn, info)
         objAsgn.add(newDotP(a, "evObj"))
-        objAsgn.add(b[0])
+        objAsgn.add(hardCastNode("pointer", b[0]))
   elif b.kind == nkIdent:
     # bare `Handler` inside a method: bind `self`
     if p.selfClass.len > 0:
@@ -3853,7 +4268,7 @@ proc rewriteMethodPtrAsgn(p: var TParser; a, b: Node; info: TLineInfo): Node =
         procAsgn.add(newIdentNode(tname, info))
         objAsgn = newNode(nkAsgn, info)
         objAsgn.add(newDotP(a, "evObj"))
-        objAsgn.add(newIdentNode("self", info))
+        objAsgn.add(hardCastNode("pointer", newIdentNode("self", info)))
   if procAsgn.kind != nkEmpty:
     result = newNode(nkStmtList, info)
     result.add(procAsgn)
@@ -3872,6 +4287,18 @@ proc rewriteMethodPtrCall(p: var TParser; n: Node): Node =
   for i in 1 ..< n.len:
     call.add(n[i])
   return call
+
+proc lowerTMethodField(p: var TParser, n: Node): Node =
+  ## `TMethod(x).Code`/`.Data` -> the method-pointer's evProc/evObj
+  result = n
+  if n.kind == nkDotExpr and n.len == 2 and n[1].kind == nkIdent:
+    let f = n[1].strVal.toLowerAscii
+    if f in ["code", "data"]:
+      var b = n[0]
+      while b.kind == nkPar and b.len >= 1: b = b[0]
+      if b.kind == nkCall and b.len == 2 and b[0].kind == nkIdent and
+          b[0].strVal.toLowerAscii == "tmethod":
+        result = newDotP(b[1], if f == "code": "evProc" else: "evObj")
 
 proc rewriteMethodPtrNilCmp(p: var TParser; n: Node): Node =
   ## `ev = nil` / `ev <> nil` -> compare the evProc field
@@ -3941,6 +4368,13 @@ proc parseTypeDef*(p: var TParser): Node =
     elif result.len == 3 and result[2].kind == nkProcTy:
       # plain proc-type alias: Assigned(x) lowers to `x != nil`
       p.procTyTypes[name.toLowerAscii] = true
+      if result[2].len > 0 and result[2][0].len > 0:
+        p.procTyParams[name.toLowerAscii] = result[2][0]
+      if result[2].len > 0 and result[2][0].len > 0 and
+          result[2][0][0].kind != nkEmpty:
+        let rn = result[2][0][0]
+        let rs = if rn.kind == nkIdent: rn.strVal else: p.mappedTypeName(rn)
+        if rs.len > 0: p.procTyReturns[name.toLowerAscii] = rs
   else:
     result.add(emptyNode(nameInfo))
   if p.tok.xkind == pxSemiColon:
@@ -4022,6 +4456,12 @@ proc parseTypeDefList(p: var TParser): Node =
       if p.syms.isClass(el) or p.recordTypes.hasKey(el):
         p.arrayAliases[def[0].strVal.toLowerAscii] =
           def[2][def[2].len - 1].strVal
+    # a simple `TAlias = TTarget` alias: remember the target so the
+    # pointer/ref classification resolves through it (TValueType = TObject,
+    # the RootRef alias)
+    if def.len == 3 and def[0].kind == nkIdent and def[2].kind == nkIdent:
+      p.typeAliasTargets[def[0].strVal.toLowerAscii] =
+        def[2].strVal.toLowerAscii
     result.add(def)
 
 proc parseTypeSection*(p: var TParser): Node =
@@ -4136,6 +4576,61 @@ proc skipAsmBlock(p: var TParser) =
   p.opt(pxSemiColon)
   skipCom(p)
 
+proc scanParamAssigned(n: Node; names: Table[string, bool];
+                       assigned: var Table[string, bool]) =
+  ## direct reassignment / Inc / Dec of a value parameter in a body
+  if n.kind == nkAsgn and n.len == 2 and n[0].kind == nkIdent:
+    let k = n[0].strVal.toLowerAscii
+    if names.hasKey(k): assigned[k] = true
+  if n.kind == nkCall and n.len >= 2 and n[0].kind == nkIdent and
+      n[0].strVal.toLowerAscii in ["inc", "dec"] and n[1].kind == nkIdent:
+    let k = n[1].strVal.toLowerAscii
+    if names.hasKey(k): assigned[k] = true
+  for c in n.sons: scanParamAssigned(c, names, assigned)
+
+proc lowerMutableValueParams(p: var TParser; params, body: Node) =
+  ## Pascal value parameters are mutable; nimony value parameters are
+  ## not. For each value param directly reassigned in the body, rename
+  ## the formal and prepend `var <name> = <fresh>`, so the body keeps
+  ## its own mutable local and call sites stay pass-by-value.
+  if body.kind != nkStmtList: return
+  var names = initTable[string, bool]()
+  var tyOf = initTable[string, Node]()
+  var identOf = initTable[string, Node]()
+  var order: seq[string] = @[]
+  for i in 1 ..< params.len:
+    let d = params[i]
+    if d.kind != nkIdentDefs: continue
+    let ty = d[d.len - 2]
+    if ty.kind == nkVarTy: continue     # var/out: already mutable
+    for j in 0 ..< d.len - 2:
+      if d[j].kind == nkIdent:
+        let k = d[j].strVal.toLowerAscii
+        if not names.hasKey(k):
+          names[k] = true
+          order.add(k)
+        tyOf[k] = ty
+        identOf[k] = d[j]
+  if names.len == 0: return
+  var assigned = initTable[string, bool]()
+  scanParamAssigned(body, names, assigned)
+  if assigned.len == 0: return
+  var vs = newNode(nkVarSection, body.info)
+  for k in order:
+    if not assigned.hasKey(k): continue
+    let idn = identOf.getOrDefault(k)
+    let nm = idn.strVal
+    let fresh = "pasV_" & nm
+    idn.strVal = fresh
+    var d = newNode(nkIdentDefs, body.info)
+    d.add(newIdentNode(nm, body.info))
+    d.add(tyOf.getOrDefault(k))
+    d.add(newIdentNode(fresh, body.info))
+    vs.add(d)
+  var ns: seq[Node] = @[]
+  ns.add(vs)
+  for c in body.sons: ns.add(c)
+  body.sons = ns
 proc parseRoutineBody(p: var TParser, result: Node) =
   ## local decls + begin/end of a routine with a body
   var stmts = newNodeP(nkStmtList, p)
@@ -4149,7 +4644,20 @@ proc parseRoutineBody(p: var TParser, result: Node) =
       # whole `var` block or single locals this way)
       if declDirective(p):
         continue
-      parError(p, "begin expected in routine body, got " & $p.tok)
+      if p.tok.ident.toLowerAscii == "if":
+        # `{$if <expr>}` guarding local declarations (`{$IF not
+        # declared(_maxspan)} const _maxspan = 7; {$IFEND}`, every
+        # tplQSort*.inc): answerable only by a compiler, so forward it
+        # as a `when` whose arms hold the local decls. The arms are
+        # parsed as statements, and a `const`/`var`/`type` section in
+        # statement position yields exactly the node the emitter wants.
+        stmts.add(parseIfDir(p, succ(p.tok.xkind)))
+        if p.tok.xkind == pxSemiColon:
+          getTokP(p)
+          skipCom(p)
+        continue
+      # a closer of an enclosing group: its owner must see it
+      break
     case p.tok.xkind
     of pxVar, pxThreadvar:
       stmts.add(parseVarSection(p))
@@ -4464,6 +4972,8 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
       if rtl.len > 0: p.varTypes["result"] = rtl
       elif p.pointerAliases.hasKey(retKey):
         p.varTypes["result"] = "ptr:" & params[0].strVal
+      elif ptrKindOf(p, params[0].strVal).startsWith("ref:"):
+        p.varTypes["result"] = "class:" & params[0].strVal
       else: p.varTypes["result"] = "unknown" 
   # Delphi conversion/unary class operators (Implicit/Explicit/Inc/
   # Dec) have no nimony operator symbol: lower to uniquely named
@@ -4527,6 +5037,10 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
             ":" & renderInfo(nameInfo),
             "method '" & name & "' hides virtual method of ancestor " &
             "type - add reintroduce to acknowledge")
+  if oldOuterName.len > 0:
+    # a nested standalone proc captures the enclosing routine's locals;
+    # nimony requires an explicit `.closure` pragma for that
+    pragmas.add(newIdentNode("closure", nameInfo))
   result.add(pragmas)
   result.add(emptyNode(nameInfo))  # exceptions (unused)
   # register the parameter count (the paren-less call rule consults
@@ -4603,6 +5117,7 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
       p.syms.addMemberParams(p.selfClass, name, ptyParts.join(";"))
     # param types for 1-based string indexing inside the body
     let savedParamTypes = p.paramTypes
+    let savedMethodPtrVars = p.methodPtrVars
     p.paramTypes = initTable[string, string]()
     for i in 1 ..< params.len:
       let d = params[i]
@@ -4634,11 +5149,11 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
             for j in 0 ..< d.len - 2:
               if d[j].kind == nkIdent:
                 p.arrayVarElems[d[j].strVal.toLowerAscii] = el
-          if p.methodPtrTypes.hasKey(pty.strVal.toLowerAscii):
-            for j in 0 ..< d.len - 2:
-              if d[j].kind == nkIdent:
-                p.methodPtrVars[d[j].strVal.toLowerAscii] =
-                  p.methodPtrTypes.getOrDefault(pty.strVal.toLowerAscii)
+        if p.methodPtrTypes.hasKey(pty.strVal.toLowerAscii):
+          for j in 0 ..< d.len - 2:
+            if d[j].kind == nkIdent:
+              p.methodPtrVars[d[j].strVal.toLowerAscii] =
+                p.methodPtrTypes.getOrDefault(pty.strVal.toLowerAscii)
     # remember the param names for bare `inherited;` forwarding
     p.outerParams = @[]
     for i in 1 ..< params.len:
@@ -4648,11 +5163,15 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
           if d[j].kind == nkIdent:
             p.outerParams.add(d[j].strVal)
     parseRoutineBody(p, result)
+    lowerMutableValueParams(p, params, result[result.len - 1])
     # class-reference `=`/`<>` rewrite to sameRef while this routine's
     # param/local maps are still live (nimony has no ref equality)
     if result.len > 0:
       rewriteClassEq(p, result[result.len - 1])
       rewritePtrAddr(p, result[result.len - 1])
+      result[result.len - 1] = coercePtrCasts(p, result[result.len - 1])
+      coercePtrAsgns(p, result[result.len - 1])
+      coercePtrArgs(p, result[result.len - 1])
     if kind == pxConstructor and isMethod:
       # constructors return self so `X := T.create(...)` works
       let pre = newNode(nkAsgn, nameInfo)
@@ -4669,6 +5188,7 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
     p.outerResultTy = oldOuterResultTy
     p.outerParams = savedOuterParams
     p.paramTypes = savedParamTypes
+    p.methodPtrVars = savedMethodPtrVars
     p.classOfProc = oldClass
   # virtual/override -> method definition
   if isVirtual and isMethod:
@@ -4931,7 +5451,43 @@ proc parseInherited*(p: var TParser): Node =
         for i in 1 ..< a.len:
           call.add(a[i])
       else:
-        discard
+        # `inherited Row + ',' + Name` (uTest1/uTest1b): the member is
+        # one OPERAND of a larger expression, not a call. Rebinding only
+        # the leftmost leaf keeps the rest of the expression; the old
+        # code dropped everything but the member reference, silently
+        # losing every operand after it. The leaf is usually already a
+        # paren-less CALL (`Row(self)`), since parseStmt applied the
+        # zero-arg rule to the bare name.
+        # nkInfix is [op, lhs, rhs], so the leftmost operand is son 1
+        var leaf = a
+        while leaf.kind == nkInfix and leaf.len >= 3:
+          leaf = leaf[1]
+        var leafName = ""
+        if leaf.kind == nkIdent:
+          leafName = leaf.strVal.toLowerAscii
+        elif leaf.kind == nkCall and leaf.len > 0:
+          # the callee is bare (`Row`) or already self-qualified
+          # (`self.Row`) by the paren-less rule
+          leafName = typeLeafName(leaf[0]).toLowerAscii
+        if leafName == p.outerProcName.toLowerAscii:
+          if leaf.kind == nkCall:
+            # sons = [callee, (self), args...]: keep the args, swap the
+            # receiver for the parent cast and unbind the bare spelling
+            leaf[0] = newIdentNode(callee, info)
+            if leaf.len >= 2:
+              leaf[1] = declCast
+            else:
+              leaf.add(declCast)
+            leaf.noQualCallee = true
+          else:
+            leaf.strVal = ""
+            leaf.kind = nkCall
+            leaf.add(newIdentNode(callee, info))
+            leaf.add(declCast)
+            leaf.noQualCallee = true
+          call = a
+        else:
+          call.add(a)
     elif a.kind == nkIndexExpr or (a.kind == nkAsgn and a.len == 2 and
         a[0].kind == nkIndexExpr):
       # `inherited Items[Index]` / `inherited Items[Index] := v`: the
@@ -4999,6 +5555,18 @@ proc parseInherited*(p: var TParser): Node =
       else:
         result = call
 
+proc narrowCaseLabel(x: Node): Node =
+  ## Pascal case labels carry the selector's ordinal type; nimony's
+  ## `high`/`low`/`sizeof` and arithmetic type int64 and a non-literal
+  ## label will not coerce to an int32 selector. The corpus's case
+  ## selectors are Integer, so narrow non-literal labels to int32.
+  if x.kind in {nkInfix, nkPrefix, nkCall}:
+    result = newNode(nkCall, x.info)
+    result.add(newIdentNode("int32", x.info))
+    result.add(x)
+  else:
+    result = x
+
 proc parseCase*(p: var TParser): Node =
   result = newNodeP(nkCaseStmt, p)
   getTokP(p)                    # skip `case`
@@ -5042,7 +5610,13 @@ proc parseCase*(p: var TParser): Node =
           getTokP(p)
           skipCom(p)
         if p.tok.xkind in {pxCurlyDirLe, pxStarDirLe}: continue
-        b.add(rangeExpr(p))
+        var lab = rangeExpr(p)
+        if lab.kind == nkRange:
+          for ri in 0 ..< lab.len:
+            lab[ri] = narrowCaseLabel(lab[ri])
+        else:
+          lab = narrowCaseLabel(lab)
+        b.add(lab)
         p.opt(pxComma)
         skipCom(p)
       if noLabels:
@@ -5417,7 +5991,8 @@ proc mapStringBuiltins*(p: var TParser, n: Node): Node =
   # call-form casts across the pointer/object boundary
   let clsCallee = n[0].strVal.toLowerAscii
   if p.syms.isClass(clsCallee) or
-      clsCallee in ["tobject", "rootref", "tclass"]:
+      clsCallee in ["tobject", "rootref", "tclass"] or
+      ptrKindOf(p, n[0].strVal).startsWith("ref:"):
     if n.len == 2:
       var isPtrArg = false
       if n[1].kind == nkIdent:
@@ -5425,6 +6000,8 @@ proc mapStringBuiltins*(p: var TParser, n: Node): Node =
       elif n[1].kind in {nkCall, nkIndexExpr}:
         # the corpus's TObject(inherited X) family rides Pointer results
         isPtrArg = true
+      if not isPtrArg:
+        isPtrArg = ptrKindOf(p, rhsExprType(p, n[1])) == "pointer"
       if isPtrArg:
         # the pointer->object cast; RootRef must keep its exact
         # capitalization (nimsem's cast check is case sensitive)
@@ -5691,17 +6268,55 @@ proc rhsExprType(p: var TParser, n: Node): string =
     result = "int32"
   of nkIdent:
     result = p.varTypes.getOrDefault(n.strVal.toLowerAscii)
+    if result.len == 0:
+      result = p.varRawTypes.getOrDefault(n.strVal.toLowerAscii)
+    if result.len == 0 and p.selfClass.len > 0:
+      result = p.fieldTypes.getOrDefault(
+          p.selfClass.toLowerAscii & "." & n.strVal.toLowerAscii)
   of nkDotExpr:
-    if n.len == 2 and n[0].kind == nkIdent and n[1].kind == nkIdent:
-      let rv = p.varTypes.getOrDefault(n[0].strVal.toLowerAscii)
-      if rv.startsWith("record:"):
-        result = p.fieldTypes.getOrDefault(rv[7 .. ^1].toLowerAscii &
-                                           "." &
-                                           n[1].strVal.toLowerAscii)
+    if n.len == 2 and n[1].kind == nkIdent:
+      var owner = ""
+      if n[0].kind == nkIdent:
+        let rv = p.varTypes.getOrDefault(n[0].strVal.toLowerAscii)
+        if rv.startsWith("record:"): owner = rv[7 .. ^1]
+        elif rv.startsWith("class:"): owner = rv[6 .. ^1]
+        elif rv.startsWith("ptr:"):
+          owner = rv[4 .. ^1]
+          if p.pointerAliases.hasKey(owner.toLowerAscii):
+            owner = p.pointerAliases.getOrDefault(owner.toLowerAscii)
+        else:
+          owner = n[0].strVal
+          if p.pointerAliases.hasKey(owner.toLowerAscii):
+            owner = p.pointerAliases.getOrDefault(owner.toLowerAscii)
+        if owner.len == 0 and n[0].strVal.toLowerAscii == "self" and
+            p.selfClass.len > 0:
+          owner = p.selfClass
+      if owner.len == 0:
+        owner = p.withExprClass(n[0])
+      result = ""
+      if owner.len > 0:
+        result = p.fieldTypes.getOrDefault(
+            owner.toLowerAscii & "." & n[1].strVal.toLowerAscii)
+      if result.len == 0:
+        let wc = p.withExprClass(n[0])
+        if wc.len > 0:
+          result = p.fieldTypes.getOrDefault(
+              wc.toLowerAscii & "." & n[1].strVal.toLowerAscii)
+    else: result = ""
+  of nkCall:
+    if n.len > 0 and n[0].kind == nkIdent:
+      let ck = n[0].strVal.toLowerAscii
+      if p.pointerAliases.hasKey(ck):
+        result = n[0].strVal
       else:
-        result = p.fieldTypes.getOrDefault(n[0].strVal.toLowerAscii &
-                                           "." &
-                                           n[1].strVal.toLowerAscii)
+        result = p.routineReturns.getOrDefault(ck,
+            p.procVarReturns.getOrDefault(ck, ""))
+    elif n.len > 0 and n[0].kind == nkDotExpr and n[0].len == 2 and
+        n[0][1].kind == nkIdent:
+      let rk = n[0][1].strVal.toLowerAscii
+      let ck = if n[0][0].kind == nkIdent: n[0][0].strVal.toLowerAscii else: ""
+      result = p.routineReturns.getOrDefault(ck & "." & rk,
+          p.routineReturns.getOrDefault(rk, ""))
     else: result = ""
   of nkPar:
     if n.len > 0:
@@ -5728,6 +6343,212 @@ proc rhsExprType(p: var TParser, n: Node): string =
     else: result = ""
   else: result = ""
 
+proc ptrKindOf(p: TParser, t: string): string =
+  ## classify a registered type spelling into "ptr:<alias>", "pointer",
+  ## "ref:<spelling>" or "" (not a pointer/reference type)
+  if t.len == 0: return ""
+  let tl = t.toLowerAscii
+  if t.startsWith("ptr:"):
+    let alias = t[4 .. ^1]
+    if alias.toLowerAscii == "pointer": return "pointer"
+    return "ptr:" & alias
+  if tl == "pointer": return "pointer"
+  if p.pointerAliases.hasKey(tl): return "ptr:" & t
+  if t.startsWith("class:"): return "ref:" & t[6 .. ^1]
+  if p.typeAliasTargets.hasKey(tl):
+    let tk = ptrKindOf(p, p.typeAliasTargets.getOrDefault(tl))
+    if tk.startsWith("ref:"): return "ref:" & t
+    if tk.startsWith("ptr:"): return "ptr:" & t
+    if tk == "pointer": return "pointer"
+  if p.syms.isClass(tl): return "ref:" & t
+  case tl
+  of "rootref", "tobject", "tclass": return "ref:" & t
+  else: return ""
+
+proc placeExprType(p: var TParser, n: Node): string =
+  ## declared type of an assignment target / place expression
+  result = ""
+  case n.kind
+  of nkIdent:
+    let k = n.strVal.toLowerAscii
+    result = p.varTypes.getOrDefault(k)
+    if result.len == 0: result = p.paramTypes.getOrDefault(k)
+    if result.len == 0:
+      result = p.varRawTypes.getOrDefault(k)
+    if result.len == 0 and p.selfClass.len > 0:
+      result = p.fieldTypes.getOrDefault(
+          p.selfClass.toLowerAscii & "." & k)
+  of nkDotExpr:
+    if n.len == 2 and n[1].kind == nkIdent:
+      var base = ""
+      let bt = p.varTypes.getOrDefault(n[0].strVal.toLowerAscii)
+      if bt.startsWith("ptr:"): base = bt[4 .. ^1]
+      elif bt.startsWith("record:"): base = bt[7 .. ^1]
+      elif bt.startsWith("class:"): base = bt[6 .. ^1]
+      elif n[0].kind == nkIdent:
+        base = p.varRawTypes.getOrDefault(n[0].strVal.toLowerAscii)
+      if base.len == 0 and n[0].kind == nkIdent and
+          n[0].strVal.toLowerAscii == "self" and p.selfClass.len > 0:
+        base = p.selfClass
+      if base.len == 0:
+        base = p.withExprClass(n[0])
+      if p.pointerAliases.hasKey(base.toLowerAscii):
+        base = p.pointerAliases.getOrDefault(base.toLowerAscii)
+      if base.len > 0:
+        result = p.fieldTypes.getOrDefault(
+            base.toLowerAscii & "." & n[1].strVal.toLowerAscii)
+  else: result = ""
+
+proc convPtrNode(target: string; e: Node): Node =
+  ## T(pointerExpr): a Nim conversion from Pointer to a typed pointer
+  result = newNode(nkCall, e.info)
+  result.add(newIdentNode(target, e.info))
+  result.add(e)
+
+proc hardCastNode(target: string; e: Node): Node =
+  result = newNode(nkCast, e.info)
+  result.add(newIdentNode(target, e.info))
+  result.add(e)
+
+proc coercePtrAsgns*(p: var TParser, n: Node) =
+  ## Pascal lets Pointer, typed pointers and object refs assign freely;
+  ## nimony needs an explicit conversion (Pointer->ptr) or bit cast
+  ## (between pointer/ref domains)
+  if n.kind == nkAsgn and n.len == 2:
+    # a Delphi variable typecast on the left (TValueType(Value) := ...):
+    # it is an assignment-compatible lvalue - assign to the operand
+    if n[0].kind == nkCast and n[0].len == 2:
+      n[0] = n[0][1]
+    elif n[0].kind == nkCall and n[0].len == 2 and n[0][0].kind == nkIdent:
+      n[0] = n[0][1]
+    n[1] = lowerTMethodField(p, n[1])
+    let lt = placeExprType(p, n[0])
+    let rt = rhsExprType(p, n[1])
+    let lk = ptrKindOf(p, lt)
+    let rk = ptrKindOf(p, rt)
+    if lk.startsWith("ptr:"):
+      let alias = lk[4 .. ^1]
+      if rk == "pointer":
+        n[1] = convPtrNode(alias, n[1])
+        return
+      elif rk.startsWith("ptr:") and rk != lk:
+        n[1] = hardCastNode(alias, n[1])
+        return
+    elif lk == "pointer" and rk.startsWith("ptr:"):
+      n[1] = convPtrNode("pointer", n[1])
+      return
+    elif lk == "pointer" and rk.startsWith("ref:"):
+      n[1] = hardCastNode("pointer", n[1])
+      return
+    elif lk.startsWith("ref:") and rk == "pointer":
+      n[1] = hardCastNode(lk[4 .. ^1], n[1])
+      return
+  for s in n.sons:
+    coercePtrAsgns(p, s)
+
+proc coercePtrCasts*(p: var TParser, n: Node): Node =
+  ## an explicit Pascal pointer cast `PItems(x)` between different
+  ## pointee types is a bit cast in Nim, not a conversion
+  result = n
+  if n.kind == nkCall and n.len == 2 and n[0].kind == nkIdent and
+      p.pointerAliases.hasKey(n[0].strVal.toLowerAscii):
+    let target = n[0].strVal
+    let rk = ptrKindOf(p, rhsExprType(p, n[1]))
+    if rk.startsWith("ptr:") and rk != "ptr:" & target:
+      result = hardCastNode(target, n[1])
+      return
+  for i in 0 ..< n.sons.len:
+    if n.sons[i].kind != nkEmpty:
+      n.sons[i] = coercePtrCasts(p, n.sons[i])
+
+proc calleeProcParams(p: TParser; callee: Node): Node =
+  ## formal params of the proc type a call target denotes (`visit.call`,
+  ## a proc-typed local/param), or nil when unknown
+  var sp = ""
+  if callee.kind == nkIdent:
+    sp = p.varRawTypes.getOrDefault(callee.strVal.toLowerAscii)
+    if sp.len == 0:
+      sp = p.varTypes.getOrDefault(callee.strVal.toLowerAscii)
+  elif callee.kind == nkDotExpr and callee.len == 2 and callee[1].kind == nkIdent:
+    if callee[0].kind == nkIdent:
+      let oty = p.varTypes.getOrDefault(callee[0].strVal.toLowerAscii)
+      if oty.startsWith("record:"):
+        sp = p.fieldTypes.getOrDefault(oty[7 .. ^1].toLowerAscii & "." &
+            callee[1].strVal.toLowerAscii)
+  if sp.len == 0: return emptyNode(callee.info)
+  let sl = sp.toLowerAscii
+  if p.methodPtrTypes.hasKey(sl): return p.methodPtrTypes.getOrDefault(sl)
+  if p.procTyParams.hasKey(sl): return p.procTyParams.getOrDefault(sl)
+  result = emptyNode(callee.info)
+
+proc addrLvalueCast(tgt, inner: Node): Node =
+  ## cast[ptr T](addr x)[] - an lvalue reinterpreting x as T; a Delphi
+  ## variable typecast passed to a `var` parameter needs an lvalue, and
+  ## a plain cast is not passable by var
+  var ad = newNode(nkAddr, inner.info)
+  ad.add(inner)
+  var pt = newNode(nkPtrTy, inner.info)
+  pt.add(tgt)
+  var cn = newNode(nkCast, inner.info)
+  cn.add(pt)
+  cn.add(ad)
+  result = newNode(nkDeref, inner.info)
+  result.add(cn)
+
+proc coercePtrArgs*(p: var TParser, n: Node) =
+  ## Pascal lets Pointer, typed pointers and object refs pass at the
+  ## argument boundary; nimony needs an explicit conversion/cast
+  if n.kind == nkCall and n.len > 1 and n[0].kind in {nkIdent, nkDotExpr}:
+    let fp = calleeProcParams(p, n[0])
+    if fp.kind != nkEmpty:
+      for i in 1 ..< n.len:
+        if i < fp.len and fp[i].kind == nkIdentDefs and
+            fp[i][fp[i].len - 2].kind == nkVarTy and n[i].len == 2 and
+            (n[i].kind == nkCast or
+             (n[i].kind == nkCall and n[i][0].kind == nkIdent)) and
+            n[i][1].kind in {nkIdent, nkDotExpr, nkIndexExpr, nkDeref}:
+          n[i] = addrLvalueCast(n[i][0], n[i][1])
+  if n.kind == nkCall and n.len > 1:
+    var argTypes: seq[string] = @[]
+    if n[0].kind == nkIdent:
+      argTypes = p.routineParams.getOrDefault(n[0].strVal.toLowerAscii)
+      if argTypes.len == 0 and p.selfClass.len > 0:
+        argTypes = p.routineParams.getOrDefault(
+            p.selfClass.toLowerAscii & "." & n[0].strVal.toLowerAscii)
+    elif n[0].kind == nkDotExpr and n[0].len == 2 and n[0][1].kind == nkIdent:
+      argTypes = p.routineParams.getOrDefault(n[0][1].strVal.toLowerAscii)
+    if argTypes.len > 0:
+      for ai in 1 ..< n.len:
+        if ai - 1 < argTypes.len:
+          let pk = ptrKindOf(p, argTypes[ai - 1])
+          let ak = ptrKindOf(p, rhsExprType(p, n[ai]))
+          if pk.startsWith("ptr:"):
+            if ak == "pointer":
+              n[ai] = convPtrNode(pk[4 .. ^1], n[ai])
+            elif ak.startsWith("ptr:") and ak != pk:
+              n[ai] = hardCastNode(pk[4 .. ^1], n[ai])
+          elif pk == "pointer" and ak.startsWith("ref:"):
+            n[ai] = hardCastNode("pointer", n[ai])
+          elif pk.startsWith("ref:") and ak == "pointer":
+            n[ai] = hardCastNode(pk[4 .. ^1], n[ai])
+  if n.kind == nkCall and n.len == 3 and n[0].kind == nkIdent and
+      n[0].strVal.toLowerAscii in ["incl", "include"] and n[1].kind == nkIdent:
+    let et = p.setElemTexts.getOrDefault(n[1].strVal.toLowerAscii)
+    if et.len > 0 and n[2].kind != nkCast:
+      var cn = newNode(nkCast, n[2].info)
+      cn.add(newIdentNode(et, n[2].info))
+      cn.add(n[2])
+      n[2] = cn
+  if n.kind == nkInfix and n.len == 3 and n[0].kind == nkIdent and
+      n[0].strVal.toLowerAscii in ["in", "notin"] and n[2].kind == nkIdent:
+    let et = p.setElemTexts.getOrDefault(n[2].strVal.toLowerAscii)
+    if et.len > 0 and n[1].kind != nkCast:
+      var cn = newNode(nkCast, n[1].info)
+      cn.add(newIdentNode(et, n[1].info))
+      cn.add(n[1])
+      n[1] = cn
+  for s in n.sons:
+    coercePtrArgs(p, s)
 # --- Variant construction at Variant-typed sites ---------------------------
 # nimony applies no converters at all (measured: `f(3)` fails even with a
 # matching converter in scope), so every place Pascal relies on an implicit
@@ -5787,6 +6608,15 @@ proc isVariantExpr(p: var TParser; e: Node): bool =
     result = e.len > 1 and e[0].kind == nkIdent and
              p.varTypes.getOrDefault(e[0].strVal.toLowerAscii).toLowerAscii ==
                "variant"
+  of nkDeref:
+    # dereferencing a `ptr Variant` (Delphi `v^`) yields a Variant
+    result = false
+    if e.len > 0:
+      let pk = ptrKindOf(p, placeExprType(p, e[0]))
+      if pk.startsWith("ptr:"):
+        let al = pk[4 .. ^1].toLowerAscii
+        result = al == "variant" or
+            p.pointerAliases.getOrDefault(al).toLowerAscii == "variant"
   else: result = false
 
 proc variantCoerce(p: var TParser; e: Node): Node =
@@ -6150,6 +6980,10 @@ proc withExprClass(p: var TParser, e: Node): string =
     for i in 0 ..< p.withDepth:
       if p.withTemps[i] == e.strVal:
         return p.withClasses[i]
+    # a with-scope already closed: the lowered body still refers to the
+    # hidden temp, so resolve it from the persistent map
+    let wo = p.withTempOwners.getOrDefault(e.strVal.toLowerAscii)
+    if wo.len > 0: return wo
     let vt = p.varTypes.getOrDefault(e.strVal.toLowerAscii)
     if vt.startsWith("record:"):
       return vt[7 .. ^1]
@@ -6160,6 +6994,22 @@ proc withExprClass(p: var TParser, e: Node): string =
         if not ci.isRef:
           return ""   # value objects copy: v1 gap (needs ptr lowering)
       return sp
+    # a pointer-typed base (`n: PNode`) names the pointee record/class
+    # through its alias; without this `with n.Items[x] do` cannot
+    # classify the body and leaves every field unqualified
+    if vt.startsWith("ptr:") or vt.len == 0:
+      var alias = if vt.startsWith("ptr:"): vt[4 .. ^1] else: ""
+      if alias.len == 0:
+        alias = p.varRawTypes.getOrDefault(e.strVal.toLowerAscii, "")
+      if alias.len == 0:
+        alias = p.paramTypes.getOrDefault(e.strVal.toLowerAscii, "")
+      if alias.len > 0:
+        let el = p.pointerAliases.getOrDefault(alias.toLowerAscii, "")
+        if el.len > 0:
+          var sp = p.syms.classSpelling(el)
+          if sp.len == 0:
+            sp = p.arrayAliases.getOrDefault(el.toLowerAscii, "")
+          return (if sp.len > 0: sp else: el)
     let pc = p.paramClassTypes.getOrDefault(e.strVal.toLowerAscii)
     if pc.len > 0: return pc
     # inside another with-scope the expression is evaluated there
@@ -6245,22 +7095,52 @@ proc unitModuleSpelling(p: TParser, name: string): string =
   else:
     result = p.unitFiles.getOrDefault(name.toLowerAscii, name)
 
-proc withBaseText(e: Node): string =
+proc withBaseText(p: TParser; e: Node): string =
   ## source-text rendering of a simple with-base (idents, dots,
-  ## indexes, literals) for record-with qualification
+  ## indexes, literals) for record-with qualification. Identifiers are
+  ## CANONICALISED to their emitted spelling: rebuilding the raw source
+  ## text used `i` where the emitter declared `I`, and Nim treats the
+  ## first letter as case-sensitive (`undeclared identifier: i`).
   result = ""
   case e.kind
-  of nkIdent: result = e.strVal
+  of nkIdent: result = p.syms.canonical(e.strVal)
   of nkDotExpr:
     if e.len == 2 and e[0].kind in {nkIdent, nkDotExpr, nkBracket} and
         e[1].kind == nkIdent:
-      result = withBaseText(e[0]) & "." & e[1].strVal
+      result = withBaseText(p, e[0]) & "." &
+               p.syms.canonicalMember(e[1].strVal)
   of nkIndexExpr, nkBracket:
     if e.len >= 2:
-      result = withBaseText(e[0]) & "[" & withBaseText(e[e.len - 1]) & "]"
+      result = withBaseText(p, e[0]) & "[" &
+               withBaseText(p, e[e.len - 1]) & "]"
+  of nkDeref:
+    # the explicit deref the index builder inserts for a
+    # pointer-to-array base (`r.Items[][1]`)
+    if e.len == 1:
+      result = withBaseText(p, e[0]) & "[]"
+  of nkInfix:
+    # an index like `cCenter - 1`: without this the index rendered as
+    # an EMPTY bracket, producing an invalid `Left.Items[][]`
+    if e.len == 3:
+      result = withBaseText(p, e[1]) & e[0].strVal & withBaseText(p, e[2])
+  of nkPrefix:
+    if e.len == 2:
+      result = withBaseText(p, e[0]) & withBaseText(p, e[1])
   of nkIntLit: result = $e.intVal
   else: result = ""
 
+
+proc setElemTypeText(p: var TParser, en: Node): string =
+  ## the nimony type spelling of a set's element, for the narrowing cast
+  ## nimony's `incl` requires (`incl(s, cast[range[..]](i))`)
+  result = ""
+  if en.kind == nkRangeTy and en.len > 0:
+    result = setElemTypeText(p, en[0])
+  elif en.kind == nkRange and en.len == 2:
+    result = "range[" & withBaseText(p, en[0]) & ".." &
+             withBaseText(p, en[1]) & "]"
+  elif en.kind == nkIdent:
+    result = p.syms.canonical(en.strVal)
 
 proc withQualify(p: var TParser, n: Node): Node =
   ## qualify a bare identifier against the active with-scopes
@@ -6331,7 +7211,7 @@ proc parseWith(p: var TParser): Node =
     var qualifier = temp
     if isRecord:
       # record withs qualify against the original expression text
-      qualifier = withBaseText(e)
+      qualifier = withBaseText(p, e)
       if qualifier.len == 0:
         # complex record expression: fall back to the temp (v1:
         # writes through the with go to the temp, not the original)
@@ -6350,6 +7230,8 @@ proc parseWith(p: var TParser): Node =
       d.add(e)
       vd.add(d)
       result.add(vd)
+    if qualifier.len > 0 and cls.len > 0:
+      p.withTempOwners[qualifier.toLowerAscii] = cls
     if p.withDepth < p.withTemps.len:
       p.withTemps[p.withDepth] = qualifier
       p.withClasses[p.withDepth] = cls
@@ -7191,7 +8073,8 @@ proc initValueResult(p: var TParser, module: Node) =
         def.len >= 3 and def[2].kind == nkFormalParams:
       let ret = def[2][0]
       if ret.kind == nkIdent and
-          p.recordTypes.hasKey(ret.strVal.toLowerAscii) and
+          (p.recordTypes.hasKey(ret.strVal.toLowerAscii) or
+           ret.strVal.toLowerAscii == "variant") and
           def.len > 0 and def[def.len - 1].kind == nkStmtList and
           def[def.len - 1].len > 0:
         let body = def[def.len - 1]

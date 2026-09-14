@@ -34,6 +34,21 @@ else
 fi
 
 fail=0
+
+# Run pasler in a directory, echo its output without the nifmake noise, and
+# return PASLER'S status. The old shape piped pasler through `grep ... || true`,
+# so every pasler build failure exited 0 and the runner printed "-- ok": the
+# exact false positive this helper removes.
+pasler_run() {
+  local dir="$1"; shift
+  local log="$TMP/pasler-run.log"
+  ( cd "$dir" && "$ROOT/bin/pasler" --nimony:"$NIMONY" "$@" ) > "$log" 2>&1
+  local st=$?
+  grep -v nifmake "$log" || true
+  rm -f "$log"
+  return $st
+}
+
 for pas in "${SAMPLES[@]}"; do
   name="$(basename "$pas" .pas)"
   echo "== $name"
@@ -42,8 +57,13 @@ for pas in "${SAMPLES[@]}"; do
     fail=1
     continue
   fi
-  # grep exits 1 when it filters out everything; treat that as success
-  if ! (cd "$TMP" && "$NIMONY" c --path:. "$name.nim" 2>&1 | grep -v nifmake || true); then
+  # capture the backend's REAL exit status; piping through grep (with the
+  # customary `|| true`) hides it, turning a build failure into a later
+  # "binary not found" or a spurious "-- ok"
+  (cd "$TMP" && "$NIMONY" c --path:. "$name.nim") > "$TMP/$name.build.log" 2>&1
+  build_st=$?
+  grep -v nifmake "$TMP/$name.build.log" || true
+  if [ "$build_st" -ne 0 ]; then
     echo "   NIMONY BUILD FAILED"
     fail=1
     continue
@@ -77,6 +97,24 @@ if [ $# -eq 0 ] && [ -f "$HERE/negative/goto_nested.pas" ]; then
   fi
 fi
 
+# A real `{$I file}` whose file does not exist must be refused: silently
+# skipping it drops the included declarations, and the mistake only shows
+# up later as an undeclared identifier on the first use.
+if [ $# -eq 0 ] && [ -f "$HERE/negative/missing_include.pas" ]; then
+  echo "== negative-missing-include"
+  neglog="$TMP/negative-missing-include.log"
+  if "$ROOT/bin/pas2nimony" "$HERE/negative/missing_include.pas" \
+      -o:"$TMP/negative_missing_include.nim" > "$neglog" 2>&1; then
+    echo "   MISSING INCLUDE WAS ACCEPTED (want a refusal)"; fail=1
+  elif ! grep -q "include file not found" "$neglog"; then
+    echo "   MISSING INCLUDE FAILED FOR THE WRONG REASON"
+    sed 's/^/   /' "$neglog" | head -3
+    fail=1
+  else
+    echo "-- ok (refused: $(grep -m1 -o 'include file not found: [^ ]*' "$neglog"))"
+  fi
+fi
+
 # ---- multi-unit project: counter unit + program using it ----
 if [ $# -eq 0 ] && [ -d "$HERE/twounit" ]; then
   echo "== twounit"
@@ -86,8 +124,11 @@ if [ $# -eq 0 ] && [ -d "$HERE/twounit" ]; then
     "$ROOT/bin/pas2nimony" "$pas" -o:"$TMP/twounit/$n.nim" || {
       echo "   TRANSLATE FAILED"; fail=1; continue; }
   done
-  if (cd "$TMP/twounit" && cp "$ROOT"/runtime/*.nim . &&
-      "$NIMONY" c --path:. usecounter.nim 2>&1 | grep -v nifmake || true); then
+  (cd "$TMP/twounit" && cp "$ROOT"/runtime/*.nim . &&
+      "$NIMONY" c --path:. usecounter.nim) > "$TMP/twounit.build.log" 2>&1
+  build_st=$?
+  grep -v nifmake "$TMP/twounit.build.log" || true
+  if [ "$build_st" -eq 0 ]; then
     bin="$(find "$TMP/twounit/nimcache" -name usecounter -type f | head -1)"
     if [ -n "$bin" ]; then
       echo "-- output:"
@@ -109,7 +150,7 @@ if [ $# -eq 0 ] && [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/twounit" ]; then
   # pasler resolves shim imports from its own directory
   cp -f "$ROOT"/runtime/*.nim "$TMP/pasler/"
   rm -f "$TMP/pasler"/nimcache/*.nim
-  if (cd "$TMP/pasler" && "$ROOT/bin/pasler" --nimony:"$NIMONY" --run usecounter.pas 2>&1 | grep -v nifmake || true); then
+  if pasler_run "$TMP/pasler" --run usecounter.pas; then
     # nifler must not have touched the Pascal-derived NIFs
     if grep -lq 'vendor "pasler"' "$TMP/pasler"/nimcache/*.p.nif 2>/dev/null; then
       echo "-- ok"
@@ -127,9 +168,7 @@ if [ $# -eq 0 ] && [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/twounit" ]; then
     # pasler resolves shim imports from its own directory
     cp -f "$ROOT"/runtime/*.nim "$TMP/pasler-events/"
     rm -f "$TMP/pasler-events"/nimcache/*.nim
-    if (cd "$TMP/pasler-events" &&
-        "$ROOT/bin/pasler" --nimony:"$NIMONY" --run events.pas 2>&1 |
-        grep -v nifmake || true); then
+    if pasler_run "$TMP/pasler-events" --run events.pas; then
       echo "-- ok"
     else
       echo "   PASLER EVENTS FAILED"; fail=1
@@ -142,9 +181,7 @@ if [ $# -eq 0 ] && [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/twounit" ]; then
     # pasler resolves shim imports from its own directory
     cp -f "$ROOT"/runtime/*.nim "$TMP/pasler-anon/"
     rm -f "$TMP/pasler-anon"/nimcache/*.nim
-    if (cd "$TMP/pasler-anon" &&
-        "$ROOT/bin/pasler" --nimony:"$NIMONY" --run anonmeth.pas 2>&1 |
-        grep -v nifmake || true); then
+    if pasler_run "$TMP/pasler-anon" --run anonmeth.pas; then
       echo "-- ok"
     else
       echo "   PASLER ANON FAILED"; fail=1
@@ -157,27 +194,28 @@ if [ $# -eq 0 ] && [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/twounit" ]; then
     # pasler resolves shim imports from its own directory
     cp -f "$ROOT"/runtime/*.nim "$TMP/pasler-usesnim/"
     rm -f "$TMP/pasler-usesnim"/nimcache/*.nim
-    if (cd "$TMP/pasler-usesnim" &&
-        "$ROOT/bin/pasler" --nimony:"$NIMONY" --run usesnim.pas 2>&1 |
-        grep -v nifmake || true); then
+    if pasler_run "$TMP/pasler-usesnim" --run usesnim.pas; then
       echo "-- ok"
     else
       echo "   PASLER USESNIM FAILED"; fail=1
     fi
   fi
   for extra in shims datetime sysutils missing \
-               absolute bodywhen ifexpr condfield dirlabel; do
+               absolute bodywhen ifexpr condfield dirlabel iftypesec inctest \
+               localif msgwhen uscore dotparent inharith uscmethod \
+               addrparam multidim mathfn withalias withptr sysmem; do
     if [ -f "$HERE/$extra.pas" ]; then
       echo "== pasler-$extra"
       mkdir -p "$TMP/pasler-$extra"
       cp "$HERE/$extra.pas" "$TMP/pasler-$extra/"
+      # a sample may pull in .inc files (see inctest.pas); they are
+      # resolved next to the source that includes them
+      cp -f "$HERE"/*.inc "$TMP/pasler-$extra/" 2>/dev/null || true
       # pasler resolves shim imports from its own directory; the
       # nimcache's stale module copies must not shadow them
       cp -f "$ROOT"/runtime/*.nim "$TMP/pasler-$extra/"
       rm -f "$TMP/pasler-$extra"/nimcache/*.nim
-      if (cd "$TMP/pasler-$extra" &&
-          "$ROOT/bin/pasler" --nimony:"$NIMONY" --run $extra.pas 2>&1 |
-          grep -v nifmake || true); then
+      if pasler_run "$TMP/pasler-$extra" --run $extra.pas; then
         echo "-- ok"
       else
         echo "   PASLER $extra FAILED"; fail=1
@@ -191,9 +229,7 @@ if [ $# -eq 0 ] && [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/twounit" ]; then
     # pasler resolves shim imports from its own directory
     cp -f "$ROOT"/runtime/*.nim "$TMP/pasler-generics/"
     rm -f "$TMP/pasler-generics"/nimcache/*.nim
-    if (cd "$TMP/pasler-generics" &&
-        "$ROOT/bin/pasler" --nimony:"$NIMONY" --run generics.pas 2>&1 |
-        grep -v nifmake || true); then
+    if pasler_run "$TMP/pasler-generics" --run generics.pas; then
       echo "-- ok"
     else
       echo "   PASLER GENERICS FAILED"; fail=1
@@ -206,9 +242,7 @@ if [ $# -eq 0 ] && [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/twounit" ]; then
     # pasler resolves shim imports from its own directory
     cp -f "$ROOT"/runtime/*.nim "$TMP/pasler-op/"
     rm -f "$TMP/pasler-op"/nimcache/*.nim
-    if (cd "$TMP/pasler-op" &&
-        "$ROOT/bin/pasler" --nimony:"$NIMONY" --run opover.pas 2>&1 |
-        grep -v nifmake || true); then
+    if pasler_run "$TMP/pasler-op" --run opover.pas; then
       echo "-- ok"
     else
       echo "   PASLER OP FAILED"; fail=1
@@ -221,9 +255,7 @@ if [ $# -eq 0 ] && [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/twounit" ]; then
     # pasler resolves shim imports from its own directory
     cp -f "$ROOT"/runtime/*.nim "$TMP/pasler-cm/"
     rm -f "$TMP/pasler-cm"/nimcache/*.nim
-    if (cd "$TMP/pasler-cm" &&
-        "$ROOT/bin/pasler" --nimony:"$NIMONY" --run classmeth.pas 2>&1 |
-        grep -v nifmake || true); then
+    if pasler_run "$TMP/pasler-cm" --run classmeth.pas; then
       echo "-- ok"
     else
       echo "   PASLER CM FAILED"; fail=1
@@ -236,9 +268,7 @@ if [ $# -eq 0 ] && [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/twounit" ]; then
     # pasler resolves shim imports from its own directory
     cp -f "$ROOT"/runtime/*.nim "$TMP/pasler-intf/"
     rm -f "$TMP/pasler-intf"/nimcache/*.nim
-    if (cd "$TMP/pasler-intf" &&
-        "$ROOT/bin/pasler" --nimony:"$NIMONY" --run intf.pas 2>&1 |
-        grep -v nifmake || true); then
+    if pasler_run "$TMP/pasler-intf" --run intf.pas; then
       echo "-- ok"
     else
       echo "   PASLER INTF FAILED"; fail=1
@@ -251,9 +281,7 @@ if [ $# -eq 0 ] && [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/twounit" ]; then
     # pasler resolves shim imports from its own directory
     cp -f "$ROOT"/runtime/*.nim "$TMP/pasler-cast/"
     rm -f "$TMP/pasler-cast"/nimcache/*.nim
-    if (cd "$TMP/pasler-cast" &&
-        "$ROOT/bin/pasler" --nimony:"$NIMONY" --run cast.pas 2>&1 |
-        grep -v nifmake || true); then
+    if pasler_run "$TMP/pasler-cast" --run cast.pas; then
       echo "-- ok"
     else
       echo "   PASLER CAST FAILED"; fail=1
@@ -266,9 +294,7 @@ if [ $# -eq 0 ] && [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/twounit" ]; then
     # pasler resolves shim imports from its own directory
     cp -f "$ROOT"/runtime/*.nim "$TMP/pasler-goto/"
     rm -f "$TMP/pasler-goto"/nimcache/*.nim
-    if (cd "$TMP/pasler-goto" &&
-        "$ROOT/bin/pasler" --nimony:"$NIMONY" --run goto.pas 2>&1 |
-        grep -v nifmake || true); then
+    if pasler_run "$TMP/pasler-goto" --run goto.pas; then
       echo "-- ok"
     else
       echo "   PASLER GOTO FAILED"; fail=1
@@ -281,9 +307,7 @@ if [ $# -eq 0 ] && [ -x "$ROOT/bin/pasler" ] && [ -d "$HERE/twounit" ]; then
     # pasler resolves shim imports from its own directory
     cp -f "$ROOT"/runtime/*.nim "$TMP/pasler-with/"
     rm -f "$TMP/pasler-with"/nimcache/*.nim
-    if (cd "$TMP/pasler-with" &&
-        "$ROOT/bin/pasler" --nimony:"$NIMONY" --run with.pas 2>&1 |
-        grep -v nifmake || true); then
+    if pasler_run "$TMP/pasler-with" --run with.pas; then
       echo "-- ok"
     else
       echo "   PASLER WITH FAILED"; fail=1

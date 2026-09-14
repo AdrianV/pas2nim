@@ -17,8 +17,9 @@ Two different things are easy to conflate, so they are stated separately.
 The parser's reach is deliberately wider than the proven tier. It is measured against a
 large third-party Delphi 2007 corpus that is kept out of this repository:
 **all 55 units of that closure translate** - 47 from Pascal source, 8 satisfied by runtime
-shims. None of those 55 has been type-checked yet. That is the next milestone, and the gap
-between "translates" and "compiles" is exactly where the remaining unknowns live.
+shims. Compilation of that tier has begun: the five `lazyBtree*` generic-container modules
+now type-check and build under nimony (see `pas2nimony/doc/nimony-compat.md`, M15). The other
+50 are translated but not yet compiled; that gap is exactly where the remaining unknowns live.
 
 ## What is working
 
@@ -31,6 +32,10 @@ between "translates" and "compiles" is exactly where the remaining unknowns live
 - interfaces (with method resolution through the class), `reference to procedure` anonymous
   methods, generics (classes and specialized aliases)
 - operator overloading for records and classes
+- method pointers (`procedure ... of object`, `TMethod(..).Code`/`.Data`, `Assigned`),
+  lowered to a `{evProc, evObj}` record
+- `out` parameters, and Pascal's mutable value parameters lowered to a local copy
+- `Variant` values, including `PVariant` (`ptr Variant`) pointer handling
 - sets (`in`, `include`/`exclude`, set literals), subranges, static arrays, records with
   `case` variants, pointers and `^` types
 - exceptions: `try/except/finally`, `raise` of exception classes with instances, `on E do`
@@ -107,7 +112,8 @@ other language frontend would.
 
 1. **Self-test suite** - `cd pas2nimony && ./test/run.sh` runs every sample through
    **both** pipelines (the `.nim` path and the pasler NIF path) and reports pass/fail;
-   currently 54 sections, all green, with 15 differential oracle samples alongside. New language semantics get locked in as a sample the
+   currently 86 sections, all green apart from the two known NIF `withalias`/`withptr` shapes,
+   with 15 differential oracle samples alongside. New language semantics get locked in as a sample the
    moment they work, so the suite doubles as a regression net and an executable
    feature list.
 

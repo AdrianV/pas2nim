@@ -43,7 +43,7 @@ type
     pxSemiColon, pxColon,     # operators
     pxAsgn, pxEquals, pxDot, pxDotDot, pxHat, pxPlus, pxMinus, pxStar, pxSlash,
     pxLe, pxLt, pxGe, pxGt, pxNeq, pxAt, pxStarDirLe, pxStarDirRi,
-    pxCurlyDirLe, pxCurlyDirRi
+    pxCurlyDirLe, pxCurlyDirRi, pxTilde
   TTokKinds* = set[TTokKind]
 
 const
@@ -148,6 +148,7 @@ proc tokKindToStr*(k: TTokKind): string =
   of pxStarDirRi: result = "*)"
   of pxCurlyDirLe: result = "{$"
   of pxCurlyDirRi: result = "}"
+  of pxTilde: result = "~"
 
 proc `$`*(tok: TToken): string =
   case tok.xkind
@@ -311,6 +312,49 @@ proc opaqueDirectiveBody(L: var TLexer, tok: var TToken, closeCurly: bool) =
       if L.buf[L.bufpos] == '*' and L.bufpos + 1 < L.buf.len and
           L.buf[L.bufpos + 1] == ')': break
     inc(L.bufpos)
+  if not closeCurly and L.buf[L.bufpos] == '*' and
+      L.bufpos + 1 < L.buf.len and L.buf[L.bufpos + 1] == ')':
+    inc(L.bufpos, 2)
+    L.pendingDirRi = 1
+  elif closeCurly and L.buf[L.bufpos] == '}':
+    inc(L.bufpos)
+    L.pendingDirRi = 2
+
+proc captureIncludeName(L: var TLexer, tok: var TToken, closeCurly: bool) =
+  ## the file name of an `{$I ...}` / `{$INCLUDE ...}` directive, taken
+  ## raw into tok.literal. Delphi accepts it quoted ('jedi.inc') or bare
+  ## (vList.inc); the bare form ends at the directive's close marker. The
+  ## quoted form deliberately does NOT go through opaqueDirectiveBody,
+  ## which throws the body away - that exists for `{$HPPEMIT 'text'}`.
+  ##
+  ## Capturing here (rather than reassembling tokens in the parser) is
+  ## what makes the quoted and the `(*$I ...*)` spellings reachable: the
+  ## close marker waits in pendingDirRi either way, exactly as it does for
+  ## the opaque-body directives.
+  var name = ""
+  if L.buf[L.bufpos] in {'\'', '"'}:
+    let q = L.buf[L.bufpos]
+    inc(L.bufpos)
+    while L.bufpos < L.buf.len and L.buf[L.bufpos] != q and
+        L.buf[L.bufpos] notin {'\c', '\l', lexbase.EndOfFile}:
+      name.add(L.buf[L.bufpos])
+      inc(L.bufpos)
+    if L.bufpos < L.buf.len and L.buf[L.bufpos] == q: inc(L.bufpos)
+  else:
+    while L.bufpos < L.buf.len:
+      let c = L.buf[L.bufpos]
+      if closeCurly:
+        if c == '}': break
+      else:
+        if c == '*' and L.bufpos + 1 < L.buf.len and
+            L.buf[L.bufpos + 1] == ')': break
+      name.add(c)
+      inc(L.bufpos)
+    name = name.strip()
+  # trailing blanks between a quoted name and the marker
+  while L.bufpos < L.buf.len and L.buf[L.bufpos] in {' ', '\t'}:
+    inc(L.bufpos)
+  tok.literal = name
   if not closeCurly and L.buf[L.bufpos] == '*' and
       L.bufpos + 1 < L.buf.len and L.buf[L.bufpos + 1] == ')':
     inc(L.bufpos, 2)
@@ -536,7 +580,9 @@ proc getTok*(L: var TLexer, tok: var TToken) =
           getSymbol(L, tok)
           tok.xkind = pxStarDirLe
           while L.buf[L.bufpos] == ' ': inc(L.bufpos)
-          if L.buf[L.bufpos] in {'\'', '#'}:
+          if tok.ident.toLowerAscii in ["i", "include"]:
+            captureIncludeName(L, tok, closeCurly = false)
+          elif L.buf[L.bufpos] in {'\'', '#'}:
             opaqueDirectiveBody(L, tok, closeCurly = false)
         else:
           inc(L.bufpos)
@@ -576,7 +622,9 @@ proc getTok*(L: var TLexer, tok: var TToken) =
         tok.xkind = pxCurlyDirLe
         # quoted directive body: opaque to the end marker
         while L.buf[L.bufpos] == ' ': inc(L.bufpos)
-        if L.buf[L.bufpos] in {'\'', '#'}:
+        if tok.ident.toLowerAscii in ["i", "include"]:
+          captureIncludeName(L, tok, closeCurly = true)
+        elif L.buf[L.bufpos] in {'\'', '#'}:
           opaqueDirectiveBody(L, tok, closeCurly = true)
       of '&':
         inc(L.bufpos)
@@ -629,6 +677,12 @@ proc getTok*(L: var TLexer, tok: var TToken) =
       inc(L.bufpos)
     of '}':
       tok.xkind = pxCurlyDirRi
+      inc(L.bufpos)
+    of '~':
+      # not a Pascal operator, but it labels conditional closers in the
+      # JEDI headers (`{$ENDIF ~CPU64BITS}`); the label is skipped as
+      # tokens up to the marker, so it only has to LEX
+      tok.xkind = pxTilde
       inc(L.bufpos)
     of '\'', '#':
       getString(L, tok)

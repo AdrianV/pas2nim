@@ -77,6 +77,7 @@ type
     routineArgs*: Table[string, int]
     ## parameter counts of known routines (lowercase name); a 0-arg
     ## entry enables Delphi's paren-less call in expression position
+    ptrAliases*: seq[string]         ## shim `X* = ptr Y` pointer aliases
     defines*: Table[string, bool]
     ## conditional-compilation symbols: CLI -d: defines seed it and
     ## {$define}/{$undef} mutate it; {$ifdef}/{$ifndef} evaluate at
@@ -96,15 +97,58 @@ proc declareName*(t: var SymTab; spelling: string) =
   if key.len > 0 and not t.names.hasKey(key):
     t.names[key] = spelling
 
+const nimonyKeywords = ["addr", "bind", "block", "break", "cast", "concept",
+  "continue", "converter", "defer", "discard", "distinct", "elif", "enum",
+  "export", "from", "func", "import", "include", "isnot", "iterator", "let",
+  "macro", "method", "mixin", "notin", "proc", "ptr", "ref", "return",
+  "static", "template", "tuple", "using", "when", "yield"]
+  ## nimony keywords that are NOT Pascal reserved words, so they can occur
+  ## as Pascal identifiers (`addr` in synsock, `method`/`ptr`/`ref` in the
+  ## RTL) and must be escaped. A Pascal reserved word is deliberately
+  ## absent: the emitter renders OPERATORS through the same canon
+  ## (`and`, `or`, `xor`, `shl`, `shr`, `not`, `div`, `mod`, `in`, `is`),
+  ## so escaping them produced the undefined `pasand`/`pasxor`.
+
+proc isNimonyKeyword(s: string): bool =
+  let k = s.toLowerAscii
+  for w in nimonyKeywords:
+    if k == w: return true
+  result = false
+
 proc escapeNimonyName*(spelling: string): string =
-  ## nimony rejects identifiers starting or ending with `_`
-  ## (underscore-leading Delphi names like `_FILETIME` and
-  ## trailing-underscore locals like `str_`); escape both with the
-  ## keyword style
-  result = spelling
-  if result.len > 0 and result[^1] == '_':
-    result = result[0 .. ^2] & "_pas"
-  if result.len > 0 and result[0] == '_':
+  ## nimony rejects identifiers that lead or end with `_`, and it rejects
+  ## a `__` RUN anywhere - lexing the second underscore of `pas__d` as a
+  ## trailing underscore. A leading underscore is escaped with the `pas`
+  ## prefix, a trailing one with the `_pas` suffix, but a run needs both
+  ## handled at once: without this, the corpus field `__d` became `pas__d`
+  ## and nifler refused the unit. Each underscore after the first of a run
+  ## is spelled `U`, which no real spelling can collide with (`_d` ->
+  ## `pas_d`, `__d` -> `pas_Ud`).
+  result = ""
+  var i = 0
+  while i < spelling.len:
+    if spelling[i] != '_':
+      result.add(spelling[i])
+      inc i
+      continue
+    var j = i
+    while j < spelling.len and spelling[j] == '_': inc j
+    let run = j - i
+    let atStart = result.len == 0
+    let atEnd = j >= spelling.len
+    if atStart:
+      result.add("pas")
+    for k in 0 ..< run:
+      if atEnd:
+        # trailing run: `_pas` ends the name, further ones become `U`
+        result.add(if k == 0: "_pas" else: "U")
+      else:
+        result.add(if k == 0: "_" else: "U")
+    i = j
+  if isNimonyKeyword(result):
+    # `addr`, `method`, `block`, `ref`, ... are ordinary Pascal
+    # identifiers (synsock declares `proc (addr: pointer; ...)`) but
+    # keywords to nimony, which refuses them in any name position.
     result = "pas" & result
 
 proc canonical*(t: SymTab; spelling: string): string =
@@ -501,8 +545,14 @@ const RtlNames* = [
   ("round", "pasRound"), ("trunc", "trunc"), ("sizeof", "sizeof"),
   ("sqr", "sqr"), ("sqrt", "sqrt"), ("sin", "sin"), ("cos", "cos"),
   ("min", "min"), ("max", "max"),
-  ("arctan", "arctan"), ("ln", "ln"), ("exp", "exp"), ("pi", "PI"),
+  ("arctan", "arctan"), ("arcsin", "arcsin"), ("arccos", "arccos"),
+  ("ln", "ln"), ("exp", "exp"), ("pi", "PI"),
   ("include", "incl"), ("exclude", "excl"),
+  # memory primitives get Pascal-RTL-only spellings: their generic
+  # `var`-parameter overloads would otherwise hijack user methods of
+  # the same name (e.g. a TPoint.Move method is misresolved as the
+  # memory shim with the misleading 'cannot pass 2 to var/out T')
+  ("move", "pasMove"), ("fillchar", "pasFillChar"),
   ("halt", "quit"),
   # reserved spellings (True/TRUE -> true etc.)
   ("true", "true"), ("false", "false"), ("nil", "nil"),

@@ -148,8 +148,9 @@ proc emitCall(e: var NifEmitter; n: Node) =
     for k, son in n.sons:
       if k == 0 and n.noQualCallee and son.kind == nkIdent:
         # inherited callee: keep the member spelling (the canon would
-        # rename e.g. Insert to the string shim strInsert)
-        e.buf.addIdent(son.strVal, e.info(son))
+        # rename e.g. Insert to the string shim strInsert), but still
+        # escape a leading/trailing underscore for nimony
+        e.buf.addIdent(escapeNimonyName(son.strVal), e.info(son))
       else:
         e.emitExpr(son)
 
@@ -586,7 +587,12 @@ proc isPlainIdentStr(s: string): bool =
 
 proc emitProcName(e: var NifEmitter; n: Node; i: NifLineInfo) =
   ## operator names like `data2 =` need the (quoted ...) form
-  let name = e.nameOf(n[0])
+  # method definitions keep their member spelling (`Move`), never the
+  # type-tier RTL map (`pasMove` memory shim)
+  let name = if n.defClass.len > 0 and e.syms != nil:
+               e.syms[].canonicalMember(n[0].strVal)
+             else:
+               e.nameOf(n[0])
   if name.find(' ') >= 0:
     e.buf.copyInto(globalTags.registerTag("quoted"), i):
       for part in name.split(' '):
