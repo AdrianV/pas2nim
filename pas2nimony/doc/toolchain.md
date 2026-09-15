@@ -40,9 +40,13 @@ Two consumption paths exist, and both must be kept working:
 
 - pas2nim repo HEAD at the time this subfolder was created:
   `cbd3e432403e1d6e10d0d54903f7c301aaa015b1` (pas2nim)
-- nimony checkout at `/home/adrian/dev/nimony`, git HEAD at creation:
-  see `git -C ../nimony log -1 --format=%H` output recorded in `nimony.commit`
-  next to this file.
+- **Pinned nimony commit: `2a458ed96bdaed53ae64483596050ba279d55d86`**
+  (`2a458ed9`, 2026-09-11, "std/regex: port lexim to Nimony as a plugin").
+  The checkout at `/home/adrian/dev/nimony` is held at this commit until
+  `TestSimpleQuery.exe` links under `--os:windows`; bump it only together
+  with a full `build.sh` + `test/run.sh` + `test/oracle.sh` re-measurement,
+  because nimony's strictness on integer-width and `var`/`out` argument
+  binding is itself part of what we are validating.
 
 ## Build
 
