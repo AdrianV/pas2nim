@@ -4,7 +4,7 @@
 ## to nimony/64-bit:
 ##   - getMemory/freeMemory/reallocMemory -> alloc0/dealloc/realloc
 ##   - system.atomicInc/atomicDec        -> std/atomics atomicFetchAdd/Sub
-##   - ByteAddress                       -> uint64
+##   - ByteAddress                       -> uint
 ##   - {.bycopy.} dropped
 ##   - union helpers (SomeDelphiString, AnsiString|AnsiStringData) split
 ##     into concrete overloads: nimony does not resolve fields/methods
@@ -41,28 +41,28 @@ proc newAnsiString(length: int32): AnsiStringData =
   result = cast[AnsiStringData](0)
   if length > 0:
     var p = cast[StrRecPtr](alloc0(int(needLength(length))))
-    result = cast[AnsiStringData](cast[uint64](p) + uint64(sizeof(StrRec)))
+    result = cast[AnsiStringData](cast[uint](p) + uint(sizeof(StrRec)))
     p.length = length
     p.refCnt = 1
-    cast[ptr int16](cast[uint64](result) +
-        uint64(length and not 1'i32))[] = 0'i16
+    cast[ptr int16](cast[uint](result) +
+        uint(length and not 1'i32))[] = 0'i16
 
 template raw*(s: AnsiString): pointer = cast[pointer](s.data)
 
 template rec*(s: AnsiStringData): StrRecPtr =
-  cast[StrRecPtr](cast[uint64](s) - uint64(sizeof(StrRec)))
+  cast[StrRecPtr](cast[uint](s) - uint(sizeof(StrRec)))
 
 template rec*(s: AnsiString): StrRecPtr = s.data.rec
 
 template rec*(s: WeakPartialString): StrRecPtr =
-  cast[StrRecPtr](cast[uint64](s.data) - uint64(sizeof(StrRec)) -
-      uint64(s.delta))
+  cast[StrRecPtr](cast[uint](s.data) - uint(sizeof(StrRec)) -
+      uint(s.delta))
 
 template strData(r: StrRecPtr): AnsiStringData =
-  cast[AnsiStringData](cast[uint64](r) + uint64(sizeof(StrRec)))
+  cast[AnsiStringData](cast[uint](r) + uint(sizeof(StrRec)))
 
-template isNil*(s: AnsiString): bool = cast[uint64](s.data) == 0
-template isNil*(s: WeakPartialString): bool = cast[uint64](s.data) == 0
+template isNil*(s: AnsiString): bool = cast[uint](s.data) == 0
+template isNil*(s: WeakPartialString): bool = cast[uint](s.data) == 0
 
 proc refCount*(s: AnsiString): int {.inline.} =
   result = 0
@@ -149,7 +149,7 @@ proc `=copy`*(dest: var AnsiString; source: AnsiString) =
     discard atomicFetchAdd(p[].refCnt, 1'i32)
   let d = dest.data
   dest.data = s
-  if cast[uint64](d) != 0:
+  if cast[uint](d) != 0:
     decRefD(d)
 
 proc uniqueStringOfLen*(s: var AnsiString; wantedLen: int32) =
@@ -163,11 +163,11 @@ proc uniqueStringOfLen*(s: var AnsiString; wantedLen: int32) =
       decRefD(data)
   else:
     let p = cast[StrRecPtr](realloc(cast[pointer](data.rec), int(needLength(wantedLen))))
-    s.data = cast[AnsiStringData](cast[uint64](p) + uint64(sizeof(StrRec)))
+    s.data = cast[AnsiStringData](cast[uint](p) + uint(sizeof(StrRec)))
     p.refCnt = 1
     p.length = wantedLen
-    cast[ptr int16](cast[uint64](s.data) +
-        uint64(wantedLen and not 1'i32))[] = 0'i16
+    cast[ptr int16](cast[uint](s.data) +
+        uint(wantedLen and not 1'i32))[] = 0'i16
 
 proc uniqueStringImpl(s: var AnsiString; r: StrRecPtr) =
   let wantedLen = r.length
@@ -222,7 +222,7 @@ proc ansiToPtr*(a: AnsiString): pointer =
     if p[].refCnt > 0:
       discard atomicFetchAdd(p[].refCnt, 1'i32)
 
-proc ptrToNimString*(p: uint64): string =
+proc ptrToNimString*(p: uint): string =
   ## the text of a varString slot as a *pure borrow*: no AnsiString reference
   ## is created, so there is nothing to release. Use this on the read path -
   ## a `ptrToAnsiString` temporary in an argument position is not destroyed
@@ -231,11 +231,11 @@ proc ptrToNimString*(p: uint64): string =
   if p != 0:
     result = fromCString(cast[cstring](p))
 
-proc ptrToAnsiString*(p: uint64): AnsiString =
+proc ptrToAnsiString*(p: uint): AnsiString =
   ## reinterpret a varString slot pointer as an AnsiString and take a
   ## reference; the caller owns (and destroys) the result. This is the
   ## `AnsiString(vString)` hard cast of Delphi/FPC. The slot travels as a
-  ## uint64 so nimony's non-nil `pointer` parameter rule cannot reject it.
+  ## uint so nimony's non-nil `pointer` parameter rule cannot reject it.
   result = default(AnsiString)
   if p != 0:
     result.data = cast[AnsiStringData](p)
@@ -249,7 +249,7 @@ proc concat(a, b: AnsiString): AnsiStringData =
   let lb = b.rec.length
   result = newAnsiString(la + lb)
   copyMem(cast[pointer](result), cast[pointer](a.data), int(la))
-  copyMem(cast[pointer](cast[uint64](result) + uint64(la)),
+  copyMem(cast[pointer](cast[uint](result) + uint(la)),
       cast[pointer](b.data), int(lb))
 
 proc `&`*(a, b: AnsiString): AnsiString {.inline.} =

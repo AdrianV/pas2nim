@@ -1575,8 +1575,8 @@ proc variantToStr(v: Variant): string =
   of varString:
     # either a nimony string (managed VString) or an explicit AnsiString (the
     # raw pointer FPC/Delphi keep in the union) - read whichever is set
-    if cast[uint64](v.VAnsiString) != 0:
-      result = ptrToNimString(cast[uint64](v.VAnsiString))
+    if cast[uint](v.VAnsiString) != 0:
+      result = ptrToNimString(cast[uint](v.VAnsiString))
     else:
       result = v.VString
   of varOleStr, varUString:
