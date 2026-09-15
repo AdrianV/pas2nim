@@ -8524,6 +8524,181 @@ proc adjustArrayIndicesInPlace(p: var TParser, n: Node): Node =
     n[i] = adjustArrayIndicesInPlace(p, n[i])
   return n
 
+proc selfRootedPlace(n: Node): bool =
+  ## is the expression a place whose base is the `self` parameter?
+  var cur = n
+  var guard = 0
+  while cur != nil and guard < 64:
+    inc guard
+    case cur.kind
+    of nkIdent:
+      return cur.strVal == "self"
+    of nkDotExpr, nkIndexExpr, nkDeref, nkAddr, nkCast, nkPar:
+      if cur.len == 0: return false
+      cur = cur[0]
+    else:
+      return false
+  return false
+
+proc calleeBaseName(head: Node): string =
+  ## the routine name behind a call head: an ident, a generic instantiation
+  ## (nkIndexExpr) or a module-qualified name (nkDotExpr) all reduce to it
+  var h = head
+  var guard = 0
+  while h != nil and guard < 8:
+    inc guard
+    case h.kind
+    of nkIdent:
+      return h.strVal
+    of nkDotExpr:
+      if h.len < 2: return ""
+      h = h[1]
+    of nkIndexExpr:
+      if h.len == 0: return ""
+      h = h[0]
+    else:
+      return ""
+  return ""
+
+proc selfArgIsWrite(callee: string; argIdx: int): bool =
+  ## For the few system helpers whose parameter roles we know, say whether
+  ## argument `argIdx` is written. Anything unknown is conservatively a
+  ## potential write: a missed write would silently drop the mutation.
+  let c = callee.toLowerAscii
+  case c
+  of "movemem":
+    result = argIdx == 0
+  of "move", "pasmove":
+    # Pascal Move(Source, Dest, Count): the destination is the second arg
+    result = argIdx == 1
+  of "fillchar", "pasfillchar", "setlen", "setlength", "add", "delete",
+     "incl", "excl":
+    # Pascal Insert(Source, var S, Index) writes arg 1, so it is deliberately
+    # absent here: an unknown/omitted helper is conservatively all-write
+    result = argIdx == 0
+  of "length", "high", "low", "ord", "chr", "sizeof", "copy", "pos",
+     "inttostr", "inttohex", "floattostr", "trim", "trimleft", "trimright",
+     "uppercase", "lowercase", "stringofchar", "systempas.length",
+     "systempas.high", "systempas.low", "abs", "sqr", "sqrt", "round",
+     "trunc", "=", "==", "!=", "<>", "<", ">", "<=", ">=", "and", "or",
+     "xor", "not", "cast", "default", "typeof", "addr", "unsafeaddr",
+     "system.cast", "systempas.cast":
+    result = false
+  else:
+    result = true
+
+proc subtreeWritesSelf(n: Node; clsLower: string;
+                       mut, known: Table[string, bool]): bool =
+  ## Conservative: true if the subtree can write through `self`. A missed
+  ## write would silently drop the mutation (the `self: T` copy would be
+  ## mutated instead), so an uncertain call counts as a write.
+  if n == nil: return false
+  case n.kind
+  of nkAsgn:
+    if n.len >= 1 and selfRootedPlace(n[0]): return true
+  of nkCall:
+    if n.len >= 1:
+      let head = n[0]
+      if head.kind == nkDotExpr and head.len >= 2 and
+          selfRootedPlace(head[0]):
+        if not (head[0].kind == nkIdent and head[0].strVal == "self"):
+          return true              # property setter / chained record method
+        if head[1].kind == nkIdent:
+          let k = clsLower & "::" & head[1].strVal.toLowerAscii
+          if mut.getOrDefault(k, false): return true
+          if not known.getOrDefault(k, false): return true
+        else:
+          return true
+      else:
+        # a free/unknown callee: a self-rooted argument at a var/out
+        # position is a write; reads (Length(self.x), Move's source) are not
+        let callee = calleeBaseName(n[0])
+        for i in 1 ..< n.len:
+          if selfRootedPlace(n[i]) and selfArgIsWrite(callee, i - 1):
+            return true
+  of nkCommand:
+    for i in 1 ..< n.len:
+      if selfRootedPlace(n[i]): return true
+  else: discard
+  for s in n.sons:
+    if subtreeWritesSelf(s, clsLower, mut, known): return true
+  return false
+
+proc collectSelfDefs(n: Node; acc: var seq[Node]) =
+  ## every routine def in the tree, including the bodiless method
+  ## declarations kept inside record/object type bodies
+  if n == nil: return
+  if n.kind in {nkProcDef, nkFuncDef, nkMethodDef}:
+    acc.add(n)
+  for s in n.sons:
+    collectSelfDefs(s, acc)
+
+proc selfClsSpelling(def: Node; sp: Node): string =
+  ## the type owning a method: `defClass` when the parser set it, else the
+  ## `self` parameter's own type spelling (a hoisted forward declaration
+  ## can arrive without `defClass`)
+  if def.defClass.len > 0: return def.defClass
+  if sp.len >= 2:
+    var ty = sp[1]
+    if ty.kind == nkVarTy and ty.len > 0: ty = ty[0]
+    if ty.kind == nkIdent: return ty.strVal
+    if ty.kind == nkIndexExpr and ty.len > 0 and ty[0].kind == nkIdent:
+      return ty[0].strVal
+  return ""
+
+proc classifySelfModes*(p: var TParser, module: Node) =
+  ## Value-object methods get `var self` unconditionally at parse time, but
+  ## Delphi passes records by reference implicitly: a read-only method is
+  ## legally called on a by-value parameter (ParseTool `s.IsValid`). Emit
+  ## `self: T` for a method that cannot write `self` and `var self` for the
+  ## rest. Definition-only: a `var` base can call either, so no call site
+  ## changes and no mutation can be lost.
+  var entries: seq[tuple[key, cls: string, body: Node]] = @[]
+  var mut = initTable[string, bool]()
+  var known = initTable[string, bool]()
+  # bodiless declarations live INSIDE the record/object type body (the
+  # emitter hoists them into module-level forwards at render time), so walk
+  # the whole tree, not just the top-level defs
+  var defs: seq[Node] = @[]
+  collectSelfDefs(module, defs)
+  for def in defs:
+    if def.kind notin {nkProcDef, nkFuncDef, nkMethodDef}: continue
+    if def.len < 3 or def[2].kind != nkFormalParams or def[2].len < 2: continue
+    let sp = def[2][1]
+    if sp.kind != nkIdentDefs or sp.len < 2 or sp[0].kind != nkIdent or
+        sp[0].strVal != "self" or sp[1].kind != nkVarTy:
+      continue                     # class ref or class method: leave alone
+    let cls = selfClsSpelling(def, sp)
+    if cls.len == 0: continue
+    known[cls.toLowerAscii & "::" & def[0].strVal.toLowerAscii] = true
+    let ci = p.syms.classes.getOrDefault(cls.toLowerAscii)
+    if ci.spelling.len > 0 and ci.isRef: continue
+    if def[def.len - 1].kind != nkStmtList: continue   # forward declaration
+    entries.add((cls.toLowerAscii & "::" & def[0].strVal.toLowerAscii,
+                 cls.toLowerAscii, def[def.len - 1]))
+  # fixpoint: a method calling another mutating method of the same type is
+  # itself mutating
+  var changed = true
+  while changed:
+    changed = false
+    for e in entries:
+      if mut.getOrDefault(e.key, false): continue
+      if subtreeWritesSelf(e.body, e.cls, mut, known):
+        mut[e.key] = true
+        changed = true
+  # apply to BOTH the forward declaration and the implementation
+  for def in defs:
+    if def.kind notin {nkProcDef, nkFuncDef, nkMethodDef}: continue
+    if def.len < 3 or def[2].kind != nkFormalParams or def[2].len < 2: continue
+    let sp = def[2][1]
+    if sp.kind != nkIdentDefs or sp.len < 2 or sp[0].kind != nkIdent or
+        sp[0].strVal != "self" or sp[1].kind != nkVarTy: continue
+    let cls = selfClsSpelling(def, sp)
+    if cls.len == 0: continue
+    let key = cls.toLowerAscii & "::" & def[0].strVal.toLowerAscii
+    if not mut.getOrDefault(key, false):
+      sp[1] = sp[1][0]             # `var T` -> `T`: read-only method
+
 proc adjustArrayIndices*(p: var TParser, module: Node) =
   for i in 0 ..< module.len:
     discard adjustArrayIndicesInPlace(p, module[i])
@@ -9205,6 +9380,7 @@ proc parseUnit*(p: var TParser): Node =
   genPropertyAccessors(p, p.module)
   initValueResult(p, p.module)
   selfQualifyAll(p, p.module)
+  classifySelfModes(p, p.module)
   adjustArrayIndices(p, p.module)
   classQualifyAll(p, p.module)
   # nimony's checked-exception model: raising call sites must sit inside
