@@ -658,7 +658,13 @@ type
     VWideChar*: uint16
     VError*: int32
     # payloads without a scalar view
-    VString*: string       # varString / varOleStr / varUString
+    # varString / varOleStr / varUString all keep their text here today.
+    # MEASURED (test/ansi/vstrtypes.pas): D2007 and FPC 3.2.2 both tag an
+    # AnsiString AND a plain string as varString (0x0100); WideString is
+    # varOleStr (0x0008). varString's real payload is an AnsiString, so the
+    # mapping split must give it an AnsiString slot rather than a nimony
+    # string (see .dsh/wiki/pas2nimony-ansistring-semantics.md).
+    VString*: string
     VObject*: RootRef      # varUnknown / varDispatch
     VArray*: RootRef       # variant array (VariantArrayObj)
 
@@ -712,9 +718,11 @@ const
   varLongWord* = TVarType(0x0013)
   varInt64* = TVarType(0x0014)
   varUInt64* = TVarType(0x0015)   # FPC only: D2007 stores UInt64 as varInt64
-  varString* = TVarType(0x0100)   # Delphi's AnsiString variant
+  varString* = TVarType(0x0100)   # the AnsiString variant (D2007 + FPC)
   varAny* = TVarType(0x0101)      # FPC only (D2007: E2003)
-  varUString* = TVarType(0x0102)  # FPC / Delphi 2009+
+  varUString* = TVarType(0x0102)  # UnicodeString variant (FPC / D2009+);
+    # measured: FPC 3.2.2 tags a direct UnicodeString assignment varOleStr
+    # (0x0008), not 0x0102, yet still reads the 0x0102 slot as UnicodeString.
   varArray* = TVarType(0x2000)    # OR'd into the tag of a variant array
   varParam* = TVarType(0x4000)    # OR'd in for an untyped `var` parameter
 
@@ -1545,7 +1553,10 @@ proc variantToStr(v: Variant): string =
     result = (if neg: "-" else: "") & s
   of varSingle: result = FloatToStr(v.VSingle)
   of varDouble, varDate: result = FloatToStr(v.VDouble)
-  of varString, varOleStr, varUString: result = v.VString
+  of varString, varOleStr, varUString:
+    # varString really holds an AnsiString in both oracles; VString carries it
+    # until the mapping split gives varString an AnsiString slot
+    result = v.VString
   of varLongWord: result = $v.VLongWord
   of varWord: result = $v.VWord
   of varByte: result = $v.VByte
