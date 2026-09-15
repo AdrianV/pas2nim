@@ -84,6 +84,11 @@ type
     pointerAliases*: Table[string, string] ## P = ^T alias -> element
     routineReturns*: Table[string, string] ## routine name -> return spelling
     routineParams*: Table[string, seq[string]] ## routine name -> param spellings
+    routineIntWidths*: Table[string, seq[string]]
+    ## routine name -> per-position preferred fixed-width Nim int spelling for
+    ## an untyped integer constant ("" = the formal is not a fixed-width int).
+    ## Accumulated across overloads, so Pascal's Integer preference survives a
+    ## later Int64 overload. Drives the call-site literal width cast.
     variantParams*: Table[string, seq[bool]] ## routine -> which params are Variant
     varRawTypes*: Table[string, string] ## var name -> *Pascal* type spelling
                                         ## (Currency is float64 in nimony but
@@ -1743,6 +1748,54 @@ proc parseAnonymousMethod(p: var TParser): Node =
   def.add(body)
   result = def
 
+proc preferredIntWidth(lower: string): string =
+  ## The fixed-width Nim type an untyped Pascal integer constant should take
+  ## in a parameter spelled `lower` ("" when it is not a fixed-width int).
+  ## Pascal prefers Integer (int32) for an untyped constant.
+  case lower
+  of "integer", "int32", "longint": "int32"
+  of "cardinal", "uint32", "longword", "dword": "uint32"
+  of "int16", "smallint": "int16"
+  of "uint16", "word": "uint16"
+  of "int8", "shortint": "int8"
+  of "uint8", "byte": "uint8"
+  else: ""
+
+proc intWidthRank(w: string): int =
+  ## lower is more preferred; int32 first, matching Pascal's Integer
+  case w
+  of "int32": 0
+  of "uint32": 1
+  of "int16": 2
+  of "uint16": 3
+  of "int8": 4
+  of "uint8": 5
+  else: 99
+
+proc intLitFits(v: int64; w: string): bool =
+  case w
+  of "int8": v >= -128'i64 and v <= 127'i64
+  of "uint8": v >= 0'i64 and v <= 255'i64
+  of "int16": v >= -32768'i64 and v <= 32767'i64
+  of "uint16": v >= 0'i64 and v <= 65535'i64
+  of "int32": v >= -2147483648'i64 and v <= 2147483647'i64
+  of "uint32": v >= 0'i64 and v <= 4294967295'i64
+  else: false
+
+proc mergeRoutineIntWidths(p: var TParser; key: string; widths: seq[string]) =
+  ## Remember, per parameter position, a fixed-width int spelling seen in ANY
+  ## overload of `key`. `routineParams` keeps only one signature, so the
+  ## overload that spells Integer can otherwise be lost.
+  var cur = p.routineIntWidths.getOrDefault(key)
+  if cur.len < widths.len: cur.setLen(widths.len)
+  for i, w in widths:
+    if w.len > 0 and intWidthRank(w) < intWidthRank(cur[i]):
+      cur[i] = w
+  var any = false
+  for w in cur:
+    if w.len > 0: any = true
+  if any: p.routineIntWidths[key] = cur
+
 proc primary(p: var TParser): Node =
   # prefix operators
   if p.tok.xkind in {pxNot, pxMinus, pxPlus}:
@@ -1872,6 +1925,54 @@ proc primary(p: var TParser): Node =
           if argTypes.len == 0 and a[0].kind == nkIdent:
             argTypes = p.routineParams.getOrDefault(
               a[0].strVal.toLowerAscii & "." & a[1].strVal.toLowerAscii)
+        # Pascal's untyped integer constant takes the declared parameter's
+        # type; nimony types a bare literal as int64, which can silently pick
+        # another overload (Araq: p.Move(2,3) -> the generic Move). Spell the
+        # width - but only where a formal is a fixed-width int. A float formal
+        # must keep the bare literal: nimony rejects int32 -> float64.
+        var intKey = ""
+        if a.kind == nkIdent:
+          intKey = a.strVal.toLowerAscii
+          if not p.routineIntWidths.hasKey(intKey) and
+              p.selfClass.len > 0 and p.routineIntWidths.hasKey(
+                p.selfClass.toLowerAscii & "." & intKey):
+            intKey = p.selfClass.toLowerAscii & "." & intKey
+          elif not p.routineIntWidths.hasKey(intKey) and
+              p.classOfProc.len > 0 and p.routineIntWidths.hasKey(
+                p.classOfProc.toLowerAscii & "." & intKey):
+            intKey = p.classOfProc.toLowerAscii & "." & intKey
+        elif a.kind == nkDotExpr and a[1].kind == nkIdent and
+            a[0].kind == nkIdent:
+          # the receiver's *class* keys the method's declared params; a bare
+          # method-name or variable-name lookup is a near-miss and is skipped
+          var rcls =
+            if a[0].strVal.toLowerAscii == "self" and p.selfClass.len > 0:
+              p.selfClass
+            else:
+              p.varRawTypes.getOrDefault(a[0].strVal.toLowerAscii)
+          if rcls.len == 0:
+            # a class/record var is filed under varTypes, not varRawTypes
+            let vt = p.varTypes.getOrDefault(a[0].strVal.toLowerAscii)
+            if vt.startsWith("class:"):
+              rcls = vt[6 .. ^1]
+            elif vt.startsWith("record:"):
+              rcls = vt[7 .. ^1]
+          if rcls.len == 0:
+            rcls = p.paramClassTypes.getOrDefault(a[0].strVal.toLowerAscii)
+          if rcls.len > 0:
+            let k2 = rcls.toLowerAscii & "." & a[1].strVal.toLowerAscii
+            if p.routineIntWidths.hasKey(k2): intKey = k2
+        if intKey.len > 0:
+          let ws = p.routineIntWidths.getOrDefault(intKey)
+          for ai in 1 ..< result.len:
+            if ai - 1 >= ws.len: break
+            if result[ai].kind != nkIntLit: continue
+            let w = ws[ai - 1]
+            if w.len > 0 and intLitFits(result[ai].intVal, w):
+              let wc = newNode(nkCall, result[ai].info)
+              wc.add(newIdentNode(w, result[ai].info))
+              wc.add(result[ai])
+              result[ai] = wc
         for ai in 1 ..< result.len:
           if ai - 1 < argTypes.len:
             let pta = argTypes[ai - 1].toLowerAscii
@@ -5008,6 +5109,27 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
   elif p.section == seInterface and p.classOfProc.len > 0 and pspD > 0:
     p.routineParamDefaults[p.classOfProc.toLowerAscii & "." &
                            name.toLowerAscii & ":" & $pspD] = pdef
+  # int-literal call-site widths: registered for BOTH functions and
+  # procedures (a procedure has no return type, so the block below is
+  # skipped for it), so an untyped integer constant passed to a fixed-width
+  # int parameter can be spelled with that width.
+  block:
+    var pspW: seq[string] = @[]
+    for pi in 1 ..< params.len:
+      let d = params[pi]
+      if d.kind == nkIdentDefs and d[d.len - 2].kind == nkIdent:
+        pspW.add(d[d.len - 2].strVal)
+    if pspW.len > 0:
+      var widths: seq[string] = @[]
+      for ps in pspW:
+        widths.add(preferredIntWidth(ps.toLowerAscii))
+      p.mergeRoutineIntWidths(name.toLowerAscii, widths)
+      if p.classOfProc.len > 0:
+        p.mergeRoutineIntWidths(
+            p.classOfProc.toLowerAscii & "." & name.toLowerAscii, widths)
+      if p.selfClass.len > 0:
+        p.mergeRoutineIntWidths(
+            p.selfClass.toLowerAscii & "." & name.toLowerAscii, widths)
   if params[0].kind == nkIdent:
     # the routine's return spelling for `with Call(...)` lowering
     let retSp = params[0].strVal
