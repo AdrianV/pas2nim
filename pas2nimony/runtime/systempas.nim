@@ -15,6 +15,7 @@
 
 import std/[strutils, syncio, times]
 import pasdatetime
+import pasansistring
 
 proc GetTickCount*(): uint32 =
   ## Delphi Windows.GetTickCount - milliseconds since boot. Shimmed
@@ -658,13 +659,19 @@ type
     VWideChar*: uint16
     VError*: int32
     # payloads without a scalar view
-    # varString / varOleStr / varUString all keep their text here today.
     # MEASURED (test/ansi/vstrtypes.pas): D2007 and FPC 3.2.2 both tag an
     # AnsiString AND a plain string as varString (0x0100); WideString is
-    # varOleStr (0x0008). varString's real payload is an AnsiString, so the
-    # mapping split must give it an AnsiString slot rather than a nimony
-    # string (see .dsh/wiki/pas2nimony-ansistring-semantics.md).
-    VString*: string
+    # varOleStr (0x0008). A varString therefore carries either a plain
+    # (system) string or an explicit AnsiString, and the shim stores each in
+    # its natural form:
+    VString*: string          # varString (system string) / varOleStr / varUString
+    VAnsiString*: pointer     # varString (explicit AnsiString). FPC/Delphi keep
+      # a raw pointer here (varianth.inc: "varstring : (vstring : pointer)"),
+      # hard-cast to an AnsiString only while the tag says varString. It must
+      # NOT be a managed AnsiString field: the generated hooks run
+      # unconditionally and the raising-return convention destroys an
+      # uninitialized Variant slot, freeing whatever bits were there.
+      # See .dsh/wiki/pas2nimony-ansistring-semantics.md.
     VObject*: RootRef      # varUnknown / varDispatch
     VArray*: RootRef       # variant array (VariantArrayObj)
 
@@ -1372,8 +1379,9 @@ proc Create*(self: typedesc[EVariantTypeCastError];
 # `int64` AND does not apply converters at all (measured: `f(3)` fails with
 # a matching converter in scope), so the emitter emits the construction
 # explicitly: toVariant(...) for a typed value, pasVarLit(...) for nkIntLit.
-# The converters below are kept for tooling that honours them and to
-# document the mapping.
+# They are plain `proc`s, not `converter`s: a converter is implicitly
+# `.noSideEffect` in nimony, and the string overloads allocate (the AnsiString
+# slot write), which a converter is not allowed to do.
 
 proc vInt(tag: TVarType; x: int64): Variant {.noSideEffect.} =
   ## every integer view of the union is written, so a read through any of
@@ -1435,6 +1443,16 @@ proc vStr(tag: TVarType; s: string): Variant {.noSideEffect.} =
   result = Variant(VType: tag)
   result.VString = s
 
+proc vAnsiStr*(s: AnsiString): Variant =
+  ## an explicit AnsiString takes the raw pointer slot (FPC/Delphi keep a
+  ## pointer there); share its buffer into the slot
+  ## (`AnsiString(vString) := Source`). A plain nimony string does NOT take
+  ## this path - it stays in the managed VString field (vStr), because the
+  ## string<->AnsiString conversion is exactly what the mapping split
+  ## introduces and it must not be eager/implicit here.
+  result = Variant(VType: varString)
+  result.VAnsiString = ansiToPtr(s)
+
 proc vBool(b: bool): Variant {.noSideEffect.} =
   result = Variant(VType: varBoolean)
   result.VBoolean = if b: 1'u16 else: 0'u16
@@ -1457,28 +1475,29 @@ proc pasVarLit*(x: int64): Variant {.noSideEffect.} =
     elif x >= -2147483648'i64: result = vInt(varInteger, x)
     else: result = vInt(varInt64, x)
 
-converter toVariant*(x: int32): Variant = vInt(varInteger, int64(x))
-converter toVariant*(x: int64): Variant = vInt(varInt64, x)
-converter toVariant*(x: int16): Variant = vInt(varSmallint, int64(x))
-converter toVariant*(x: int8): Variant = vInt(varShortInt, int64(x))
-converter toVariant*(x: uint32): Variant = vInt(varLongWord, int64(x))
-converter toVariant*(x: uint16): Variant = vInt(varWord, int64(x))
-converter toVariant*(x: uint8): Variant = vInt(varByte, int64(x))
-converter toVariant*(x: uint64): Variant = vInt(varInt64, cast[int64](x))
+proc toVariant*(x: int32): Variant = vInt(varInteger, int64(x))
+proc toVariant*(x: int64): Variant = vInt(varInt64, x)
+proc toVariant*(x: int16): Variant = vInt(varSmallint, int64(x))
+proc toVariant*(x: int8): Variant = vInt(varShortInt, int64(x))
+proc toVariant*(x: uint32): Variant = vInt(varLongWord, int64(x))
+proc toVariant*(x: uint16): Variant = vInt(varWord, int64(x))
+proc toVariant*(x: uint8): Variant = vInt(varByte, int64(x))
+proc toVariant*(x: uint64): Variant = vInt(varInt64, cast[int64](x))
   ## measured divergence: Delphi has no unsigned 64-bit variant and stores
   ## UInt64 as varInt64; FPC 3.2.2 stores varUInt64 (0x0015)
-converter toVariant*(x: float64): Variant = vReal(varDouble, x)
+proc toVariant*(x: float64): Variant = vReal(varDouble, x)
   ## measured divergence: dcc32 stores a decimal *literal* as varCurrency,
   ## FPC as varDouble. A Nim float64 cannot tell a literal from a typed
   ## Double, so this follows FPC; the emitter can fix it later by routing
   ## nkFloatLit through the shim (see the wiki's open decisions).
-converter toVariant*(x: float32): Variant = vReal(varDouble, float64(x))
+proc toVariant*(x: float32): Variant = vReal(varDouble, float64(x))
   ## measured: Single and Double both land in varDouble in dcc32 and FPC
-converter toVariant*(x: string): Variant = vStr(varString, x)
-converter toVariant*(x: bool): Variant = vBool(x)
-converter toVariant*(x: char): Variant = vStr(varString, $x)
+proc toVariant*(x: string): Variant = vStr(varString, x)
+proc toVariant*(x: AnsiString): Variant = vAnsiStr(x)
+proc toVariant*(x: bool): Variant = vBool(x)
+proc toVariant*(x: char): Variant = vStr(varString, $x)
   ## measured: a Char is stored as a one-character varString in both
-converter toVariant*(x: RootRef): Variant =
+proc toVariant*(x: RootRef): Variant =
   result = Variant(VType: varUnknown)
   result.VObject = x
 
@@ -1553,9 +1572,14 @@ proc variantToStr(v: Variant): string =
     result = (if neg: "-" else: "") & s
   of varSingle: result = FloatToStr(v.VSingle)
   of varDouble, varDate: result = FloatToStr(v.VDouble)
-  of varString, varOleStr, varUString:
-    # varString really holds an AnsiString in both oracles; VString carries it
-    # until the mapping split gives varString an AnsiString slot
+  of varString:
+    # either a nimony string (managed VString) or an explicit AnsiString (the
+    # raw pointer FPC/Delphi keep in the union) - read whichever is set
+    if cast[uint64](v.VAnsiString) != 0:
+      result = ptrToNimString(cast[uint64](v.VAnsiString))
+    else:
+      result = v.VString
+  of varOleStr, varUString:
     result = v.VString
   of varLongWord: result = $v.VLongWord
   of varWord: result = $v.VWord
@@ -1636,13 +1660,13 @@ proc parseFloat64(s: string): float64 {.raises.} =
   result = if neg: -whole else: whole
 
 proc numericOf(v: Variant): float64 {.raises.} =
-  if isStrTag(v.VType): result = parseFloat64(v.VString)
+  if isStrTag(v.VType): result = parseFloat64(variantToStr(v))
   else: result = asFloat64(v)
 
 proc intOf(v: Variant): int64 {.raises.} =
   ## measured: a real rounds half to even (1.9 -> 2, 2.5 -> 2); a numeric
   ## string is parsed ('42' -> 42); a non-numeric string raises
-  if isStrTag(v.VType): result = parseInt64(v.VString)
+  if isStrTag(v.VType): result = parseInt64(variantToStr(v))
   else: result = pasRound(asFloat64(v))
 
 proc VarAsType*(v: Variant; t: TVarType): Variant {.raises.} =
@@ -1655,12 +1679,14 @@ proc VarAsType*(v: Variant; t: TVarType): Variant {.raises.} =
   of varSingle, varDouble, varDate:
     result = vReal(if t == varDate: varDate else: varDouble, numericOf(v))
   of varCurrency:
-    if isStrTag(v.VType): result = vCurrency(parseCurr(v.VString))
+    if isStrTag(v.VType): result = vCurrency(parseCurr(variantToStr(v)))
     else: result = vCurrency(int64(asFloat64(v) * 10000.0))
   of varBoolean:
-    if isStrTag(v.VType): result = vBool(v.VString == "True")
+    if isStrTag(v.VType): result = vBool(variantToStr(v) == "True")
     else: result = vBool(asFloat64(v) != 0.0)
-  of varString, varOleStr, varUString:
+  of varString:
+    result = vStr(varString, variantToStr(v))
+  of varOleStr, varUString:
     result = vStr(t, variantToStr(v))
   else:
     pasCurrentExc = EVariantTypeCastError.Create("Invalid variant conversion")
@@ -1716,7 +1742,7 @@ proc mismatched(): Variant {.raises.} =
 proc pasVarAdd*(a, b: Variant): Variant {.raises.} =
   if vNullOr(a, b): return Null
   if isStrTag(a.VType) and isStrTag(b.VType):
-    return vStr(varString, a.VString & b.VString)
+    return vStr(varString, variantToStr(a) & variantToStr(b))
   if isStrTag(a.VType) or isStrTag(b.VType): return mismatched()
   case promoKind(a, b)
   of vpkCurrency: result = vCurrency(int64(pasRound(promoAdd(a, b) * 10000.0)))

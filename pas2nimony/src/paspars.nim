@@ -6274,6 +6274,20 @@ proc mapStringBuiltins*(p: var TParser, n: Node): Node =
         return cn2
     return n
   case n[0].strVal.toLowerAscii
+  of "string", "ansistring", "widestring", "unicodestring", "shortstring",
+     "tstring":
+    # `AnsiString(v)` / `string(v)` on a Variant is Delphi's explicit
+    # conversion (VarToStr), not a Nim type conversion: nimony rejects
+    # `string(variant)` ("type mismatch: got: auto but wanted: string").
+    # Route it through the shim. Exercised by test/ansi/vstrtypes.pas; the
+    # later-Delphi branch of fs_itools.VarRecToVariant has the same shape
+    # for a Variant-array element.
+    if n.len == 2 and isVariantExpr(p, n[1]):
+      var vc = newNode(nkCall, n.info)
+      vc.add(newIdentNode("VarToStr", n.info))
+      vc.add(n[1])
+      return vc
+    return n
   of "pointer":
     # the `Pointer(x)` reinterpretation: Delphi allows it when Integer
     # and Pointer are the same size (the Win32 origin), and FPC still

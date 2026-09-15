@@ -1,5 +1,6 @@
 import std/syncio
 import systempas
+import pasansistring
 
 # Shim-level Variant conformance test.
 #
@@ -101,6 +102,29 @@ chk("VarToStr null", "[" & text(v) & "]", "[]")
 v = Unassigned
 chk("VarToStr unassigned", "[" & text(v) & "]", "[]")
 
+# --- varString holds a real AnsiString (FPC/Delphi pointer slot) -----------
+# The slot is a raw pointer, hard-cast to an AnsiString only here - it is not
+# a managed AnsiString field (that crashed on the raising-return path, because
+# the generated hook freed whatever bits were in the union).
+proc ansiChecks() =
+  let hello = toAnsiString("hello")
+  let vh = toVariant(hello)
+  chk("ansi var type", $VarType(vh), "256")
+  chk("ansi var str", VarToStr(vh), "hello")
+  chk("ansi slot text",
+      ptrToNimString(cast[uint64](vh.VAnsiString)), "hello")
+  chk("ansi slot refcount", $refCount(hello), "2")
+  var s: string = "plain"
+  let vs = toVariant(s)
+  chk("plain var type", $VarType(vs), "256")
+  chk("plain var str", VarToStr(vs), "plain")
+  let ve = toVariant("")
+  chk("empty var type", $VarType(ve), "256")
+  chk("empty var text", VarToStr(ve), "")
+  let vc = toVariant('x')
+  chk("char var type", $VarType(vc), "256")
+  chk("char var str", VarToStr(vc), "x")
+
 # --- the raising half ------------------------------------------------------
 proc raisingChecks() {.raises.} =
   var f19: float64 = 1.9
@@ -121,8 +145,8 @@ proc raisingChecks() {.raises.} =
   var s2 = l + w
   chk("int64+int code", code(s2), "20")
   chk("int64+int text", text(s2), "-1234567890121")
-  var sa: Variant = "a"
-  var sb: Variant = "b"
+  var sa: Variant = toVariant("a")
+  var sb: Variant = toVariant("b")
   var cat = sa + sb
   chk("str+str code", code(cat), "256")
   chk("str+str text", text(cat), "ab")
@@ -161,6 +185,8 @@ proc raisingChecks() {.raises.} =
   var a2 = VarArrayOf([pasVarLit(1), pasVarLit(2), pasVarLit(3)])
   chk("VarArrayOf highbound", $VarArrayHighBound(a2, 1), "2")
   chk("VarArrayOf element 2", text(a2[2]), "3")
+
+ansiChecks()
 
 var raised = false
 try:

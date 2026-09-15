@@ -21,7 +21,7 @@
 import std/atomics
 
 type
-  StrRec* {.pure, final, packed.} = object
+  StrRec* {.pure, final.} = object
     refCnt*: int32
     length*: int32
   StrRecPtr* = ptr StrRec
@@ -203,6 +203,45 @@ proc toAnsiString*(s: cstring): AnsiString =
   if n > 0:
     result.data = newAnsiString(n)
     copyMem(cast[pointer](result.data), cast[pointer](p), int(n))
+
+# --- varString slot bridge --------------------------------------------------
+# Delphi/FPC keep a variant's string in a *pointer* slot, hard-cast to an
+# AnsiString only where the tag says varString (varianth.inc:
+# "varstring : (vstring : pointer)"; variants.pp: "AnsiString(vString) :=
+# Source"). The slot must never be a managed AnsiString field: the Variant's
+# generated hooks run unconditionally, and the raising-return convention
+# destroys a Variant slot that was never initialized, which would free
+# whatever bits were there. These helpers are the explicit hard casts.
+
+proc ansiToPtr*(a: AnsiString): pointer =
+  ## share `a` and hand out its char pointer with one extra reference; the
+  ## caller owns that reference.
+  result = cast[pointer](a.data)
+  if not isNil(a):
+    let p = a.rec
+    if p[].refCnt > 0:
+      discard atomicFetchAdd(p[].refCnt, 1'i32)
+
+proc ptrToNimString*(p: uint64): string =
+  ## the text of a varString slot as a *pure borrow*: no AnsiString reference
+  ## is created, so there is nothing to release. Use this on the read path -
+  ## a `ptrToAnsiString` temporary in an argument position is not destroyed
+  ## by nimony, which would leak one reference per read.
+  result = ""
+  if p != 0:
+    result = fromCString(cast[cstring](p))
+
+proc ptrToAnsiString*(p: uint64): AnsiString =
+  ## reinterpret a varString slot pointer as an AnsiString and take a
+  ## reference; the caller owns (and destroys) the result. This is the
+  ## `AnsiString(vString)` hard cast of Delphi/FPC. The slot travels as a
+  ## uint64 so nimony's non-nil `pointer` parameter rule cannot reject it.
+  result = default(AnsiString)
+  if p != 0:
+    result.data = cast[AnsiStringData](p)
+    let r = result.rec
+    if r[].refCnt > 0:
+      discard atomicFetchAdd(r[].refCnt, 1'i32)
 
 proc concat(a, b: AnsiString): AnsiStringData =
   result = cast[AnsiStringData](0)
