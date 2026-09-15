@@ -33,6 +33,14 @@ type
     delta*: int32
     length*: int32
 
+# Byte-correctness guard. Delphi's StrRec is a *packed* record of two
+# Longint -> 8 bytes, fields at 0 and 4, data at 8. `packed` is omitted
+# because GCC warns -Waddress-of-packed-member on every refcount atomic (and
+# the harness captured the warning as program output). That is safe only
+# while the layout still matches, so fail the build if it ever does not.
+when sizeof(StrRec) != 8:
+  {.error: "StrRec must be 8 bytes to stay byte-compatible with Delphi".}
+
 template needLength(len: int32): int32 =
   let length = len
   int32(length + int32(sizeof(StrRec)) + 1'i32 + ((length + 1'i32) and 1'i32))

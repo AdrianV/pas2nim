@@ -56,6 +56,17 @@ block:
   chk("embedded nul bytes", bytes(z), "97 98 0 99 100 ")
   chk("embedded nul toString len", $toString(z).len, "5")
 
+# --- Delphi byte layout -----------------------------------------------------
+# StrRec sits immediately before the data pointer: refCnt at -8, length at
+# -4 (little-endian int32) - exactly Delphi's packed record. The compile-time
+# `when sizeof(StrRec) != 8: {.error.}` guard caps the size; this reads the
+# raw bytes, because old 32-bit Delphi code can depend on these offsets.
+block:
+  let s = toAnsiString("hello")
+  let base = cast[uint](raw(s))
+  chk("layout refCnt@-8", $cast[ptr int32](base - 8)[], "1")
+  chk("layout length@-4", $cast[ptr int32](base - 4)[], "5")
+
 # --- refcount / copy on write ----------------------------------------------
 block:
   var a = toAnsiString("hello")
