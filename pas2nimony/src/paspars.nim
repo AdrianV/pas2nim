@@ -1772,6 +1772,16 @@ proc intWidthRank(w: string): int =
   of "uint8": 5
   else: 99
 
+proc intBitRank(w: string): int =
+  ## operand-width size for the bit operators (0 = not a known int width);
+  ## unlike `intWidthRank` this is a size, not a preference
+  case w
+  of "int8", "uint8": 1
+  of "int16", "uint16": 2
+  of "int32", "uint32": 3
+  of "int64", "uint64": 4
+  else: 0
+
 proc intLitFits(v: int64; w: string): bool =
   case w
   of "int8": v >= -128'i64 and v <= 127'i64
@@ -2381,16 +2391,45 @@ proc lowestExprAux(p: var TParser, v: var Node, limit: int): TTokKind =
           v2 = c
       # a bit-op's ord() operand: nimony's ord types int64, a narrow
       # declared width needs the cast at the operator boundary
-      if op in {pxAnd, pxOr, pxXor, pxShl, pxShr}:
+      if op in {pxAnd, pxOr, pxXor, pxShl, pxShr, pxPlus, pxMinus, pxStar}:
         let lt = rhsExprType(p, v)
-        if lt in ["int8", "uint8", "int16", "uint16", "int32", "uint32"]:
-          if v2.kind == nkCall and v2.len == 2 and
-              v2[0].kind == nkIdent and
-              v2[0].strVal.toLowerAscii == "ord":
+        let rt = rhsExprType(p, v2)
+        # nimony rejects a mixed-width integer op and leaves the expression
+        # `auto` (`Integer or Byte`, synacode Decode4to3Ex). Delphi
+        # promotes the narrower operand to the wider for and/or/xor and
+        # keeps the LEFT width for shl. A bare literal is left alone: it
+        # already adapts to the other operand's context.
+        let vLit = v.kind in {nkIntLit, nkInt64Lit, nkCharLit}
+        let v2Lit = v2.kind in {nkIntLit, nkInt64Lit, nkCharLit}
+        let lb = intBitRank(lt)
+        let rb = intBitRank(rt)
+        if op == pxShl:
+          if lb > 0 and rb > 0 and lt != rt and not v2Lit:
             let wc = newNode(nkCall, v2.info)
             wc.add(newIdentNode(lt, v2.info))
             wc.add(v2)
             v2 = wc
+        elif op in {pxAnd, pxOr, pxXor, pxPlus, pxMinus, pxStar} and
+            lb > 0 and rb > 0 and lt != rt and not vLit and not v2Lit:
+          if lb >= rb:
+            let wc = newNode(nkCall, v2.info)
+            wc.add(newIdentNode(lt, v2.info))
+            wc.add(v2)
+            v2 = wc
+          else:
+            let wc = newNode(nkCall, v.info)
+            wc.add(newIdentNode(rt, v.info))
+            wc.add(v)
+            node[1] = wc
+            v = wc
+        if op in {pxAnd, pxOr, pxXor, pxShl, pxShr} and
+            lb in 1 .. 3 and v2.kind == nkCall and v2.len == 2 and
+            v2[0].kind == nkIdent and
+            v2[0].strVal.toLowerAscii == "ord":
+          let wc = newNode(nkCall, v2.info)
+          wc.add(newIdentNode(lt, v2.info))
+          wc.add(v2)
+          v2 = wc
       node.add(v2)
     v = p.rewriteMethodPtrNilCmp(node)
     op = nextop
@@ -6525,10 +6564,34 @@ proc rhsExprType(p: var TParser, n: Node): string =
           result = p.fieldTypes.getOrDefault(
               wc.toLowerAscii & "." & n[1].strVal.toLowerAscii)
     else: result = ""
+  of nkIndexExpr:
+    # `d[i]` / `s[i]`: the element spelling of the indexed container.
+    # Without this, a bit-op on an array element (`d[1] and $30`) fell
+    # back to the literal's `int32`, and the `shr` rewrite then chose
+    # `uint32` - widening the whole expression away from its declared
+    # `Byte` (the synacode Decode4to3 cluster).
+    result = ""
+    if n.len >= 2 and n[0].kind == nkIdent:
+      let k = n[0].strVal.toLowerAscii
+      let raw = p.arrayVarElemTypes.getOrDefault(k, "")
+      if raw.len > 0:
+        result = rtlSpelling(raw.toLowerAscii)
+        if result.len == 0: result = raw.toLowerAscii
+      if result.len == 0 and p.varTypes.getOrDefault(k) == "string":
+        result = "char"
   of nkCall:
     if n.len > 0 and n[0].kind == nkIdent:
       let ck = n[0].strVal.toLowerAscii
-      if ck in ["pointer", "addr"]:
+      if ck in ["int8", "uint8", "int16", "uint16", "int32", "uint32",
+                "int64", "uint64"]:
+        # an explicit width conversion (`int32(x)`, `Integer(x)`) has a
+        # known result width; without this the bit-op coercer saw "" and
+        # left `Cardinal and int32(255)` mixed (synacode UpdateCrc32)
+        result = ck
+      elif rtlSpelling(ck) in ["int8", "uint8", "int16", "uint16",
+                               "int32", "uint32", "int64", "uint64"]:
+        result = rtlSpelling(ck)
+      elif ck in ["pointer", "addr"]:
         # `Pointer(x)` / `addr(x)`: a raw address (the cstring rule
         # needs to see it to insert the cast at a cstring target)
         result = "pointer"
@@ -6553,21 +6616,26 @@ proc rhsExprType(p: var TParser, n: Node): string =
     else: result = ""
   of nkInfix:
     if n.len == 3:
-      let lt = rhsExprType(p, n[1])
-      let rt = rhsExprType(p, n[2])
+      var lt = rhsExprType(p, n[1])
+      var rt = rhsExprType(p, n[2])
+      # a bare integer literal adapts to the other operand's declared
+      # width, so it must not drag the result to `int32` (`uint8_expr + 9`
+      # is `uint8` in nimony, not `int32`)
+      let lLit = n[1].kind in {nkIntLit, nkInt64Lit, nkCharLit}
+      let rLit = n[2].kind in {nkIntLit, nkInt64Lit, nkCharLit}
+      if lLit and not rLit: lt = rt
+      if rLit and not lLit: rt = lt
+      let lb = intBitRank(lt)
+      let rb = intBitRank(rt)
       if lt.startsWith("record:"): result = lt
       elif rt.startsWith("record:"): result = rt
       elif lt in ["float32", "float64"] or rt in ["float32", "float64"]:
         result = "float64"
-      elif n[0].kind == nkIdent and n[0].strVal in
-          ["and", "or", "xor", "shl", "shr"] and
-          (lt in ["int8", "uint8", "int16", "uint16", "int32", "uint32"] or
-           rt in ["int8", "uint8", "int16", "uint16", "int32", "uint32"]):
-        # bit operators keep the narrow operand's own width (Delphi
-        # semantics; the other side may be a call of unknown type)
-        result = if lt in ["int8", "uint8", "int16", "uint16", "int32",
-                           "uint32"]: lt else: rt
-      elif lt.len > 0 and rt.len > 0: result = "int32"
+      elif lb > 0 and rb > 0:
+        # both operands have a declared width: the wider one wins
+        result = if lb >= rb: lt else: rt
+      elif lb > 0: result = lt
+      elif rb > 0: result = rt
       else: result = ""
     else: result = ""
   else: result = ""
@@ -8012,7 +8080,7 @@ proc parseStmt*(p: var TParser): Node =
           c.add(b)
           result[1] = c
       if a.kind in {nkIdent, nkIndexExpr} and
-          b.kind in {nkInfix, nkCall, nkPrefix}:
+          b.kind in {nkInfix, nkCall, nkPrefix, nkIdent}:
         # (nkPrefix: a negative literal like `-512` types as int in
         # nimony - an int32 target needs the width cast too)
         # Pascal computes Integer arithmetic in the declared width;
@@ -8033,10 +8101,19 @@ proc parseStmt*(p: var TParser): Node =
             if lhsTy.len == 0: lhsTy = el.toLowerAscii
         if lhsTy in ["int8", "uint8", "int16", "uint16", "int32",
                     "uint32", "int64", "uint64"]:
-          let castN = newNode(nkCall, b.info)
-          castN.add(newIdentNode(lhsTy, b.info))
-          castN.add(b)
-          result[1] = castN
+          # a bare ident RHS only needs the cast when it is wider than
+          # the target (`P: Byte := Cnt: Word`); literal arithmetic and
+          # calls always need the declared width
+          var needCast = b.kind != nkIdent
+          if not needCast:
+            let rr = intBitRank(rhsExprType(p, b))
+            let lr = intBitRank(lhsTy)
+            if rr > 0 and lr > 0 and rr > lr: needCast = true
+          if needCast:
+            let castN = newNode(nkCall, b.info)
+            castN.add(newIdentNode(lhsTy, b.info))
+            castN.add(b)
+            result[1] = castN
       # Delphi's literal cross-type assignments: `s := 'x'` (a char
       # literal into a string target) and `c := ''` (empty into char)
       if a.kind == nkIdent or (a.kind == nkDotExpr and a.len == 2):
@@ -8519,6 +8596,15 @@ proc adjustArrayIndicesInPlace(p: var TParser, n: Node): Node =
         minus.add(n[1])
         minus.add(newIntNode(nkIntLit, int64(low), n[1].info))
         n[1] = minus
+    # nimony's `[]` accepts only a 32-bit index: a narrow (`Byte`) or
+    # 64-bit index fails ("Type mismatch at [position]"). Delphi accepts
+    # any ordinal, so widen the index to int32.
+    let it = rhsExprType(p, n[1])
+    if it in ["int8", "uint8", "int16", "uint16", "int64", "uint64"]:
+      let wc = newNode(nkCall, n[1].info)
+      wc.add(newIdentNode("int32", n[1].info))
+      wc.add(n[1])
+      n[1] = wc
     return n
   for i in 0 ..< n.len:
     n[i] = adjustArrayIndicesInPlace(p, n[i])
