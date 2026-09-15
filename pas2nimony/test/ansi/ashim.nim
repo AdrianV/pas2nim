@@ -48,6 +48,13 @@ chk("abc[2]", cs(toAnsiString("abc")[2]), "c")
 chk("abc bytes", bytes(toAnsiString("abc")), "97 98 99 ")
 chk("roundtrip", toString(toAnsiString("hello")), "hello")
 chk("roundtrip empty", toString(toAnsiString("")), "")
+# Delphi counts bytes: an embedded NUL is data, not a terminator. A
+# cstring/fromCString round-trip silently truncates here.
+block:
+  let z = toAnsiString("ab\0cd")
+  chk("embedded nul len", $z.len, "5")
+  chk("embedded nul bytes", bytes(z), "97 98 0 99 100 ")
+  chk("embedded nul toString len", $toString(z).len, "5")
 
 # --- refcount / copy on write ----------------------------------------------
 block:

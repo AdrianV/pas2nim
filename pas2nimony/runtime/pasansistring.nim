@@ -83,17 +83,17 @@ proc high*(s: AnsiString): int32 =
   result = s.len - 1'i32
 
 proc toString*(s: AnsiString): string =
-  ## Build the nimony string from the AnsiString buffer as a C string:
-  ## every AnsiString carries a terminating zero just past its data (set
-  ## in newAnsiString), and nimony's fromCString copies from a cstring
-  ## without us assuming anything about the nimony string layout.
-  ## Tradeoff: like every cstring round-trip, an embedded \0 truncates;
-  ## Delphi lengths an AnsiString by its header, so a string with an
-  ## embedded \0 must not be routed through this conversion.
-  if isNil(s):
-    result = ""
-  else:
-    result = fromCString(cast[cstring](s.data))
+  ## Build the nimony string by the AnsiString's *counted* length, exactly
+  ## like Delphi: an embedded \0 is data, not a terminator. This is the
+  ## Nim-1 reference's newString(length) + copyMem(addr result[0], ...);
+  ## `addr result[0]` is spelled toCString(result) because nimony rejects
+  ## the address of a not-yet-written string element.
+  result = ""
+  let length = s.len
+  if length > 0'i32:
+    result = newString(int(length))
+    copyMem(cast[pointer](toCString(result)), cast[pointer](s.data),
+        int(length))
 
 template `$`*(s: AnsiString): string = toString(s)
 
@@ -229,7 +229,11 @@ proc ptrToNimString*(p: uint): string =
   ## by nimony, which would leak one reference per read.
   result = ""
   if p != 0:
-    result = fromCString(cast[cstring](p))
+    let data = cast[AnsiStringData](p)
+    let length = data.rec.length
+    if length > 0'i32:
+      result = newString(int(length))
+      copyMem(cast[pointer](toCString(result)), cast[pointer](p), int(length))
 
 proc ptrToAnsiString*(p: uint): AnsiString =
   ## reinterpret a varString slot pointer as an AnsiString and take a
