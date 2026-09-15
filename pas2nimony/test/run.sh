@@ -466,6 +466,13 @@ if ! sh "$HERE/oracle.sh"; then
   echo "   ORACLE FAILED"; fail=1
 fi
 
+# AnsiString conformance tier: direct model test under nimony plus the
+# FPC/Delphi differential over test/ansi/*.pas. The shim leg is the gate
+# that must stay green before the ansistring -> string mapping is split.
+if ! sh "$HERE/ansi/ansi-oracle.sh"; then
+  echo "   ANSI ORACLE FAILED"; fail=1
+fi
+
 # keep the generated artifacts for inspection, but drop the build cache
 rm -rf "$TMP/nimcache"
 exit $fail
