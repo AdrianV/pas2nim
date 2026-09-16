@@ -290,6 +290,9 @@ proc emitTypeDesc(e: var NifEmitter; n: Node) =
   case n.kind
   of nkIdent:
     e.buf.addIdent(e.nameOf(n), i)
+  of nkIntLit, nkInt64Lit:
+    # a static generic argument, (at ConstAnsiLit 3)
+    e.buf.addIntLit(n.intVal, i)
   of nkArrayTy:
     # (at array len elem) - Pascal's lo..hi becomes a 0-based length
     e.buf.copyInto(globalTags.registerTag("at"), i):
@@ -821,6 +824,77 @@ proc emitVarDef(e: var NifEmitter; d: Node; tag: string) =
       else:
         e.emitDefaultInit(d[d.len - 2], vi)
 
+proc emitAnsiStringConst(e: var NifEmitter; d: Node) =
+  ## Pascal \`const X: AnsiString = 'lit'\`: a read-only literal in static
+  ## storage. Emit the ConstAnsiLit backing plus a module-level \`let\` view
+  ## (refCnt = -1 marks the buffer; the first write detaches). Shape probed
+  ## against nifler: (oconstr (at ConstAnsiLit N) (kv rec (oconstr StrRec
+  ## (kv refCnt (call int32 -1)) (kv length (call int32 N)))) (kv buf
+  ## (bracket (call char C)...))).
+  let i = d.info
+  let name = e.canon(d[0].strVal)
+  let lit = d[d.len - 1].strVal
+  let n = lit.len
+  let litName = "pasLit_" & name
+  # backing: const pasLit_X = ConstAnsiLit[N](...)
+  let backing = newNode(nkIdentDefs, i)
+  backing.add(newIdentNode(litName, i))
+  backing.add(newNode(nkEmpty, i))
+  let oc = newNode(nkOconstr, i)
+  let tyIdx = newNode(nkIndexExpr, i)
+  tyIdx.add(newIdentNode("ConstAnsiLit", i))
+  tyIdx.add(newIntNode(nkIntLit, n, i))
+  oc.add(tyIdx)
+  let recOc = newNode(nkOconstr, i)
+  recOc.add(newIdentNode("StrRec", i))
+  let kvRc = newNode(nkCall, i)
+  kvRc.add(newIdentNode("kv", i))
+  kvRc.add(newIdentNode("refCnt", i))
+  let negOne = newNode(nkCall, i)
+  negOne.add(newIdentNode("int32", i))
+  negOne.add(newIntNode(nkIntLit, -1, i))
+  kvRc.add(negOne)
+  recOc.add(kvRc)
+  let kvLen = newNode(nkCall, i)
+  kvLen.add(newIdentNode("kv", i))
+  kvLen.add(newIdentNode("length", i))
+  let lenCall = newNode(nkCall, i)
+  lenCall.add(newIdentNode("int32", i))
+  lenCall.add(newIntNode(nkIntLit, n, i))
+  kvLen.add(lenCall)
+  recOc.add(kvLen)
+  let kvRec = newNode(nkCall, i)
+  kvRec.add(newIdentNode("kv", i))
+  kvRec.add(newIdentNode("rec", i))
+  kvRec.add(recOc)
+  oc.add(kvRec)
+  let br = newNode(nkBracket, i)
+  for c in lit:
+    let cc = newNode(nkCall, i)
+    cc.add(newIdentNode("char", i))
+    cc.add(newIntNode(nkIntLit, int(uint8(c)), i))
+    br.add(cc)
+  let cc0 = newNode(nkCall, i)
+  cc0.add(newIdentNode("char", i))
+  cc0.add(newIntNode(nkIntLit, 0, i))
+  br.add(cc0)
+  let kvBuf = newNode(nkCall, i)
+  kvBuf.add(newIdentNode("kv", i))
+  kvBuf.add(newIdentNode("buf", i))
+  kvBuf.add(br)
+  oc.add(kvBuf)
+  backing.add(oc)
+  e.emitVarDef(backing, "const")
+  # view: let X: AnsiString = toAnsiStringLit(pasLit_X)
+  let view = newNode(nkIdentDefs, i)
+  view.add(d[0])
+  view.add(newIdentNode("AnsiString", i))
+  let call = newNode(nkCall, i)
+  call.add(newIdentNode("toAnsiStringLit", i))
+  call.add(newIdentNode(litName, i))
+  view.add(call)
+  e.emitVarDef(view, "let")
+
 proc emitDef(e: var NifEmitter; n: Node) =
   case n.kind
   of nkProcDef, nkFuncDef, nkMethodDef, nkTemplateDef:
@@ -854,7 +928,13 @@ proc emitDef(e: var NifEmitter; n: Node) =
   of nkConstSection:
     for d in n.sons:
       if d.kind == nkIdentDefs:
-        e.emitVarDef(d, "const")
+        # Pascal const AnsiString literal: static-storage backing + let view
+        if d[d.len - 2].kind == nkIdent and
+            d[d.len - 2].strVal.toLowerAscii == "ansistring" and
+            d[d.len - 1].kind in {nkStrLit, nkCharLit}:
+          e.emitAnsiStringConst(d)
+        else:
+          e.emitVarDef(d, "const")
   of nkImportStmt:
     # a forwarded `{$if <expr>}` among the units becomes a guarded
     # import: the plain units go into the `(import ...)` list and the

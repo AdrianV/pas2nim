@@ -6553,6 +6553,12 @@ proc rhsExprType(p: var TParser, n: Node): string =
     result = p.varTypes.getOrDefault(n.strVal.toLowerAscii)
     if result.len == 0:
       result = p.varRawTypes.getOrDefault(n.strVal.toLowerAscii)
+    if result.len == 0:
+      # a typed const carries its declared type (absent from varTypes)
+      let ct = p.constTypes.getOrDefault(n.strVal.toLowerAscii)
+      if ct.len > 0:
+        result = rtlSpelling(ct.toLowerAscii)
+        if result.len == 0: result = ct
     if result.len == 0 and p.selfClass.len > 0:
       result = p.fieldTypes.getOrDefault(
           p.selfClass.toLowerAscii & "." & n.strVal.toLowerAscii)

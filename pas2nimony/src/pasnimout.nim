@@ -812,6 +812,26 @@ proc stmt(s: var TRendor, n: Node) =
       # nkVarSection rule): importing units read the name
       let star = if d[0].exported: "*" else: ""
       let tyStr = s.typeStr(d[1])
+      # Pascal `const X: AnsiString = 'lit'`: a read-only literal in static
+      # storage. refCnt = -1 marks it so the first write detaches. A nimony
+      # `const` of the AnsiString object hits a C-codegen bug (the
+      # toAnsiStringLit index becomes an undeclared symbol), so the backing is
+      # a ConstAnsiLit const with a module-level `let` view beside it.
+      if tyStr.toLowerAscii == "ansistring" and d[2].kind in {nkStrLit, nkCharLit}:
+        let lit = d[2].strVal
+        let n = lit.len
+        var buf = "["
+        for i in 0 ..< n:
+          if i > 0: buf.add(", ")
+          buf.add("char(" & $uint8(lit[i]) & ")")
+        if n > 0: buf.add(", ")
+        buf.add("char(0)]")
+        let litName = "pasLit_" & name
+        s.line("const " & tickName(litName) & star & " = ConstAnsiLit[" & $n &
+            "](rec: StrRec(refCnt: -1'i32, length: " & $n & "'i32), buf: " & buf & ")")
+        s.line("let " & tickName(name) & star & ": AnsiString = toAnsiStringLit(" &
+            tickName(litName) & ")")
+        continue
       let valStr = s.expr(d[2])
       if tyStr.len > 0:
         s.line("const " & tickName(name) & star & ": " & tyStr & " = " & valStr)
