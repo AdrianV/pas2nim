@@ -530,7 +530,7 @@ const RtlNames* = [
   ("hresult", "int32"), ("dword", "uint32"), ("qword", "uint64"),
   ("nativeint", "int"), ("nativeuint", "uint"),
   ("textfile", "File"), ("text", "File"),
-  ("string", "string"), ("ansistring", "string"), ("widestring", "string"),
+  ("string", "string"), ("ansistring", "AnsiString"), ("widestring", "string"),
   ("unicodestring", "string"), ("shortstring", "string"), ("tstring", "string"),
   ("singlefloat", "float32"), ("tclass", "RootRef"),
   ("tdatetime", "TDateTime"),

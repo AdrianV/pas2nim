@@ -332,9 +332,11 @@ proc defaultInit(s: var TRendor, ty: Node): string =
       result = "'\\x00'"
     of "bool", "boolean":
       result = "false"
-    of "string", "ansistring", "widestring", "unicodestring", "shortstring",
+    of "string", "widestring", "unicodestring", "shortstring",
        "tstring":
       result = "\"\""
+    of "ansistring":
+      result = "default(AnsiString)"
     of "single", "double", "float", "float32", "float64", "real", "extended":
       result = "0.0"
     of "tobject", "rootref", "pointer", "pchar", "pwidechar":

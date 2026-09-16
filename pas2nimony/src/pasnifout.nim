@@ -353,9 +353,13 @@ proc emitDefaultInit(e: var NifEmitter; ty: Node; i: NifLineInfo) =
       e.buf.addCharLit('\x00', i)
     of "bool", "boolean":
       e.buf.addIdent("false", i)
-    of "string", "ansistring", "widestring", "unicodestring", "shortstring",
+    of "string", "widestring", "unicodestring", "shortstring",
        "tstring":
       e.buf.addStrLit("", i)
+    of "ansistring":
+      e.buf.copyInto(globalTags.registerTag("call"), i):
+        e.buf.addIdent("default", i)
+        e.buf.addIdent(e.canon("AnsiString"), i)
     of "single", "double", "float", "float32", "float64", "real", "extended":
       e.buf.addFloatLit(0.0, i)
     of "tobject", "rootref", "pointer", "pchar", "pwidechar":

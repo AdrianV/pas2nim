@@ -16,6 +16,7 @@
 import std/[strutils, syncio, times]
 import pasdatetime
 import pasansistring
+export pasansistring
 
 proc GetTickCount*(): uint32 =
   ## Delphi Windows.GetTickCount - milliseconds since boot. Shimmed
@@ -38,6 +39,27 @@ proc strInsert*(src: string; s: var string; idx: int32) =
   ## Delphi Insert(src, s, idx): insert src before the 1-based idx
   if idx < 1: return
   s = substr(s, 0, idx - 2) & src & substr(s, idx - 1)
+
+# AnsiString variants: the in-place mutators round-trip through the string
+# representation so the byte layout and COW detach stay in the model.
+proc strDelete*(s: var AnsiString; idx, cnt: int32) =
+  var t = toString(s)
+  strDelete(t, idx, cnt)
+  var a = toAnsiString(t)
+  moveInto(s, a)
+
+proc strInsert*(src: string; s: var AnsiString; idx: int32) =
+  var t = toString(s)
+  strInsert(src, t, idx)
+  var a = toAnsiString(t)
+  moveInto(s, a)
+
+proc strInsert*(src: AnsiString; s: var AnsiString; idx: int32) =
+  var t = toString(s)
+  var sr = toString(src)
+  strInsert(sr, t, idx)
+  var a = toAnsiString(t)
+  moveInto(s, a)
 
 proc ChrToStr*(c: char): string =
   result = ""
@@ -434,10 +456,18 @@ proc Len32*[T](x: openArray[T]): int32 =
   ## Pascal Length(array) = Integer (int32)
   result = int32(len(x))
 
+proc Len32*(s: AnsiString): int32 =
+  ## Pascal Length(AnsiString) = Integer (int32)
+  result = s.len
+
 proc Length*(s: string): int32 =
   ## `System.Length(s)` arrives QUALIFIED, so the unqualified rewrite to
   ## Len32 does not see it; this exported spelling covers that path.
   result = Len32(s)
+
+proc Length*(s: AnsiString): int32 =
+  ## `System.Length(s)` on an explicit AnsiString
+  result = s.len
 
 proc Length*[T](x: openArray[T]): int32 =
   result = Len32(x)
@@ -848,6 +878,12 @@ const
 
 proc pasFind*(s: string; sub: string): int32 = int32(find(s, sub))
 proc pasFind*(s: string; sub: char): int32 = int32(find(s, sub))
+proc pasFind*(s: AnsiString; sub: string): int32 =
+  int32(find(toString(s), sub))
+proc pasFind*(s: AnsiString; sub: AnsiString): int32 =
+  int32(find(toString(s), toString(sub)))
+proc pasFind*(s: AnsiString; sub: char): int32 =
+  int32(find(toString(s), sub))
 
 # Delphi `StringReplace`/`TReplaceFlags`. The generated call passes the
 # flags in a Pascal set literal (`[rfReplaceAll]`), which the emitter
@@ -910,7 +946,11 @@ proc TrimRight*(s: string): string =
 proc CompareStr*(a, b: string): int =
   if a < b: -1 elif a > b: 1 else: 0
 
+proc CompareStr*(a: AnsiString; b: AnsiString): int = cmp(a, b)
+proc CompareStr*(a: AnsiString; b: string): int = cmp(a, toAnsiString(b))
+proc CompareStr*(a: string; b: AnsiString): int = cmp(toAnsiString(a), b)
 proc AnsiCompareStr*(a, b: string): int = CompareStr(a, b)
+proc AnsiCompareStr*(a, b: AnsiString): int = cmp(a, b)
 proc AnsiCompareText*(a, b: string): int = CompareText(a, b)
 proc AnsiUpperCase*(s: string): string = UpperCase(s)
 proc AnsiLowerCase*(s: string): string = LowerCase(s)

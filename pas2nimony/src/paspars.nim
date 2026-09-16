@@ -1612,8 +1612,10 @@ proc bracketExprList(p: var TParser, first: Node): Node =
       getTokP(p)
       skipCom(p)
     idxs.add(a)
-  # Delphi strings are 1-based; nimony's `string` is 0-based
-  if idxs.len == 1 and stringBaseType(p, head) == "string":
+  # Delphi strings are 1-based; nimony's `string` is 0-based. AnsiString
+  # is a distinct type with the same 1-based Pascal indexing.
+  let baseTy = stringBaseType(p, head)
+  if idxs.len == 1 and baseTy in ["string", "AnsiString", "ansistring"]:
     idxs[0] = decIndex(p, idxs[0])
   result = head
   for x in idxs:
@@ -6176,6 +6178,12 @@ proc fixExit(p: var TParser, n: Node): bool =
   # legacy helper; `Exit` is now handled directly in parseStmt
   result = false
 
+proc wrapBridge*(name: string; e: Node): Node =
+  ## explicit representation bridge (toAnsiString / toString)
+  result = newNode(nkCall, e.info)
+  result.add(newIdentNode(name, e.info))
+  result.add(e)
+
 proc asStrOperand(n: Node): Node =
   ## `$n` for non-string operands; string literals pass through;
   ## pasW calls already produce Pascal-formatted strings
@@ -6611,6 +6619,18 @@ proc rhsExprType(p: var TParser, n: Node): string =
         result = "pointer"
       elif p.pointerAliases.hasKey(ck):
         result = n[0].strVal
+      elif ck in ["tostring"]:
+        result = "string"
+      elif ck in ["toansistring", "toansistringlit"]:
+        result = "AnsiString"
+      elif ck == "substr":
+        # substr keeps the representation of its receiver
+        if n.len >= 2 and rhsExprType(p, n[1]).toLowerAscii == "ansistring":
+          result = "AnsiString"
+        else:
+          result = "string"
+      elif ck in ["pasfind", "find", "pos", "ansipos"]:
+        result = "int32"
       else:
         result = p.routineReturns.getOrDefault(ck,
             p.procVarReturns.getOrDefault(ck, ""))
@@ -7082,7 +7102,10 @@ proc mapBuiltinCall*(p: var TParser; n: Node): Node =
     let stdoutNode = newIdentNode("stdout", n[0].info)
     var newSons: seq[Node] = @[n[0], stdoutNode]
     for i in 1 ..< n.len:
-      newSons.add(n[i])
+      var arg = n[i]
+      if rhsExprType(p, arg).toLowerAscii == "ansistring":
+        arg = wrapBridge("toString", arg)
+      newSons.add(arg)
     n.sons = newSons
     if n.len > 3:
       # nimony's write takes one value; fold into a single string,
@@ -7103,6 +7126,8 @@ proc mapBuiltinCall*(p: var TParser; n: Node): Node =
     var i = 1
     while i < n.len:
       n[i] = writelnArg(p, n[i])
+      if rhsExprType(p, n[i]).toLowerAscii == "ansistring":
+        n[i] = wrapBridge("toString", n[i])
       inc i
     n[0].strVal = "echo"
     return n
@@ -8901,6 +8926,29 @@ proc rewriteClassAsgns*(p: var TParser, n: Node) =
   for s in n.sons:
     rewriteClassAsgns(p, s)
 
+proc ansiRhsKind(p: var TParser; e: Node): string =
+  ## "ansi", "string" or "" for an assignment RHS
+  if e.kind in {nkStrLit, nkCharLit}: return "string"
+  let t = rhsExprType(p, e).toLowerAscii
+  if t == "ansistring": return "ansi"
+  if t == "string": return "string"
+  return ""
+
+proc rewriteStringCoerce*(p: var TParser, n: Node) =
+  ## The two string representations never coerce implicitly: a declared
+  ## AnsiString target takes an explicit toAnsiString(), a declared string
+  ## target takes toString(). These are the owner's "explicit and
+  ## diagnostic" conversion points.
+  if n.kind == nkAsgn and n.len == 2:
+    let lt = placeExprType(p, n[0]).toLowerAscii
+    let rk = ansiRhsKind(p, n[1])
+    if lt == "ansistring" and rk == "string":
+      n[1] = wrapBridge("toAnsiString", n[1])
+    elif lt == "string" and rk == "ansi":
+      n[1] = wrapBridge("toString", n[1])
+  for s in n.sons:
+    rewriteStringCoerce(p, s)
+
 proc rewriteCtorCalls*(p: var TParser, n: Node): Node =
   ## `Second.create(v)` -> `create(Second(), v)`; an inherited
   ## constructor call gets an explicit cast back to the subclass
@@ -9507,6 +9555,7 @@ proc parseUnit*(p: var TParser): Node =
     p.module.sons = rebuilt
   for i in 0 ..< p.module.len:
     rewriteClassAsgns(p, p.module[i])
+    rewriteStringCoerce(p, p.module[i])
     p.module.sons[i] = rewriteCtorCalls(p, p.module[i])
     p.module.sons[i] = rewriteClassProcCalls(p, p.module[i])
     rewriteArrayProps(p, p.module[i])

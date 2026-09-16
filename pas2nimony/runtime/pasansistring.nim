@@ -164,6 +164,16 @@ proc `=copy`*(dest: var AnsiString; source: AnsiString) =
   if cast[uint](d) != 0:
     decRefD(d)
 
+proc moveInto*(dest: var AnsiString; src: var AnsiString) =
+  ## hand src's buffer to dest and nil src. Assigning to a `var AnsiString`
+  ## parameter can run the parameter's destroy at proc exit, which would
+  ## release the buffer the caller now holds; a true move avoids that.
+  let d = dest.data
+  dest.data = src.data
+  src.data = nil
+  if cast[uint](d) != 0:
+    decRefD(d)
+
 proc uniqueStringOfLen*(s: var AnsiString; wantedLen: int32) =
   let data = s.data
   let minLen = if wantedLen > s.len: s.len else: wantedLen
@@ -178,8 +188,16 @@ proc uniqueStringOfLen*(s: var AnsiString; wantedLen: int32) =
     s.data = cast[AnsiStringData](cast[uint](p) + uint(sizeof(StrRec)))
     p.refCnt = 1
     p.length = wantedLen
-    cast[ptr int16](cast[uint](s.data) +
-        uint(wantedLen and not 1'i32))[] = 0'i16
+    # Delphi zero-fills newly exposed bytes on growth; without this the
+    # realloc path leaks stale bytes, unlike newAnsiString's fresh buffer.
+    var z = minLen
+    while z < wantedLen:
+      s.data[int(z)] = '\0'
+      inc z
+    # truncation/growth on a live buffer: terminate at the new length. The
+    # allocation-time `and not 1` double-NUL trick is for fresh buffers only;
+    # here it would clobber the last byte when wantedLen is odd.
+    s.data[int(wantedLen)] = '\0'
 
 proc uniqueStringImpl(s: var AnsiString; r: StrRecPtr) =
   let wantedLen = r.length
@@ -197,6 +215,13 @@ template uniqueString*(s: var AnsiString) =
 
 template `[]`*(s: AnsiString; x: int): char = s.data[x]
 template `[]`*(s: AnsiString; x: int32): char = s.data[int(x)]
+template `[]=`*(s: var AnsiString; x: int; c: char) =
+  ## write access: detach first (copy-on-write), so a copy never observes it.
+  uniqueString(s)
+  s.data[x] = c
+template `[]=`*(s: var AnsiString; x: int32; c: char) =
+  uniqueString(s)
+  s.data[int(x)] = c
 template `[]`*(s: WeakPartialString; x: int): char = s.data[x]
 template `[]`*(s: WeakPartialString; x: int32): char = s.data[int(x)]
 
@@ -217,6 +242,12 @@ proc toAnsiString*(s: cstring): AnsiString =
   if n > 0:
     result.data = newAnsiString(n)
     copyMem(cast[pointer](result.data), cast[pointer](p), int(n))
+
+proc toAnsiString*(c: char): AnsiString =
+  ## a single-character literal assigned to an AnsiString
+  result = default(AnsiString)
+  result.data = newAnsiString(1'i32)
+  result.data[0] = c
 
 template toAnsiStringLit*[N: static[int]](lit: ConstAnsiLit[N]): AnsiString =
   ## View a module-level ConstAnsiLit (rec.refCnt = -1) as an AnsiString.
@@ -314,6 +345,40 @@ proc `&`*(a, b: AnsiString): AnsiString {.inline.} =
     incRef(b)
     result.data = b.data
 
+# --- Pascal `+` on an explicit AnsiString ---------------------------------
+# Mixed representation cases convert explicitly through toString/toAnsiString.
+# The char cases build the buffer directly: passing a call that returns an
+# AnsiString straight as an argument to `&` destroys an uninitialized
+# raising-return slot in nimony, and a char needs no string round-trip anyway.
+proc `+`*(a, b: AnsiString): AnsiString = a & b
+
+proc `+`*(a: AnsiString; b: string): AnsiString =
+  result = default(AnsiString)
+  var t = toAnsiString(b)
+  result = a & t
+
+proc `+`*(a: string; b: AnsiString): AnsiString =
+  result = default(AnsiString)
+  var t = toAnsiString(a)
+  result = t & b
+
+proc `+`*(a: AnsiString; b: char): AnsiString =
+  result = default(AnsiString)
+  let la = a.len
+  result.data = newAnsiString(la + 1'i32)
+  if la > 0:
+    copyMem(cast[pointer](result.data), cast[pointer](a.data), int(la))
+  result.data[int(la)] = b
+
+proc `+`*(b: char; a: AnsiString): AnsiString =
+  result = default(AnsiString)
+  let la = a.len
+  result.data = newAnsiString(la + 1'i32)
+  result.data[0] = b
+  if la > 0:
+    copyMem(cast[pointer](cast[uint](result.data) + 1'u),
+        cast[pointer](a.data), int(la))
+
 proc setLen*(dest: var AnsiString; newLen: int32) =
   uniqueStringOfLen(dest, newLen)
 
@@ -340,6 +405,25 @@ proc cmp*(a, b: AnsiString): int =
 
 proc `==`*(a, b: AnsiString): bool = cmp(a, b) == 0
 proc `<`*(a, b: AnsiString): bool = cmp(a, b) < 0
+
+proc substr*(s: AnsiString; first, last: int): AnsiString =
+  ## nimony's substr spelling for an explicit AnsiString; Pascal Copy(s,a,b)
+  ## lowers to substr(s, a-1, a-1+(b-1)), so the bounds are already 0-based.
+  result = default(AnsiString)
+  if not isNil(s):
+    let n = int(s.len)
+    let lo = if first < 0: 0 else: first
+    let hi = if last >= n: n - 1 else: last
+    if lo < n and lo <= hi:
+      let cnt = hi - lo + 1
+      result.data = newAnsiString(int32(cnt))
+      copyMem(cast[pointer](result.data),
+          cast[pointer](cast[uint](s.data) + uint(lo)), cnt)
+
+proc substr*(s: AnsiString; first: int): AnsiString =
+  result = default(AnsiString)
+  if not isNil(s):
+    result = substr(s, first, int(s.len) - 1)
 
 proc weakSlice*(source: AnsiString; start: int32): WeakPartialString {.inline.} =
   result = default(WeakPartialString)
