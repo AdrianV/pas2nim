@@ -2411,7 +2411,15 @@ proc lowestExprAux(p: var TParser, v: var Node, limit: int): TTokKind =
         let lb = intBitRank(lt)
         let rb = intBitRank(rt)
         if op == pxShl:
-          if lb > 0 and rb > 0 and lt != rt and not v2Lit:
+          if vLit and rb > 0:
+            # a bare literal left operand leaves nimony `1 shl z` typed
+            # auto; pin it to the shift count's declared width
+            let wc = newNode(nkCall, v.info)
+            wc.add(newIdentNode(rt, v.info))
+            wc.add(v)
+            node[1] = wc
+            v = wc
+          elif lb > 0 and rb > 0 and lt != rt and not v2Lit:
             let wc = newNode(nkCall, v2.info)
             wc.add(newIdentNode(lt, v2.info))
             wc.add(v2)
@@ -2437,6 +2445,26 @@ proc lowestExprAux(p: var TParser, v: var Node, limit: int): TTokKind =
           wc.add(newIdentNode(lt, v2.info))
           wc.add(v2)
           v2 = wc
+      if op in {pxEquals, pxLe, pxLt, pxGe, pxGt, pxNeq}:
+        # a mixed-width integer comparison (a Byte against ord(c), a
+        # promoted byte sum against an Integer) needs the wider width on
+        # both sides; a bare literal already adapts
+        let lt = rhsExprType(p, v)
+        let rt = rhsExprType(p, v2)
+        let lb = intBitRank(lt)
+        let rb = intBitRank(rt)
+        if lb > 0 and rb > 0 and lt != rt:
+          if lb >= rb:
+            let wc = newNode(nkCall, v2.info)
+            wc.add(newIdentNode(lt, v2.info))
+            wc.add(v2)
+            v2 = wc
+          else:
+            let wc = newNode(nkCall, v.info)
+            wc.add(newIdentNode(rt, v.info))
+            wc.add(v)
+            node[1] = wc
+            v = wc
       node.add(v2)
     v = p.rewriteMethodPtrNilCmp(node)
     op = nextop
@@ -3085,6 +3113,17 @@ proc parseVarSection*(p: var TParser): Node =
       getTokP(p)
       skipCom(p)
       let target = parseExpr(p)
+      # an `absolute` alias of a formal parameter whose untyped `out`/`var`
+      # spelling is `pointer` but whose alias type is a typed pointer: alias
+      # the *storage* so reads carry the alias type and writes reach the
+      # caller's slot (a bare template body would be a `pointer` mismatch)
+      var useAddr = false
+      if target.kind == nkIdent and defs.len >= 3 and
+          defs[defs.len - 2].kind == nkIdent:
+        let pt = p.paramTypes.getOrDefault(target.strVal.toLowerAscii)
+        let at = defs[defs.len - 2].strVal.toLowerAscii
+        if pt.len > 0 and at.len > 0 and pt != at:
+          useAddr = true
       for i in 0 ..< defs.len - 2:
         if defs[i].kind != nkIdent:
           continue
@@ -3099,7 +3138,19 @@ proc parseVarSection*(p: var TParser): Node =
         t.add(emptyNode(defs[i].info))
         t.add(emptyNode(defs[i].info))
         let body = newNode(nkStmtList, defs[i].info)
-        body.add(target)
+        if useAddr:
+          var ad = newNode(nkAddr, target.info)
+          ad.add(target)
+          var pt2 = newNode(nkPtrTy, target.info)
+          pt2.add(newIdentNode(defs[defs.len - 2].strVal, target.info))
+          var cn = newNode(nkCast, target.info)
+          cn.add(pt2)
+          cn.add(ad)
+          var dr = newNode(nkDeref, target.info)
+          dr.add(cn)
+          body.add(dr)
+        else:
+          body.add(target)
         t.add(body)
         result.add(t)
       p.opt(pxSemiColon)
@@ -6262,6 +6313,28 @@ proc mapStringBuiltins*(p: var TParser, n: Node): Node =
   if n.kind != nkCall or n.len == 0: return n
   if n[0].kind != nkIdent: return n
   if n.noQualCallee: return n   # inherited calls keep the member spelling
+  # a Pascal hard cast of a dereferenced pointer to a named dynamic-array
+  # alias: `TArr(P^)`. nimony cannot call the alias as a constructor, so
+  # lower to `cast[ptr TArr](P)[]` - the seq lvalue Pascal sees, valid for
+  # Length/SetLength and as an index-assignment target.
+  if n.len == 2 and p.arrayAliases.hasKey(n[0].strVal.toLowerAscii):
+    var haveBase = false
+    var baseExpr = emptyNode(n.info)
+    if n[1].kind == nkDeref and n[1].len == 1:
+      baseExpr = n[1][0]
+      haveBase = true
+    elif n[1].kind == nkIndexExpr and n[1].len == 1:
+      baseExpr = n[1][0]
+      haveBase = true
+    if haveBase:
+      var pt = newNode(nkPtrTy, n.info)
+      pt.add(newIdentNode(n[0].strVal, n.info))
+      var cn = newNode(nkCast, n.info)
+      cn.add(pt)
+      cn.add(baseExpr)
+      var dr = newNode(nkDeref, n.info)
+      dr.add(cn)
+      return dr
   # class-cast treatment: the corpus's TObject(x)/TComponent(ptr)/...
   # call-form casts across the pointer/object boundary
   let clsCallee = n[0].strVal.toLowerAscii
