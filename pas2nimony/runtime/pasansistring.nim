@@ -9,8 +9,10 @@
 ##   - union helpers (SomeDelphiString, AnsiString|AnsiStringData) split
 ##     into concrete overloads: nimony does not resolve fields/methods
 ##     through an object union.
-##   - addr s[0] -> cast[pointer](toCString(s)): nimony rejects an
-##     address of a not-yet-written string element.
+##   - nimony string access goes through readRawData (read) and
+##     beginStore/endStore (write). toCString is the *mutating*,
+##     null-terminating accessor and is NOT used for AnsiString conversion:
+##     AnsiString carries its own \0, so toCString would be an extra copy.
 ##
 ## Layout: an AnsiString is a pointer to the character data; the StrRec
 ## (refCnt, length) sits immediately before it. refCnt > 0 is a heap
@@ -32,6 +34,12 @@ type
     data: AnsiStringData
     delta*: int32
     length*: int32
+  ConstAnsiLit*[N: static[int]] = object
+    ## Backing storage for a Delphi const string literal. The StrRec sits
+    ## immediately before the data and carries refCnt = -1: never freed,
+    ## never mutated in place (uniqueString detaches on the first write).
+    rec*: StrRec
+    buf*: array[N + 1, char]
 
 # Byte-correctness guard. Delphi's StrRec is a *packed* record of two
 # Longint -> 8 bytes, fields at 0 and 4, data at 8. `packed` is omitted
@@ -92,16 +100,15 @@ proc high*(s: AnsiString): int32 =
 
 proc toString*(s: AnsiString): string =
   ## Build the nimony string by the AnsiString's *counted* length, exactly
-  ## like Delphi: an embedded \0 is data, not a terminator. This is the
-  ## Nim-1 reference's newString(length) + copyMem(addr result[0], ...);
-  ## `addr result[0]` is spelled toCString(result) because nimony rejects
-  ## the address of a not-yet-written string element.
+  ## like Delphi: an embedded \0 is data, not a terminator. Writes through
+  ## nimony's documented bulk-write pair (beginStore/endStore); toCString is
+  ## the mutating null-terminating accessor and must not be used here.
   result = ""
   let length = s.len
   if length > 0'i32:
-    result = newString(int(length))
-    copyMem(cast[pointer](toCString(result)), cast[pointer](s.data),
-        int(length))
+    let dst = beginStore(result, int(length))
+    copyMem(cast[pointer](dst), cast[pointer](s.data), int(length))
+    endStore(result)
 
 template `$`*(s: AnsiString): string = toString(s)
 
@@ -140,7 +147,8 @@ proc `=dup`*(s: AnsiString): AnsiString =
   if not isNil(s):
     result.data = s.data
     let p = s.rec
-    discard atomicFetchAdd(p[].refCnt, 1'i32)
+    if p[].refCnt > 0:
+      discard atomicFetchAdd(p[].refCnt, 1'i32)
 
 proc `=copy`*(dest: var AnsiString; source: AnsiString) =
   ## explicit assignment hook (used where the compiler does not choose
@@ -149,12 +157,8 @@ proc `=copy`*(dest: var AnsiString; source: AnsiString) =
   var s = source.data
   if not isNil(source):
     var p = source.rec
-    if p[].refCnt < 0:
-      let length = p.length
-      s = newAnsiString(length)
-      copyMem(cast[pointer](s), cast[pointer](source.data), int(length))
-      p = s.rec
-    discard atomicFetchAdd(p[].refCnt, 1'i32)
+    if p[].refCnt > 0:
+      discard atomicFetchAdd(p[].refCnt, 1'i32)
   let d = dest.data
   dest.data = s
   if cast[uint](d) != 0:
@@ -163,7 +167,7 @@ proc `=copy`*(dest: var AnsiString; source: AnsiString) =
 proc uniqueStringOfLen*(s: var AnsiString; wantedLen: int32) =
   let data = s.data
   let minLen = if wantedLen > s.len: s.len else: wantedLen
-  if data == nil or data.rec.refCnt > 1:
+  if data == nil or data.rec.refCnt != 1:
     s.data = newAnsiString(wantedLen)
     if data != nil:
       for i in 0'i32 ..< minLen:
@@ -181,12 +185,14 @@ proc uniqueStringImpl(s: var AnsiString; r: StrRecPtr) =
   let wantedLen = r.length
   s.data = newAnsiString(wantedLen)
   copyMem(cast[pointer](s.data), cast[pointer](r.strData), int(wantedLen))
-  discard atomicFetchSub(r.refCnt, 1'i32)
+  if r.refCnt > 0:
+    discard atomicFetchSub(r.refCnt, 1'i32)
 
 template uniqueString*(s: var AnsiString) =
   if not s.isNil:
     let res = s.rec
-    if res.refCnt > 1:
+    if res.refCnt != 1:
+      # shared (>1) or a const literal (<0): detach before any mutation
       uniqueStringImpl(s, res)
 
 template `[]`*(s: AnsiString; x: int): char = s.data[x]
@@ -199,8 +205,8 @@ proc toAnsiString*(s: string): AnsiString =
   let length = int32(s.len)
   if length > 0:
     result.data = newAnsiString(length)
-    var v = s
-    copyMem(cast[pointer](result.data), cast[pointer](toCString(v)), int(length))
+    copyMem(cast[pointer](result.data), cast[pointer](readRawData(s)),
+        int(length))
 
 proc toAnsiString*(s: cstring): AnsiString =
   result = default(AnsiString)
@@ -211,6 +217,37 @@ proc toAnsiString*(s: cstring): AnsiString =
   if n > 0:
     result.data = newAnsiString(n)
     copyMem(cast[pointer](result.data), cast[pointer](p), int(n))
+
+template toAnsiStringLit*[N: static[int]](lit: ConstAnsiLit[N]): AnsiString =
+  ## View a module-level ConstAnsiLit (rec.refCnt = -1) as an AnsiString.
+  ## `lit` is substituted as a name, so unsafeAddr reaches the const's own
+  ## storage rather than a copy.
+  AnsiString(data: cast[AnsiStringData](unsafeAddr lit.buf[0]))
+
+# --- raw access, COW-correct ------------------------------------------------
+# An AnsiString is a copy-on-write buffer: reading may share, writing must
+# own. The names mirror nimony's string API (readRawData / beginStore /
+# endStore); toCString is only the NUL-terminated reinterpretation.
+
+template toCString*(s: AnsiString): cstring =
+  ## AnsiString is *always* NUL-terminated (unlike a nimony string), so this
+  ## is a pure reinterpretation: no terminator is added, nothing mutates.
+  cast[cstring](s.data)
+
+template readRawData*(s: AnsiString; start = 0'i32): ptr UncheckedArray[char] =
+  ## read access: no unique, no refcount change (shared/literal is fine).
+  cast[ptr UncheckedArray[char]](cast[uint](s.data) + uint(start))
+
+proc beginStore*(s: var AnsiString; newLen: int32; start = 0'i32):
+    ptr UncheckedArray[char] =
+  ## write access: detach (uniqueStringOfLen) before handing out a mutable
+  ## pointer, so a copy of `s` can never observe the write.
+  uniqueStringOfLen(s, newLen)
+  result = cast[ptr UncheckedArray[char]](cast[uint](s.data) + uint(start))
+
+template endStore*(s: var AnsiString) =
+  ## AnsiString has no cached prefix to sync; kept for API symmetry.
+  discard
 
 # --- varString slot bridge --------------------------------------------------
 # Delphi/FPC keep a variant's string in a *pointer* slot, hard-cast to an
@@ -240,8 +277,9 @@ proc ptrToNimString*(p: uint): string =
     let data = cast[AnsiStringData](p)
     let length = data.rec.length
     if length > 0'i32:
-      result = newString(int(length))
-      copyMem(cast[pointer](toCString(result)), cast[pointer](p), int(length))
+      let dst = beginStore(result, int(length))
+      copyMem(cast[pointer](dst), cast[pointer](p), int(length))
+      endStore(result)
 
 proc ptrToAnsiString*(p: uint): AnsiString =
   ## reinterpret a varString slot pointer as an AnsiString and take a

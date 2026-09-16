@@ -1939,37 +1939,47 @@ proc VarArrayRedim*(v: var Variant; highBound: int32) =
 
 # Sizes are system-sized (the reference's DSize = int): Delphi's memory
 # manager uses the target's pointer-sized integer (Cardinal on Win32), so a
-# 32-bit build must see 32-bit sizes too. The fixed-width overloads stay so
-# a Pascal Integer/Cardinal/Int64/QWord argument resolves without an
-# implicit conversion; each forwards through the system-sized int.
+# 32-bit build must see 32-bit sizes too. Only the *other* width gets explicit
+# overloads: `int` IS `int64` on 64-bit and IS `int32` on 32-bit, so an
+# unconditional fixed-width set duplicates the system width and makes every
+# literal call ambiguous.
 proc AllocMem*(size: int): pointer = alloc0(size)
 proc AllocMem*(size: uint): pointer = alloc0(int(size))
-proc AllocMem*(size: int32): pointer = alloc0(int(size))
-proc AllocMem*(size: uint32): pointer = alloc0(int(size))
-proc AllocMem*(size: int64): pointer = alloc0(int(size))
-proc AllocMem*(size: uint64): pointer = alloc0(int(size))
+when sizeof(int) == 8:
+  proc AllocMem*(size: int32): pointer = alloc0(int(size))
+  proc AllocMem*(size: uint32): pointer = alloc0(int(size))
+else:
+  proc AllocMem*(size: int64): pointer = alloc0(int(size))
+  proc AllocMem*(size: uint64): pointer = alloc0(int(size))
 
 proc FreeMem*(p: pointer) = dealloc(p)
 proc FreeMem*(p: pointer; size: int) = dealloc(p)
 proc FreeMem*(p: pointer; size: uint) = dealloc(p)
-proc FreeMem*(p: pointer; size: int32) = dealloc(p)
-proc FreeMem*(p: pointer; size: uint32) = dealloc(p)
-proc FreeMem*(p: pointer; size: int64) = dealloc(p)
-proc FreeMem*(p: pointer; size: uint64) = dealloc(p)
+when sizeof(int) == 8:
+  proc FreeMem*(p: pointer; size: int32) = dealloc(p)
+  proc FreeMem*(p: pointer; size: uint32) = dealloc(p)
+else:
+  proc FreeMem*(p: pointer; size: int64) = dealloc(p)
+  proc FreeMem*(p: pointer; size: uint64) = dealloc(p)
 proc FreeMemory*(p: pointer) = dealloc(p)
 
 proc ReallocMem*(p: var pointer; size: int) = p = realloc(p, size)
 proc ReallocMem*(p: var pointer; size: uint) = p = realloc(p, int(size))
-proc ReallocMem*(p: var pointer; size: int32) = p = realloc(p, int(size))
-proc ReallocMem*(p: var pointer; size: uint32) = p = realloc(p, int(size))
-proc ReallocMem*(p: var pointer; size: int64) = p = realloc(p, int(size))
-proc ReallocMem*(p: var pointer; size: uint64) = p = realloc(p, int(size))
+when sizeof(int) == 8:
+  proc ReallocMem*(p: var pointer; size: int32) = p = realloc(p, int(size))
+  proc ReallocMem*(p: var pointer; size: uint32) = p = realloc(p, int(size))
+else:
+  proc ReallocMem*(p: var pointer; size: int64) = p = realloc(p, int(size))
+  proc ReallocMem*(p: var pointer; size: uint64) = p = realloc(p, int(size))
+
 proc ReallocMemory*(p: pointer; size: int): pointer = realloc(p, size)
 proc ReallocMemory*(p: pointer; size: uint): pointer = realloc(p, int(size))
-proc ReallocMemory*(p: pointer; size: int32): pointer = realloc(p, int(size))
-proc ReallocMemory*(p: pointer; size: uint32): pointer = realloc(p, int(size))
-proc ReallocMemory*(p: pointer; size: int64): pointer = realloc(p, int(size))
-proc ReallocMemory*(p: pointer; size: uint64): pointer = realloc(p, int(size))
+when sizeof(int) == 8:
+  proc ReallocMemory*(p: pointer; size: int32): pointer = realloc(p, int(size))
+  proc ReallocMemory*(p: pointer; size: uint32): pointer = realloc(p, int(size))
+else:
+  proc ReallocMemory*(p: pointer; size: int64): pointer = realloc(p, int(size))
+  proc ReallocMemory*(p: pointer; size: uint64): pointer = realloc(p, int(size))
 
 proc pasMove*[S, D](src: var S; dest: var D; count: int32) =
   moveMem(addr dest, addr src, int(count))

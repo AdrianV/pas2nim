@@ -139,6 +139,105 @@ block:
     inc i
   chk("weakSlice value", acc, "world")
 
+# --- string <-> AnsiString: correct conversion form ------------------------
+# Conversions go through readRawData/beginStore, never toCString (which
+# *mutates* by materialising a terminator - an extra allocation for a type
+# that already terminates itself).
+block:
+  let src = "hello"
+  let a = toAnsiString(src)
+  chk("string->ansi value", toString(a), "hello")
+  chk("string->ansi src value", src, "hello")
+  chk("string->ansi src len", $src.len, "5")
+  var b = toAnsiString("shared")
+  discard toString(b)
+  chk("toString refCount stable", $refCount(b), "1")
+
+# --- Pascal NUL padding (a nimony string has none) --------------------------
+# Delphi terminates at data[len] and, because the allocation is rounded even,
+# leaves a second zero byte at data[len+1] for even lengths.
+block:
+  let odd = toAnsiString("abc")            # len 3
+  chk("odd terminator", $int(cast[uint8](readRawData(odd, 3'i32)[0])), "0")
+  let even = toAnsiString("ab")            # len 2
+  chk("even terminator", $int(cast[uint8](readRawData(even, 2'i32)[0])), "0")
+  chk("even second zero", $int(cast[uint8](readRawData(even, 3'i32)[0])), "0")
+  chk("empty is nil", $(isNil(toAnsiString("")) == true), "true")
+
+# --- no duplicate NUL when string -> AnsiString -----------------------------
+block:
+  let a = toAnsiString("ab")
+  chk("no dup nul len", $a.len, "2")
+  chk("no dup nul value", toString(a), "ab")
+  chk("no dup nul bytes", bytes(a), "97 98 ")
+  let z = toAnsiString("ab\0")             # an explicit NUL is data
+  chk("explicit nul len", $z.len, "3")
+  chk("explicit nul bytes", bytes(z), "97 98 0 ")
+
+# --- AnsiString.toCString is a no-op reinterpretation -----------------------
+block:
+  var s = toAnsiString("hello")
+  let cp = toCString(s)
+  chk("toCString is raw", $(cast[uint](cp) == cast[uint](raw(s))), "true")
+  chk("toCString refCount stable", $refCount(s), "1")
+  chk("toCString first", cs(cast[ptr UncheckedArray[char]](cp)[0]), "h")
+  chk("toCString terminator",
+      $int(cast[uint8](cast[ptr UncheckedArray[char]](cp)[5])), "0")
+  chk("toCString roundtrip", fromCString(cp), "hello")
+
+# --- read access does not detach -------------------------------------------
+block:
+  var a = toAnsiString("hello")
+  var b = a
+  chk("read share refCount", $refCount(a), "2")
+  chk("read p0", cs(readRawData(a)[0]), "h")
+  chk("read p4", cs(readRawData(a, 4'i32)[0]), "o")
+  chk("read no unique a", $refCount(a), "2")
+  chk("read no unique b", $refCount(b), "2")
+
+# --- write access detaches: a copy can never observe it --------------------
+block:
+  var a = toAnsiString("hello")
+  var b = a
+  let w = beginStore(b, 5'i32)
+  w[0] = 'H'
+  endStore(b)
+  chk("write copy mutated", toString(b), "Hello")
+  chk("write original intact", toString(a), "hello")
+  chk("write original detached", $refCount(a), "1")
+  chk("write copy unique", $refCount(b), "1")
+block:
+  var a = toAnsiString("ab")
+  let w = beginStore(a, 4'i32)
+  w[2] = 'c'
+  w[3] = 'd'
+  endStore(a)
+  chk("beginStore grow", toString(a), "abcd")
+  chk("beginStore grow terminator",
+      $int(cast[uint8](readRawData(a, 4'i32)[0])), "0")
+
+# --- const literal: refCnt = -1 (Delphi typed const) -----------------------
+const pasLit_foo = ConstAnsiLit[7](
+  rec: StrRec(refCnt: -1'i32, length: 7'i32),
+  buf: ['f', 'o', 'o', ' ', 'b', 'a', 'r', '\0'])
+block:
+  let cl = toAnsiStringLit(pasLit_foo)
+  chk("lit refCount", $refCount(cl), "-1")
+  chk("lit len", $cl.len, "7")
+  chk("lit value", toString(cl), "foo bar")
+  chk("lit terminator", $int(cast[uint8](readRawData(cl, 7'i32)[0])), "0")
+  chk("lit toCString", fromCString(toCString(cl)), "foo bar")
+  var m = cl
+  chk("lit shared refCount", $refCount(m), "-1")
+  let w = beginStore(m, 3'i32)
+  w[0] = 'A'
+  w[1] = 'B'
+  w[2] = 'C'
+  endStore(m)
+  chk("lit copy mutated", toString(m), "ABC")
+  chk("lit unchanged", toString(cl), "foo bar")
+  chk("lit refCount after mutate", $refCount(cl), "-1")
+
 if fails == 0:
   echo("ansi-shim: ALL OK")
 else:
