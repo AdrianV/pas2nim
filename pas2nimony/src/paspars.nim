@@ -1887,9 +1887,14 @@ proc primary(p: var TParser): Node =
             result.len == 3 and
             not (result[2].kind in {nkIntLit, nkInt64Lit}):
           # nimony's setLen takes `int` (64-bit); a Cardinal/Longint
-          # length argument needs the widening cast
+          # length argument needs the widening cast.  The AnsiString
+          # overload takes int32, so narrow there instead.
+          var width = "int64"
+          if result[1].kind == nkIdent and
+              p.varTypes.getOrDefault(result[1].strVal.toLowerAscii).toLowerAscii == "ansistring":
+            width = "int32"
           let wc = newNode(nkCast, result[2].info)
-          wc.add(newIdentNode("int64", result[2].info))
+          wc.add(newIdentNode(width, result[2].info))
           wc.add(result[2])
           result[2] = wc
         if a.kind == nkIdent and
@@ -3313,6 +3318,13 @@ proc parseConstSection*(p: var TParser): Node =
     # (a const is absent from varTypes) and treat it as read-only
     if def.len > 2 and def[1].kind == nkIdent:
       p.constTypes[name.toLowerAscii] = def[1].strVal
+    elif def.len > 2 and def[1].kind == nkEmpty:
+      # an untyped const with a literal initializer: a system string (or
+      # char) value, which a call site may have to bridge
+      if def[2].kind == nkStrLit:
+        p.constTypes[name.toLowerAscii] = "string"
+      elif def[2].kind == nkCharLit:
+        p.constTypes[name.toLowerAscii] = "char"
     elif def.len > 2 and def[1].kind in {nkArrayTy, nkSeqTy} and
         def[1].len > 0 and def[1][def[1].len - 1].kind == nkIdent:
       let el = def[1][def[1].len - 1].strVal
@@ -5158,8 +5170,11 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
     var pspW: seq[string] = @[]
     for pi in 1 ..< params.len:
       let d = params[pi]
-      if d.kind == nkIdentDefs and d[d.len - 2].kind == nkIdent:
-        pspW.add(d[d.len - 2].strVal)
+      if d.kind == nkIdentDefs:
+        var t = d[d.len - 2]
+        while t.kind == nkVarTy and t.len > 0: t = t[0]
+        if t.kind == nkIdent:
+          pspW.add(t.strVal)
     if pspW.len > 0:
       var widths: seq[string] = @[]
       for ps in pspW:
@@ -5171,22 +5186,27 @@ proc parseRoutine*(p: var TParser; noBody: bool): Node =
       if p.selfClass.len > 0:
         p.mergeRoutineIntWidths(
             p.selfClass.toLowerAscii & "." & name.toLowerAscii, widths)
+  # the param spellings for char-arg call-site and string-bridge
+  # decisions: procedures need them too (an AnsiString/string param
+  # crosses at the same boundary as a function's)
+  var psp: seq[string] = @[]
+  for pi in 1 ..< params.len:
+    let d = params[pi]
+    if d.kind == nkIdentDefs:
+      var t = d[d.len - 2]
+      while t.kind == nkVarTy and t.len > 0: t = t[0]
+      if t.kind == nkIdent:
+        psp.add(t.strVal)
+  if psp.len > 0:
+    p.routineParams[name.toLowerAscii] = psp
+    if p.classOfProc.len > 0:
+      p.routineParams[p.classOfProc.toLowerAscii & "." & name.toLowerAscii] = psp
+    if p.selfClass.len > 0:
+      p.routineParams[p.selfClass.toLowerAscii & "." & name.toLowerAscii] = psp
   if params[0].kind == nkIdent:
     # the routine's return spelling for `with Call(...)` lowering
     let retSp = params[0].strVal
     p.routineReturns[name.toLowerAscii] = retSp
-    # the param spellings for char-arg call-site decisions
-    var psp: seq[string] = @[]
-    for pi in 1 ..< params.len:
-      let d = params[pi]
-      if d.kind == nkIdentDefs and d[d.len - 2].kind == nkIdent:
-        psp.add(d[d.len - 2].strVal)
-    if psp.len > 0:
-      p.routineParams[name.toLowerAscii] = psp
-      if p.classOfProc.len > 0:
-        p.routineParams[p.classOfProc.toLowerAscii & "." & name.toLowerAscii] = psp
-      if p.selfClass.len > 0:
-        p.routineParams[p.selfClass.toLowerAscii & "." & name.toLowerAscii] = psp
     if p.classOfProc.len > 0:
       p.routineReturns[p.classOfProc.toLowerAscii & "." &
                        name.toLowerAscii] = retSp
@@ -6543,6 +6563,21 @@ proc writelnArg(p: var TParser, n: Node): Node =
         return c
   return n
 
+proc rtlStringReturn(ck: string): string =
+  ## return spelling of the RTL string helpers the parser must know so it
+  ## can insert the explicit bridge at an AnsiString boundary (a declared
+  ## `string` return is the nimony string, not AnsiString).
+  case ck
+  of "inttostr", "int64tostr", "uinttostr", "floattostr", "floattostrf",
+     "formattostr", "inttohex", "inttohex64", "stringofchar", "trim",
+     "trimleft", "trimright", "uppercase", "lowercase", "stringreplace",
+     "replicatestr", "dupestring", "leftstr", "rightstr", "midstr",
+     "booltostr", "timetostr", "datetostr", "datetimetostr", "quotestring",
+     "hexstr", "ansiupper", "ansilower", "ansitrim", "format":
+    result = "string"
+  else:
+    result = ""
+
 proc rhsExprType(p: var TParser, n: Node): string =
   ## best-effort static type of an assignment RHS, used to insert
   ## Delphi Implicit-conversion calls; "" when unknown
@@ -6637,9 +6672,17 @@ proc rhsExprType(p: var TParser, n: Node): string =
           result = "string"
       elif ck in ["pasfind", "find", "pos", "ansipos"]:
         result = "int32"
+      elif ck in ["len32", "length", "len"]:
+        result = "int32"
+      elif ck == "ord":
+        result = "int64"
+      elif ck in ["floor", "ceil", "pasround", "round", "trunc"]:
+        result = "int64"
       else:
-        result = p.routineReturns.getOrDefault(ck,
-            p.procVarReturns.getOrDefault(ck, ""))
+        result = p.routineReturns.getOrDefault(ck, "")
+        if result.len == 0: result = rtlStringReturn(ck)
+        if result.len == 0:
+          result = p.procVarReturns.getOrDefault(ck, "")
     elif n.len > 0 and n[0].kind == nkDotExpr and n[0].len == 2 and
         n[0][1].kind == nkIdent:
       let rk = n[0][1].strVal.toLowerAscii
@@ -8940,20 +8983,107 @@ proc ansiRhsKind(p: var TParser; e: Node): string =
   if t == "string": return "string"
   return ""
 
-proc rewriteStringCoerce*(p: var TParser, n: Node) =
+proc listTy(names, types: seq[string]; name: string): string =
+  ## type spelling of a name in a routine parameter list
+  let k = name.toLowerAscii
+  for i in 0 ..< names.len:
+    if names[i] == k: return types[i]
+  result = ""
+
+proc rewriteStringCoerce*(p: var TParser, n: Node; curResult = "";
+                          curClass = ""; curPNames: seq[string] = @[];
+                          curPTys: seq[string] = @[]) =
   ## The two string representations never coerce implicitly: a declared
   ## AnsiString target takes an explicit toAnsiString(), a declared string
   ## target takes toString(). These are the owner's "explicit and
   ## diagnostic" conversion points.
+  var resTy = curResult
+  var clsTy = curClass
+  var pNames = curPNames
+  var pTys = curPTys
+  if n.kind in {nkProcDef, nkFuncDef, nkMethodDef} and n.len > 2 and
+      n[2].kind == nkFormalParams:
+    # the def's own return type: routineReturns is keyed by name only, so
+    # overloads with different return types would collide
+    if n[2].len > 0 and n[2][0].kind == nkIdent:
+      resTy = n[2][0].strVal
+    pNames = @[]
+    pTys = @[]
+    for pi in 1 ..< n[2].len:
+      let d = n[2][pi]
+      if d.kind == nkIdentDefs and d.len >= 2:
+        var t = d[d.len - 2]
+        while t.kind == nkVarTy and t.len > 0: t = t[0]
+        if t.kind == nkIdent:
+          for ni in 0 ..< d.len - 2:
+            if d[ni].kind == nkIdent:
+              pNames.add(d[ni].strVal.toLowerAscii)
+              pTys.add(t.strVal)
+              if d[ni].strVal.toLowerAscii == "self": clsTy = t.strVal
   if n.kind == nkAsgn and n.len == 2:
-    let lt = placeExprType(p, n[0]).toLowerAscii
-    let rk = ansiRhsKind(p, n[1])
+    var lt = placeExprType(p, n[0]).toLowerAscii
+    if n[0].kind == nkIdent and
+        n[0].strVal.toLowerAscii == "result" and resTy.len > 0:
+      lt = resTy.toLowerAscii
+    elif lt.len == 0 and n[0].kind == nkDotExpr and n[0].len == 2 and
+        n[0][0].kind == nkIdent and n[0][1].kind == nkIdent:
+      var baseTy = ""
+      if n[0][0].strVal.toLowerAscii == "result" and resTy.len > 0:
+        baseTy = resTy
+      elif n[0][0].strVal.toLowerAscii == "self" and clsTy.len > 0:
+        baseTy = clsTy
+      else:
+        baseTy = listTy(pNames, pTys, n[0][0].strVal)
+      if baseTy.len > 0:
+        lt = p.fieldTypes.getOrDefault(
+            baseTy.toLowerAscii & "." &
+            n[0][1].strVal.toLowerAscii).toLowerAscii
+    var rk = ansiRhsKind(p, n[1])
+    if rk.len == 0 and n[1].kind == nkIdent:
+      let it = listTy(pNames, pTys, n[1].strVal).toLowerAscii
+      if it == "ansistring": rk = "ansi"
+      elif it == "string": rk = "string"
+    if lt == "int32" and n[1].kind == nkCall and n[1].len >= 1 and
+        n[1][0].kind == nkIdent and n[1][0].strVal.toLowerAscii in
+            ["floor", "ceil", "round", "trunc", "pasround"]:
+      # Delphi implicitly narrows the Int64 Math result to the Integer field
+      n[1] = wrapBridge("int32", n[1])
     if lt == "ansistring" and rk == "string":
       n[1] = wrapBridge("toAnsiString", n[1])
     elif lt == "string" and rk == "ansi":
       n[1] = wrapBridge("toString", n[1])
+  elif n.kind == nkCall and n.len >= 1 and
+      (n[0].kind == nkIdent or n[0].kind == nkDotExpr):
+    # an argument crossing between the two representations is an explicit
+    # bridge: AnsiString -> string when the callee wants string, and the
+    # reverse when it wants AnsiString
+    var ck = ""
+    if n[0].kind == nkIdent:
+      ck = n[0].strVal.toLowerAscii
+    elif n[0].len >= 2 and n[0][n[0].len - 1].kind == nkIdent:
+      ck = n[0][n[0].len - 1].strVal.toLowerAscii
+    if ck == "trunc" and n.len == 2 and
+        intBitRank(rhsExprType(p, n[1]).toLowerAscii) > 0 and
+        n[0].kind == nkIdent:
+      # Pascal Trunc on an ordinal is the ordinal (nimony trunc wants float)
+      n[0].strVal = "int64"
+    let rtlRet = rtlStringReturn(ck)
+    var paramTys: seq[string] = @[]
+    if p.routineParams.hasKey(ck):
+      paramTys = p.routineParams.getOrDefault(ck)
+    for i in 1 ..< n.len:
+      var at = rhsExprType(p, n[i]).toLowerAscii
+      if at.len == 0 and n[i].kind == nkIdent:
+        at = listTy(pNames, pTys, n[i].strVal).toLowerAscii
+      var pt = ""
+      if (i - 1) < paramTys.len: pt = paramTys[i - 1].toLowerAscii
+      if pt.len == 0 and rtlRet.len > 0: pt = "string"
+      if pt == "ansistring" and at == "string":
+        n[i] = wrapBridge("toAnsiString", n[i])
+      elif pt == "string" and at == "ansistring":
+        n[i] = wrapBridge("toString", n[i])
   for s in n.sons:
-    rewriteStringCoerce(p, s)
+    rewriteStringCoerce(p, s, resTy, clsTy, pNames, pTys)
 
 proc rewriteCtorCalls*(p: var TParser, n: Node): Node =
   ## `Second.create(v)` -> `create(Second(), v)`; an inherited

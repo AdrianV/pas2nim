@@ -405,6 +405,15 @@ proc cmp*(a, b: AnsiString): int =
 
 proc `==`*(a, b: AnsiString): bool = cmp(a, b) == 0
 proc `<`*(a, b: AnsiString): bool = cmp(a, b) < 0
+# the other representation: a Pascal comparison may mix an AnsiString with
+# a plain string value (a literal is a system string here)
+proc `==`*(a: AnsiString; b: string): bool = toString(a) == b
+proc `==`*(a: string; b: AnsiString): bool = a == toString(b)
+proc `<`*(a: AnsiString; b: string): bool = toString(a) < b
+proc `<`*(a: string; b: AnsiString): bool = a < toString(b)
+proc `<=`*(a, b: AnsiString): bool = cmp(a, b) <= 0
+proc `<=`*(a: AnsiString; b: string): bool = toString(a) <= b
+proc `<=`*(a: string; b: AnsiString): bool = a <= toString(b)
 
 proc substr*(s: AnsiString; first, last: int): AnsiString =
   ## nimony's substr spelling for an explicit AnsiString; Pascal Copy(s,a,b)

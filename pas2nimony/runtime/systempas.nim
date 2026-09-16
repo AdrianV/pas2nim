@@ -577,6 +577,10 @@ proc `[]`*(p: cstring): var char =
   ## `P^`: nimony's cstring has no deref of its own
   result = cast[ptr char](cast[uint](p))[]
 
+proc pasPAnsiChar*(s: AnsiString): cstring =
+  ## the AnsiString overload: the data buffer is already NUL-terminated
+  result = cast[cstring](raw(s))
+
 proc pasPAnsiChar*(s: string): cstring =
   ## Delphi's `Pointer(AnsiString)` / `PAnsiChar(AnsiString)`: the
   ## address of the string data. nimony's toCString needs a `var string`
