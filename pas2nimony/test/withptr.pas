@@ -2,7 +2,7 @@ program WithPtr;
 (* `with X.Field[i] do` where the field is a POINTER to an array of
   records (`Items: PItems`, `PItems = ^TItemArray`,
   `TItemArray = array[..] of TItem`). This is exactly the node layout
-  of pascal4neko's tplbtree.inc, whose `with n.Items[x] do` emitted
+  of the corpus's node include, whose `with n.Items[x] do` emitted
   the body's bare field names and failed with "undeclared identifier:
   Node/Value/Key".
 

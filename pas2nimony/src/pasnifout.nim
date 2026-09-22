@@ -1,3 +1,4 @@
+{.feature: "lenientnils".}
 #
 #           pasnifout - direct .p.nif emission from the Pascal AST
 #
@@ -581,7 +582,11 @@ proc emitParamList(e: var NifEmitter; params: Node) =
         e.buf.copyInto(globalTags.registerTag("param"), pi):
           e.buf.addIdent(e.nameOf(d[j]), pi)
           e.buf.addDotToken(pi)
-          e.buf.addDotToken(pi)
+          if ty.kind == nkVarTy and ty.noInitParam:
+            e.buf.copyInto(globalTags.registerTag("pragmas"), pi):
+              e.buf.addIdent("noinit", pi)
+          else:
+            e.buf.addDotToken(pi)
           e.emitTypeDesc(ty)
           if init.kind != nkEmpty:
             e.emitExpr(init)
@@ -660,14 +665,19 @@ proc emitProcDef(e: var NifEmitter; n: Node) =
           havePrag = true
     var wantRaise = n.len > 0 and n[n.len - 1].kind != nkEmpty and
         containsRaiseNode(n[n.len - 1])
-    if havePrag or wantRaise:
-      # forward accepted routine pragmas (inline, cdecl, stdcall) and
-      # the raises announcement in one pragma node
+    # the result is written only through `addr result`; take the init-proof
+    # escape hatch (mirrors the Nim renderer)
+    let wantNoinit = n.resultNoInit
+    if havePrag or wantRaise or wantNoinit:
+      # forward accepted routine pragmas (inline, cdecl, stdcall), the
+      # noinit escape hatch and the raises announcement in one pragma node
       e.buf.copyInto(globalTags.registerTag("pragmas"), i):
         if havePrag:
           for son in n[3].sons:
             if son.kind == nkIdent and son.strVal != "raises":
               e.buf.addIdent(son.strVal, e.info(son))
+        if wantNoinit:
+          e.buf.addIdent("noinit", i)
         if wantRaise:
           # nimony: raising procs announce it (ErrorCode model)
           e.buf.addIdent("raises", i)

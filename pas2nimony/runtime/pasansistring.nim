@@ -1,3 +1,4 @@
+{.feature: "lenientnils".}
 ## Delphi AnsiString model for the nimony chain.
 ##
 ## Ported from /home/adrian/dev/nimbackend/delphi32.nim (Nim 1, 32-bit)
@@ -9,10 +10,12 @@
 ##   - union helpers (SomeDelphiString, AnsiString|AnsiStringData) split
 ##     into concrete overloads: nimony does not resolve fields/methods
 ##     through an object union.
-##   - nimony string access goes through readRawData (read) and
-##     beginStore/endStore (write). toCString is the *mutating*,
-##     null-terminating accessor and is NOT used for AnsiString conversion:
-##     AnsiString carries its own \0, so toCString would be an extra copy.
+##   - the buffer is reached through the exported `data` field (a
+##     `ptr UncheckedArray[char]`): `s[i]` is the read/write element
+##     accessor and `s.data[i]` the un-detached raw read. nimony's own
+##     string `readRawData`/`beginStore` API is not involved: AnsiString
+##     carries its own \0, so `toCString` is a pure reinterpretation and
+##     never an extra copy.
 ##
 ## Layout: an AnsiString is a pointer to the character data; the StrRec
 ## (refCnt, length) sits immediately before it. refCnt > 0 is a heap
@@ -29,7 +32,7 @@ type
   StrRecPtr* = ptr StrRec
   AnsiStringData = ptr UncheckedArray[char]
   AnsiString* {.pure, final.} = object
-    data: AnsiStringData
+    data*: AnsiStringData
   WeakPartialString* {.pure, final.} = object
     data: AnsiStringData
     delta*: int32
@@ -213,15 +216,17 @@ template uniqueString*(s: var AnsiString) =
       # shared (>1) or a const literal (<0): detach before any mutation
       uniqueStringImpl(s, res)
 
-template `[]`*(s: AnsiString; x: int): char = s.data[x]
-template `[]`*(s: AnsiString; x: int32): char = s.data[int(x)]
-template `[]=`*(s: var AnsiString; x: int; c: char) =
+func `[]`*(s: AnsiString; x: int): var char {.inline.} = s.data[x]
+template `[]`*(s: AnsiString; x: int32): var char = s[int(x)]
+
+proc `[]=`*(s: var AnsiString; x: int; c: char) {.inline.} =
   ## write access: detach first (copy-on-write), so a copy never observes it.
   uniqueString(s)
   s.data[x] = c
+
 template `[]=`*(s: var AnsiString; x: int32; c: char) =
-  uniqueString(s)
-  s.data[int(x)] = c
+  `[]=`(s, int(x), c)
+
 template `[]`*(s: WeakPartialString; x: int): char = s.data[x]
 template `[]`*(s: WeakPartialString; x: int32): char = s.data[int(x)]
 
@@ -257,17 +262,24 @@ template toAnsiStringLit*[N: static[int]](lit: ConstAnsiLit[N]): AnsiString =
 
 # --- raw access, COW-correct ------------------------------------------------
 # An AnsiString is a copy-on-write buffer: reading may share, writing must
-# own. The names mirror nimony's string API (readRawData / beginStore /
-# endStore); toCString is only the NUL-terminated reinterpretation.
+# own. `s[i]` is the element accessor (a `var char` place - reading it shares,
+# assigning through it detaches via `[]=`); `s.data[i]` is the raw read used
+# by the byte-layout tests; `pasOwnStr(t)[i]` is the detaching place the
+# emitter hands to an untyped Pascal `var` parameter (`Move`/`FillChar`).
+# toCString is only the NUL-terminated reinterpretation.
 
 template toCString*(s: AnsiString): cstring =
   ## AnsiString is *always* NUL-terminated (unlike a nimony string), so this
   ## is a pure reinterpretation: no terminator is added, nothing mutates.
   cast[cstring](s.data)
 
-template readRawData*(s: AnsiString; start = 0'i32): ptr UncheckedArray[char] =
-  ## read access: no unique, no refcount change (shared/literal is fine).
-  cast[ptr UncheckedArray[char]](cast[uint](s.data) + uint(start))
+proc pasOwnStr*(s: var AnsiString): var AnsiString =
+  ## The place an untyped Pascal `var` parameter must receive: Delphi and FPC
+  ## make an AnsiString element unique before handing out its address, so
+  ## `pasOwnStr(t)[i]` is a writable element whose buffer `t` owns.
+  ## Taking `t[i]` directly would write through a shared or literal buffer.
+  uniqueString(s)
+  result = s
 
 proc beginStore*(s: var AnsiString; newLen: int32; start = 0'i32):
     ptr UncheckedArray[char] =
@@ -281,13 +293,14 @@ template endStore*(s: var AnsiString) =
   discard
 
 # --- varString slot bridge --------------------------------------------------
-# Delphi/FPC keep a variant's string in a *pointer* slot, hard-cast to an
-# AnsiString only where the tag says varString (varianth.inc:
-# "varstring : (vstring : pointer)"; variants.pp: "AnsiString(vString) :=
-# Source"). The slot must never be a managed AnsiString field: the Variant's
-# generated hooks run unconditionally, and the raising-return convention
-# destroys a Variant slot that was never initialized, which would free
-# whatever bits were there. These helpers are the explicit hard casts.
+# Explicit hard casts between a raw char pointer and an AnsiString, for
+# Pascal source that does that itself (`AnsiString(P)`, `PAnsiString` data).
+# The Variant no longer needs them: its varString payload is text (see
+# systempas's Variant), not the raw pointer slot Delphi keeps in TVarData.
+# A managed AnsiString field is still impossible in a case object - nimony
+# 9e44454e miscompiles an assignment to a managed field of an object for a
+# type with user hooks (crash + use-after-free). These helpers are the
+# explicit casts for the cases that do need a pointer.
 
 proc ansiToPtr*(a: AnsiString): pointer =
   ## share `a` and hand out its char pointer with one extra reference; the

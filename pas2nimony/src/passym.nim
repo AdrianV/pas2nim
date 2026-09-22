@@ -1,3 +1,4 @@
+{.feature: "lenientnils".}
 #
 #           pas2nimony - Pascal to Nimony translator
 #
@@ -103,7 +104,7 @@ const nimonyKeywords = ["addr", "bind", "block", "break", "cast", "concept",
   "macro", "method", "mixin", "notin", "proc", "ptr", "ref", "return",
   "static", "template", "tuple", "using", "when", "yield"]
   ## nimony keywords that are NOT Pascal reserved words, so they can occur
-  ## as Pascal identifiers (`addr` in synsock, `method`/`ptr`/`ref` in the
+  ## as Pascal identifiers (`addr` in one corpus unit, `method`/`ptr`/`ref`
   ## RTL) and must be escaped. A Pascal reserved word is deliberately
   ## absent: the emitter renders OPERATORS through the same canon
   ## (`and`, `or`, `xor`, `shl`, `shr`, `not`, `div`, `mod`, `in`, `is`),
@@ -147,7 +148,7 @@ proc escapeNimonyName*(spelling: string): string =
     i = j
   if isNimonyKeyword(result):
     # `addr`, `method`, `block`, `ref`, ... are ordinary Pascal
-    # identifiers (synsock declares `proc (addr: pointer; ...)`) but
+    # identifiers (a corpus unit declares `proc (addr: pointer; ...)`) but
     # keywords to nimony, which refuses them in any name position.
     result = "pas" & result
 

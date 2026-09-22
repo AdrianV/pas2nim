@@ -1,3 +1,4 @@
+{.feature: "lenientnils".}
 #
 #           pas2nimony - Pascal to Nimony translator
 #

@@ -5,7 +5,7 @@ program WithAlias;
   alias never reached `arrayVarElems`, so the with-base classified as
   an unknown class: the body's field names stayed unqualified and
   nimony rejected them ("undeclared identifier: Node/Value/Key" in
-  tplbtree.inc's `with n.Items[x] do`).
+  a corpus include's `with n.Items[x] do`).
 
   The with-body now qualifies through a hidden ADDRESS temp
   (`var w = addr(r[1])`): the base is evaluated once and writes reach

@@ -18,6 +18,34 @@ Two consumption paths exist, and both must be kept working:
 
 ## Version history and what each bump changed
 
+- **`2a458ed9` → `9e44454e`** (43 commits, 2026-09-11 → 2026-09-21). This is
+  the bump that moved nimony's defaults; it did **not** have to change any
+  emitted tag, but it does change what compiles:
+  - **`5bb78abb` "contracts: a not-nil pointer has no default value"**: a
+    `ptr`/`ref`/`pointer`/`cstring` type now rejects `default(T)`/`nil`
+    *unless the module that declares the type carries*
+    `{.feature: "lenientnils".}`. The feature is per module and is fixed at
+    the **declaration site**, not the use site - so it belongs in every
+    runtime shim *and* in pasler's own `src/*.nim` (both declare nilable
+    pointers), not only in the generated output. Missing it in one module
+    reports the error against an unrelated-looking line, e.g.
+    `Windows.nim(153, 15) Error: expected non-nil value, got a conversion of
+    nil: ref Node`.
+  - **`d9873784` + `b14838ca`**: `.requires` clauses are now judged at
+    compile time, and *a contract whose negation is provable is an error
+    even without opting in*. One corpus unit therefore stops compiling: the
+    1-based index shift emits `Data[0 - 1]` for a `Data[0]` subexpression,
+    which the prover rejects as `contract violated: 0 <= idx and idx <
+    x.len`. (The artifact is older than the bump - a 2026-09-13 translated
+    `md4_16.nim` already contains `Data[0 - 1]`; only the diagnosis is new.)
+    `{.feature: "staticContracts".}` (demand the proof everywhere) is opt-in
+    and `runtimeContracts` opts out; neither is emitted by default.
+  - **`[]` overloads were tightened** (the polymorphic accessor model:
+    `func [](x: Container): var Element`, no `var T` overloading). Two
+    consequences for generated code, both handled in `src/paspars.nim` - see
+    "Dereferencing a raw address" below: a bare `Pointer`/`cstring` has no
+    deref, and a `var T` place produced by a call is only *borrowable* when
+    its path roots in a real variable/field or an `addr`.
 - **0.4.0 → 0.6.3 development** (nimony `19973add..2a458ed9`, 2026-08-30 →
   2026-09-11, 66 commits; nativenif `73eadb4..7bd3d04`, 22 commits). The
   update was verified **not** to break this project: no emitted tag moved
@@ -40,13 +68,21 @@ Two consumption paths exist, and both must be kept working:
 
 - pas2nim repo HEAD at the time this subfolder was created:
   `cbd3e432403e1d6e10d0d54903f7c301aaa015b1` (pas2nim)
-- **Pinned nimony commit: `2a458ed96bdaed53ae64483596050ba279d55d86`**
-  (`2a458ed9`, 2026-09-11, "std/regex: port lexim to Nimony as a plugin").
-  The checkout at `/home/adrian/dev/nimony` is held at this commit until
-  `TestSimpleQuery.exe` links under `--os:windows`; bump it only together
-  with a full `build.sh` + `test/run.sh` + `test/oracle.sh` re-measurement,
-  because nimony's strictness on integer-width and `var`/`out` argument
-  binding is itself part of what we are validating.
+- **Pinned nimony commit: `9e44454edd384d0509f1513f68823f94b9f2accc`**
+  (`9e44454e`, 2026-09-21). This is the checkout at `/home/adrian/dev/nimony`
+  that `build.sh` and `test/run.sh` measure against.
+- **Wine-side nimony: `1b0433bd706cb898f8c6130d502bec034dd7ddde`**
+  (`1b0433bd`, 2026-09-21), the checkout at
+  `./.wine/win64/drive_c/nimony` (= `c:\nimony`) that builds the Windows
+  binaries and compiles everything the win64 oracle runs. The two are kept
+  in step by hand; re-measure both when either moves.
+- Previous pin: `2a458ed96bdaed53ae64483596050ba279d55d86` (`2a458ed9`,
+  2026-09-11) - the last revision before the defaults above changed.
+
+Bump either only together with a full `build.sh` + `test/run.sh` +
+`build-win64.sh` + `test/ansi/win64-oracle.sh` re-measurement, because
+nimony's strictness on integer width, `var`/`out` argument binding and
+not-nil pointers is itself part of what we are validating.
 
 ## Build
 
@@ -136,7 +172,50 @@ If the nimony checkout changes:
 cd ../nimony && nim c -r src/hastur/hastur build nimony
 ```
 
-## Cross-compiling to Windows (verified working)
+## Building for Windows in the wine win64 prefix
+
+Most of the private source tree is Windows-only, so the project also builds
+and runs **native Windows binaries** inside a wine win64 prefix that carries
+a complete toolset (`c:\nimony`, `c:\mingw64` gcc 16.2, `c:\mingw32`, FPC
+3.2.2 in `c:\lazarus\fpc\3.2.2`, Delphi 2007 in `c:\program files
+(x86)\codegear\rad studio\5.0`). Nothing is copied or moved: the prefix maps
+the repository itself.
+
+```
+sh build-win64.sh      # -> bin/pasler.exe, bin/pas2nimony.exe (PE32+)
+```
+
+Rules the script encodes (all of them verified the hard way):
+
+- **Drives**: `e:` is this repository (`e:\` = `pas2nimony/`), `d:` is
+  `private/`, `c:` is the prefix. There is **no `z:`**, so a path under
+  `/tmp` is invisible to wine - any scratch directory a wine-run tool must
+  see has to live under the checkout (the win64 oracle uses
+  `test/tmp/win64`, not `mktemp -d`).
+- **The prefix PATH is complete** (`C:\mingw64\bin`, `C:\nimony\bin`,
+  `C:\Nim\bin`, FPC's `x86_64-win64\bin`, CodeGear's `bin`), so no
+  `WINEPATH` is needed and `nimony` (pasler's default compiler name) and
+  `gcc` (for `niflink`) both resolve bare. `build-win64.sh` still passes
+  `--nimony:c:\nimony\bin\nimony.exe` explicitly.
+- **No source changes or `--path` are needed for the relative imports**:
+  `pasler.nim`'s `import ../../nimony/src/...` and `pasnifout.nim`'s
+  `../../nimony/src/lib/...` resolve through nimony's own stdlib search base
+  (`c:\nimony\lib`), from any working directory inside the prefix.
+- **The compiler's own modules need `{.feature: "lenientnils".}`** (see the
+  version history): `src/*.nim` declares `ref Node`/`ref TLexer`, so the
+  pragma is the first line of every one of them. Without it the *compiler*
+  does not build on the new nimony.
+- `-o:bin/pasler.exe` is required: `addFileExt("x.p", "exe")` is a no-op on
+  the produced `.p` binary, and `pasler --run` executes
+  `nimcache\<stem>\<stem>.p` by path, which wine handles fine.
+
+The differential tier for this toolchain is `test/ansi/win64-oracle.sh`
+(also hooked into `test/run.sh`): it compiles and runs every
+`test/ansi/*.pas` under FPC x86_64-win64, under dcc32 and under
+`bin/pasler.exe`, then compares the outputs; the `ashim.nim` model test is
+compiled by the prefix's `nimony.exe` and run as a Windows binary.
+
+## Cross-compiling to Windows from Linux (verified working)
 
 nimony's C backend builds genuine Windows executables from Linux, and they
 run under Wine. Verified end to end on a hello-world and on a
@@ -373,14 +452,22 @@ translator itself — keep current:
     collision, not a real error. Clean `nimcache` and re-run alone before
     investigating that message.
 39. **`uses <placeholder unit>` needs the module next to the anchor**:
-    paspars absorbs a unit that has no real source (`Windows`, `Forms`,
-    `Controls`, …) and the anchor then says `import Windows`. The
+    paspars absorbs a unit that has no real source (`Forms`, `Controls`,
+    `Graphics`, …) and the anchor then says `import Forms`. The
     `runtime/placeholders` directory is deliberately *not* on `--path`
     (it only ever supplies declarations, and a real unit of the same name
     must win), so `nimony` reports `file not found`. Both drivers mirror
     the placeholder into nimcache — `pasler.mirrorPlaceholders` and the
     `cp runtime/placeholders/*.nim` in `test/run.sh` — and never overwrite
     an existing file of that name.
+    That directory is **generated, gitignored and never committed**: its
+    file names are unit names of the closed-source trees the front end
+    translates, so publishing them would publish the dependency graph of
+    a private code base. `make-placeholders.sh` derives the set locally
+    (every `uses` name in the local Pascal trees that resolves to nothing,
+    so a stub can never shadow a real unit); a checkout without the
+    private tree simply has no directory and the public samples build
+    anyway, because they only use units the runtime provides.
 40. **Indexed collection properties are accessor calls in both emitters**:
     Pascal's `List.Strings[i]`, `.Objects[i]`, `.Values[k]`, `.Names[i]`
     have no nimony equivalent, so `pasnimout`/`pasnifout` lower them to

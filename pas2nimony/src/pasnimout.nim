@@ -1,3 +1,4 @@
+{.feature: "lenientnils".}
 #
 #           pas2nimony - Pascal to Nimony translator
 #
@@ -303,10 +304,14 @@ proc gParams(s: var TRendor, n: Node): string =
     if i > 1: result.add("; ")
     let d = n[i]
     if d.kind == nkIdentDefs:
+      let dt = d[d.len - 2]
+      let noinit = dt.kind == nkVarTy and dt.noInitParam
       for j in 0 ..< d.len - 2:
         if j > 0: result.add(", ")
         result.add(s.defName(d[j]))
-      result.add(": " & s.typeStr(d[d.len - 2]))
+      if noinit:
+        result.add(" {.noinit.}")
+      result.add(": " & s.typeStr(dt))
       if d[d.len - 1].kind != nkEmpty:
         result.add(" = " & s.expr(d[d.len - 1]))
   result.add(")")
@@ -535,12 +540,16 @@ proc renderDef(s: var TRendor, n: Node) =
   # node, containsRaise owns it). nimony's front end rejects two ADJACENT
   # pragma blocks on one definition - `proc E() {.closure.} {.raises.} =`
   # dies with "invalid indentation" - so collect every pragma and emit a
-  # single `{.a, b.}` block. (Masks.pas, VHelper.pas.)
+  # single `{.a, b.}` block. (Two corpus units.)
   var prags: seq[string] = @[]
   if n.len >= 4 and n[3].kind == nkPragma:
     for pi in 0 ..< n[3].len:
       if n[3][pi].kind == nkIdent and n[3][pi].strVal != "raises":
         prags.add(n[3][pi].strVal)
+  if n.resultNoInit:
+    # the result is written only through `addr result` (the callback
+    # pattern); the init proof cannot see it, so take the escape hatch
+    prags.add("noinit")
   if containsRaise(body):
     # nimony: raising procs must announce it (ErrorCode model)
     prags.add("raises")
@@ -840,7 +849,7 @@ proc stmt(s: var TRendor, n: Node) =
   of nkTypeSection:
     # a routine-LOCAL type section: Nim allows `type` inside a proc, so
     # render the definitions in place. This case used to be a bare
-    # discard, which silently dropped e.g. tplbtree.inc's local `RPath`
+    # discard, which silently dropped e.g. a corpus include's local `RPath`
     # and left every use of it undeclared. Module-level sections are
     # rendered by renderModule, not here.
     var anyDef = false

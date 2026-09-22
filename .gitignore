@@ -11,6 +11,12 @@ pas2nimony/test/tmp
 pas2nimony/test/tmp2
 # closed-source Delphi compiler food - never published
 pas2nimony/test/private
+# the runtime placeholder *names* are unit names from the closed-source trees:
+# make-placeholders.sh derives the stubs locally, nothing here is published
+pas2nimony/runtime/placeholders/
+pas2nimony/runtime/placeholders.list
+pas2nimony/runtime/placeholders.paths
+pas2nimony/runtime/placeholders.extra
 # closed-source Delphi corpus: several nested git checkouts. NEVER publish,
 # and never publish anything derived from them (translated .nim, logs, build
 # trees) either.
@@ -30,3 +36,5 @@ test.txt
 .dsh/
 .vscode/
 *.log
+pas2nimony/nimcache-win
+tmp/

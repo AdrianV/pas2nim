@@ -3,7 +3,7 @@ program InhArith;
 
     result := inherited Row + ',' + FieldF.AsString;
 
-  (uTest1/uTest1b). The member name is the LEFTMOST leaf of the parsed
+  (two corpus units). The member name is the LEFTMOST leaf of the parsed
   expression, not a call of its own - so only that leaf may be rebound to
   the parent call. Treating the whole expression as "not a call" dropped
   every operand after the member reference and produced a wrong result. *)

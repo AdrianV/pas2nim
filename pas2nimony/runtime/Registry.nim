@@ -6,7 +6,7 @@
 # ships.
 #
 # One corpus unit names Registry in its `uses` clause without taking a
-# symbol from it; `DBWebbrowser` uses TRegistry directly. The real RTL
+# symbol from it; another uses TRegistry directly. The real RTL
 # is a thin wrapper over advapi32's RegOpenKeyEx/RegQueryValueEx, and
 # v1 has no such FFI - so this shim is an IN-MEMORY store. Keys and
 # values round-trip within the process and the Delphi success/failure

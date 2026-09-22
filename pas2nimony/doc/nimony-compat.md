@@ -1031,7 +1031,7 @@ census tracks the tier separately from the nimony leg.
 - dcc32 rule: with an ABSOLUTE source path the .exe lands next to the
   source; compile the scratch copy under a RELATIVE name instead.
 - MSWINDOWS defines tier: the uses bridge grew a `windows` branch
-  importing `runtime/placeholders/Windows.nim` (the Win32 compat shim:
+  importing `runtime/Windows.nim` (the Win32 compat shim:
   THandle/HWND/HWnd/HMODULE/HINSTANCE as `uint32`, the WAIT_*/QS_*/
   PM_*/RPC_* consts, the wait/mutex/critical-section/window/OLE API
   stubs, `Win32Platform`, `HWND_MESSAGE` = `0xFFFFFFFD'u32`). The
@@ -1197,7 +1197,7 @@ satisfied by runtime shims), and the suite grew to 54 sections, all green.
 - **`Registry` shim**: the last MISSING unit. One corpus unit listed it in `uses` without
   taking a symbol from it, but the closure could not resolve it. The API surface was read
   from the Delphi 2007 RTL source shipped in the wine prefix
-  (`source/Win32/rtl/common/Registry.pas`); `runtime/placeholders/Registry.nim` now covers
+  (`source/Win32/rtl/common/Registry.pas`); `runtime/Registry.nim` now covers
   the full `TRegistry` surface plus `TRegIniFile` over an in-memory store. Documented
   divergence: pasclasses' `TStrings` is an unbacked base (its `Add` is a no-op), so the
   enumeration helpers take a `TStringList`.
@@ -1209,11 +1209,11 @@ One corpus unit had `:` where `;` belongs, and another needed the nested `goto` 
 **Status: nothing in this tier has been type-checked.** Translation is reach; compilation
 is the next milestone.
 
-## M15 - the lazyBtree tier type-checks (P4-P7)
+## M15 - the generic-container tier type-checks (P4-P7)
 
 Translation was reach; this milestone opens the compile tier. The first target is the
-five `lazyBtree*` modules (`lazyBtree`, `lazyBtreeInt64`, `lazyBtreeDateTime`,
-`lazyBtreeString`, `lazyBtreeText`), the generic-container core of the corpus. They go
+five keyed generic-container modules (int32, int64, TDateTime, string and text
+keyed), the container core of the corpus. They go
 from **197 nimony `Error:` lines to 0** - each module now builds a binary (`nimony c`
 exit 0). The suite grows to 86 sections and stays otherwise green (the only failures are
 the pre-existing NIF shapes `pasler-withalias` / `pasler-withptr`), so no regression was
@@ -1313,5 +1313,5 @@ The parsed-NIF writer gained the two shapes the new AST uses - `(call addr x)` a
 the deref `(at x)` (probed against nifler) - and a real `(ptr T)` type descriptor
 (a bare `ptr` ident was an undeclared name). `pasler-withalias` and
 `pasler-withptr` now both pass, so the suite is **86 sections, all green**, the
-oracle is 15/15, and the five `lazyBtree*` modules still build at 0 errors. The
+oracle is 15/15, and the five generic-container modules still build at 0 errors. The
 `withalias` / `withptr` sample comments were updated to describe the capture.

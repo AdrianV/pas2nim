@@ -2,7 +2,7 @@ program DotAncestor;
 (* A class may name its ancestor with the UNIT qualifier, and the corpus
   does exactly that inside the unit itself:
 
-    TaStringList = class(vStrLst.TaTemplateList)
+    TChild = class(someunit.TParent)
 
   The ancestor registry is keyed by the bare type name, so a qualified
   parent used to be recorded as NO parent. `inherited IndexOf(x)` then

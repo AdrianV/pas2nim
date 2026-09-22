@@ -555,10 +555,40 @@ proc Dispose*(p: pointer) =
   discard
 
 # pasCStr: Delphi's `PChar(Integer(P) + N)` pointer arithmetic has no
-# nimony spelling (int<->cstring casts are rejected); the v1 shim
-# answers nil and the corpus's binary-stream paths stay compile-only
+# nimony spelling (int<->cstring casts are rejected); the v1 shim answers
+# nil and the corpus's binary-stream paths stay compile-only. A *deref* of
+# such an address does not come through here: the parser's addrArith drops
+# the integer conversion and calls the `pointer` overload below, which is
+# exact (`Move(PAnsiChar(ByteAddress(@x) + n)^, ...)`).
 proc pasCStr*(a: int32): cstring =
   result = nil
+
+proc pasCStr*(a: pointer): cstring =
+  ## `PAnsiChar(<raw address>)`: exact - the address is the value
+  result = cast[cstring](a)
+
+# pasDeref: Pascal's `X^` on a raw address. nimony's `[]` only accepts a
+# `ptr T` operand, so neither the untyped `Pointer` (Delphi reads `P^` as a
+# Byte) nor a `PAnsiChar`/`PChar` has a deref of its own. Both lower to
+# `pasDeref(X)[]`, which is the `var` place an untyped Pascal parameter
+# (`Move(const Source; var Dest; Count)`) requires.
+proc pasDeref*(a: pointer): ptr uint8 {.inline.} = cast[ptr uint8](a)
+proc pasDeref*(a: cstring): ptr char {.inline.} = cast[ptr char](a)
+
+# pasAddr*: the Win32-era address arithmetic (`PChar(Integer(P) + N)`). The
+# value is the plain bit arithmetic, but the *shape* matters: nimony proves a
+# `var` argument borrowable by walking a call's first argument down to the
+# `addr` that roots it, and a builtin `+` node stops that walk. Routing the
+# arithmetic through a call that takes the address first keeps
+# `Move(Pointer(ByteAddress(@x) + n)^, ...)` borrowable.
+proc pasAddrOff*(a: pointer; n: int): pointer {.inline.} =
+  cast[pointer](cast[uint](a) + cast[uint](n))
+
+proc pasAddrSub*(a: pointer; n: int): pointer {.inline.} =
+  cast[pointer](cast[uint](a) - cast[uint](n))
+
+proc pasAddrAnd*(a: pointer; n: int): pointer {.inline.} =
+  cast[pointer](cast[uint](a) and cast[uint](n))
 
 # Delphi's PAnsiChar semantics. nimony splits them between two types:
 # cstring has `P[i]` and the C ABI but neither arithmetic nor `P^`;
@@ -656,58 +686,139 @@ proc pasRound*(f: float64): int64 =
 proc sameRef*(a, b: RootRef): bool =
   result = cast[pointer](a) == cast[pointer](b)
 
+# Delphi's variant type codes; measured identical in dcc32 and FPC.
+# Declared *before* the Variant type: nimony resolves a case label/constructor
+# discriminator against what is already in scope (a later const is 'undeclared').
 type
-  # Delphi Variant: TVarData's tag plus a payload wide enough to keep the
-  # Delphi union views (VInteger/VLongWord/VInt64/VDouble/VCurrency/...)
-  # synchronised on every store, so corpus code reading
-  # `TVarData(v).VInteger` sees what Delphi sees. `TVarData` is the same
-  # type, which makes Delphi's `TVarData(v)` cast an identity in Nim.
+  TVarType* = uint16
+
+const
+  varEmpty* = TVarType(0x0000)
+  varNull* = TVarType(0x0001)
+  varSmallint* = TVarType(0x0002)
+  varInteger* = TVarType(0x0003)
+  varSingle* = TVarType(0x0004)
+  varDouble* = TVarType(0x0005)
+  varCurrency* = TVarType(0x0006)
+  varDate* = TVarType(0x0007)
+  varOleStr* = TVarType(0x0008)
+  varDispatch* = TVarType(0x0009)
+  varError* = TVarType(0x000A)
+  varBoolean* = TVarType(0x000B)
+  varVariant* = TVarType(0x000C)
+  varUnknown* = TVarType(0x000D)
+  varShortInt* = TVarType(0x0010)
+  varByte* = TVarType(0x0011)
+  varWord* = TVarType(0x0012)
+  varLongWord* = TVarType(0x0013)
+  varInt64* = TVarType(0x0014)
+  varUInt64* = TVarType(0x0015)   # FPC only: D2007 stores UInt64 as varInt64
+  varString* = TVarType(0x0100)   # the AnsiString variant (D2007 + FPC)
+  varAny* = TVarType(0x0101)      # FPC only (D2007: E2003)
+  varUString* = TVarType(0x0102)  # UnicodeString variant (FPC / D2009+);
+    # measured: FPC 3.2.2 tags a direct UnicodeString assignment varOleStr
+    # (0x0008), not 0x0102, yet still reads the 0x0102 slot as UnicodeString.
+  varArray* = TVarType(0x2000)    # OR'd into the tag of a variant array
+  varParam* = TVarType(0x4000)    # OR'd in for an untyped `var` parameter
+
+  # A variant array's tag is `varArray or <element tag>`. The case-object
+  # branch below enumerates them instead of using a range or an `or`
+  # expression, because nimony 9e44454e rejects both in a case label (a
+  # range trips an internal assertion, `or` is not folded) and rejects any
+  # constructor whose discriminator it cannot prove belongs to the branch.
+  # These are literals so the same names work in the labels *and* in the
+  # constant-tag constructors.
+  vArrEmpty* = TVarType(0x2000)
+  vArrNull* = TVarType(0x2001)
+  vArrSmallint* = TVarType(0x2002)
+  vArrInteger* = TVarType(0x2003)
+  vArrSingle* = TVarType(0x2004)
+  vArrDouble* = TVarType(0x2005)
+  vArrCurrency* = TVarType(0x2006)
+  vArrDate* = TVarType(0x2007)
+  vArrOleStr* = TVarType(0x2008)
+  vArrError* = TVarType(0x200A)
+  vArrBoolean* = TVarType(0x200B)
+  vArrVariant* = TVarType(0x200C)   # VarArrayOf / the default element type
+  vArrShortInt* = TVarType(0x2010)
+  vArrByte* = TVarType(0x2011)
+  vArrWord* = TVarType(0x2012)
+  vArrLongWord* = TVarType(0x2013)
+  vArrInt64* = TVarType(0x2014)
+  vArrUInt64* = TVarType(0x2015)
+  vArrString* = TVarType(0x2100)
+  vArrUString* = TVarType(0x2102)
+
+type
+  # Delphi Variant: a *discriminated* union (`case object`) whose
+  # discriminator is the measured tag. The old flat model kept every union
+  # view in sync by hand; nimony's case object gives the same aliasing for
+  # free (all branches start at the same payload offset, so a cross-view read
+  # such as `VInteger` of a varLongWord still reads the same bits - measured
+  # in both directions) while making the tag authoritative for construction
+  # and destruction.
   #
   # The semantics below are *measured*, not recalled: type codes, the
   # Null/Unassigned predicates, the conversions and the operators were
   # pinned against Delphi 2007 (dcc32/Win32 under wine) and FPC 3.2.2 by
-  # test/variant/vcore.pas + test/variant-oracle.sh; see
-  # .dsh/wiki/pas2nimony-variant-semantics.md. Divergences are marked.
-  TVarType* = uint16
-
+  # test/variant/*.pas + test/variant/vshim.nim + test/ansi/vstrtypes.pas;
+  # see .dsh/wiki/pas2nimony-variant-semantics.md. Divergences are marked.
+  #
+  # Construction is constructor-only (`Variant(VType: tag, <field>: value)`)
+  # in the shim's helpers: corpus code never pokes the tag (verified over the
+  # whole closure - its `FValue.VType`/`Dest.VType` writes are a *different*
+  # type, an expression record of its own).
   Variant* = object
-    VType*: TVarType
-    # integer views, kept in sync on store (a union's low-32 view of an
-    # unsigned value is a two's-complement reinterpretation, as in Delphi)
-    VInteger*: int32
-    VLongWord*: uint32
-    VSmallint*: int16
-    VShortInt*: int8
-    VByte*: uint8
-    VWord*: uint16
-    VInt64*: int64
-    VUInt64*: uint64
+    case VType*: TVarType
+    of varEmpty, varNull: discard
+    # integer views. Each tag carries the field named after it; the branches
+    # alias, so the other widths still read back the same bits.
+    of varSmallint: VSmallint*: int16
+    of varShortInt: VShortInt*: int8
+    of varByte: VByte*: uint8
+    of varWord: VWord*: uint16
+    of varInteger: VInteger*: int32
+    of varLongWord: VLongWord*: uint32
+    of varInt64: VInt64*: int64
+    of varUInt64: VUInt64*: uint64
     # real views
-    VSingle*: float32
-    VDouble*: float64
-    VCurrency*: int64      # Delphi Currency: scaled by 10000
-    VDate*: float64        # TDateTime
+    of varSingle: VSingle*: float32
+    of varDouble: VDouble*: float64
+    of varCurrency: VCurrency*: int64   # Delphi Currency: scaled by 10000
+    of varDate: VDate*: float64         # TDateTime
     # misc scalars
-    VBoolean*: uint16      # WordBool
-    VChar*: char
-    VWideChar*: uint16
-    VError*: int32
-    # payloads without a scalar view
+    of varBoolean: VBoolean*: uint32
+      # MEASURED (vcase.pas): Delphi's WordBool payload is 0x0000FFFF for
+      # True and the union's 4-byte view reads back 65535, so the field is
+      # deliberately 4 bytes: a 2-byte WordBool leaves the upper half of the
+      # union payload to the compiler, which nimony 1b0433bd (wine) leaves
+      # uninitialized (the host 9e44454e zeroed it - the same probe then
+      # printed 65535 vs -30998529). Nothing reads VBoolean as a WordBool.
+    of varError: VError*: int32
     # MEASURED (test/ansi/vstrtypes.pas): D2007 and FPC 3.2.2 both tag an
     # AnsiString AND a plain string as varString (0x0100); WideString is
-    # varOleStr (0x0008). A varString therefore carries either a plain
-    # (system) string or an explicit AnsiString, and the shim stores each in
-    # its natural form:
-    VString*: string          # varString (system string) / varOleStr / varUString
-    VAnsiString*: pointer     # varString (explicit AnsiString). FPC/Delphi keep
-      # a raw pointer here (varianth.inc: "varstring : (vstring : pointer)"),
-      # hard-cast to an AnsiString only while the tag says varString. It must
-      # NOT be a managed AnsiString field: the generated hooks run
-      # unconditionally and the raising-return convention destroys an
-      # uninitialized Variant slot, freeing whatever bits were there.
-      # See .dsh/wiki/pas2nimony-ansistring-semantics.md.
-    VObject*: RootRef      # varUnknown / varDispatch
-    VArray*: RootRef       # variant array (VariantArrayObj)
+    # varOleStr (0x0008), UnicodeString arrives as varOleStr too. All three
+    # are payload-by-text, so one branch serves them.
+    #
+    # The *tag* is what the oracles pin; the payload is our representation.
+    # FPC/Delphi keep a raw pointer to the AnsiString data in this slot, but
+    # a managed `AnsiString` field cannot be used here: nimony 9e44454e
+    # miscompiles an assignment to a managed field of an object for a type
+    # with user hooks (`eQdestroy(&bitcopy-of-uninitialized-result)` plus a
+    # destroy of the source temp afterwards - a crash and a use-after-free;
+    # repro in .dsh/wiki/pas2nimony-variant-semantics.md). A nimony `string`
+    # field is safe there and keeps the bytes, so the AnsiString payload is
+    # converted through toString() and back on demand.
+    of varString, varOleStr, varUString: VString*: string
+    # payloads without a scalar view
+    of varUnknown, varDispatch: VObject*: RootRef
+    # the varArray bit plus the element tag (the enumerated vArr* consts)
+    of vArrEmpty, vArrNull, vArrSmallint, vArrInteger, vArrSingle, vArrDouble,
+       vArrCurrency, vArrDate, vArrOleStr, vArrError, vArrBoolean,
+       vArrVariant, vArrShortInt, vArrByte, vArrWord, vArrLongWord,
+       vArrInt64, vArrUInt64, vArrString, vArrUString:
+      VArray*: VariantArray
+    else: discard
 
   # a variant array: per-dimension bounds plus flat storage
   VariantArrayObj* = object
@@ -738,34 +849,6 @@ type
   TVarData* = Variant
 
 # Delphi's variant type codes; measured identical in dcc32 and FPC
-const
-  varEmpty* = TVarType(0x0000)
-  varNull* = TVarType(0x0001)
-  varSmallint* = TVarType(0x0002)
-  varInteger* = TVarType(0x0003)
-  varSingle* = TVarType(0x0004)
-  varDouble* = TVarType(0x0005)
-  varCurrency* = TVarType(0x0006)
-  varDate* = TVarType(0x0007)
-  varOleStr* = TVarType(0x0008)
-  varDispatch* = TVarType(0x0009)
-  varError* = TVarType(0x000A)
-  varBoolean* = TVarType(0x000B)
-  varVariant* = TVarType(0x000C)
-  varUnknown* = TVarType(0x000D)
-  varShortInt* = TVarType(0x0010)
-  varByte* = TVarType(0x0011)
-  varWord* = TVarType(0x0012)
-  varLongWord* = TVarType(0x0013)
-  varInt64* = TVarType(0x0014)
-  varUInt64* = TVarType(0x0015)   # FPC only: D2007 stores UInt64 as varInt64
-  varString* = TVarType(0x0100)   # the AnsiString variant (D2007 + FPC)
-  varAny* = TVarType(0x0101)      # FPC only (D2007: E2003)
-  varUString* = TVarType(0x0102)  # UnicodeString variant (FPC / D2009+);
-    # measured: FPC 3.2.2 tags a direct UnicodeString assignment varOleStr
-    # (0x0008), not 0x0102, yet still reads the 0x0102 slot as UnicodeString.
-  varArray* = TVarType(0x2000)    # OR'd into the tag of a variant array
-  varParam* = TVarType(0x4000)    # OR'd in for an untyped `var` parameter
 
 type
   PVariant* = ptr Variant
@@ -1428,33 +1511,40 @@ proc Create*(self: typedesc[EVariantTypeCastError];
 # slot write), which a converter is not allowed to do.
 
 proc vInt(tag: TVarType; x: int64): Variant {.noSideEffect.} =
-  ## every integer view of the union is written, so a read through any of
-  ## them matches Delphi's bit pattern
-  result = Variant(VType: tag)
-  result.VInt64 = x
-  result.VUInt64 = cast[uint64](x)
-  result.VInteger = int32(x and 0xFFFFFFFF'i64)
-  result.VLongWord = cast[uint32](result.VInteger)
-  result.VWord = uint16(result.VLongWord and 0xFFFF'u32)
-  result.VByte = uint8(uint32(result.VWord) and 0xFF'u32)
-  result.VSmallint = cast[int16](result.VWord)
-  result.VShortInt = cast[int8](result.VByte)
+  ## The integer branch, dispatched on the tag. A case object's constructor
+  ## needs a *constant* discriminator (nimony rejects a runtime tag whose
+  ## branch membership it cannot prove), so every tag gets its own
+  ## construction; only that branch's own field is written. The branches
+  ## alias, so Delphi's cross-view reads keep working on the same bits.
+  let u = cast[uint64](x)
+  case tag
+  of varInt64: result = Variant(VType: varInt64, VInt64: x)
+  of varUInt64: result = Variant(VType: varUInt64, VUInt64: u)
+  of varLongWord: result = Variant(VType: varLongWord,
+                                   VLongWord: uint32(u and 0xFFFFFFFF'u64))
+  of varWord: result = Variant(VType: varWord,
+                               VWord: uint16(u and 0xFFFF'u64))
+  of varByte: result = Variant(VType: varByte, VByte: uint8(u and 0xFF'u64))
+  of varSmallint: result = Variant(VType: varSmallint,
+                                   VSmallint: int16(u and 0xFFFF'u64))
+  of varShortInt: result = Variant(VType: varShortInt,
+                                   VShortInt: int8(u and 0xFF'u64))
+  of varBoolean: result = Variant(VType: varBoolean,
+                                  VBoolean: uint32(u and 0xFFFFFFFF'u64))
+  else: result = Variant(VType: varInteger,
+                         VInteger: int32(u and 0xFFFFFFFF'u64))
 
 proc vReal(tag: TVarType; x: float64): Variant {.noSideEffect.} =
-  result = Variant(VType: tag)
-  result.VDouble = x
-  result.VSingle = float32(x)
-  if tag == varDate:
-    result.VDate = x
+  ## the real branch (the `else` covers varDouble, the tag the literals use)
+  case tag
+  of varSingle: result = Variant(VType: varSingle, VSingle: float32(x))
+  of varDate: result = Variant(VType: varDate, VDate: x)
+  else: result = Variant(VType: varDouble, VDouble: x)
 
 proc vCurrency(cu: int64): Variant {.noSideEffect.} =
-  ## Delphi Currency: an int64 scaled by 10000 (the same 8 bytes as VInt64)
-  result = Variant(VType: varCurrency)
-  result.VCurrency = cu
-  result.VInt64 = cu
-  result.VUInt64 = cast[uint64](cu)
-  result.VDouble = float64(cu) / 10000.0
-  result.VSingle = float32(result.VDouble)
+  ## Delphi Currency: an int64 scaled by 10000 (the same 8 bytes as VInt64,
+  ## so `VInt64` still reads the scaled value - measured 35000)
+  result = Variant(VType: varCurrency, VCurrency: cu)
 
 proc pasVarCurrF*(x: float64): Variant =
   ## a Pascal Currency-typed expression reaches the shim as float64
@@ -1483,24 +1573,35 @@ proc pasVarWStr*(s: string): Variant {.noSideEffect.} =
   ## (measured: 0008)
   vStr(varOleStr, s)
 
+proc pasVarWStr*(s: AnsiString): Variant =
+  ## an AnsiString *element* of `VarArrayOf([...])` is varOleStr too
+  ## (measured in both oracles, test/variant/varray.pas), where a plain
+  ## Variant assignment of the same AnsiString gives varString. nimony matches
+  ## overloads exactly, so the AnsiString case needs its own overload.
+  vStr(varOleStr, toString(s))
+
 proc vStr(tag: TVarType; s: string): Variant {.noSideEffect.} =
-  result = Variant(VType: tag)
-  result.VString = s
+  ## the string branch: varString (a plain string or an AnsiString), varOleStr
+  ## and varUString share `VString`
+  case tag
+  of varOleStr: result = Variant(VType: varOleStr, VString: s)
+  of varUString: result = Variant(VType: varUString, VString: s)
+  else: result = Variant(VType: varString, VString: s)
 
 proc vAnsiStr*(s: AnsiString): Variant =
-  ## an explicit AnsiString takes the raw pointer slot (FPC/Delphi keep a
-  ## pointer there); share its buffer into the slot
-  ## (`AnsiString(vString) := Source`). A plain nimony string does NOT take
-  ## this path - it stays in the managed VString field (vStr), because the
-  ## string<->AnsiString conversion is exactly what the mapping split
-  ## introduces and it must not be eager/implicit here.
-  result = Variant(VType: varString)
-  result.VAnsiString = ansiToPtr(s)
+  ## an explicit AnsiString. Its *tag* is varString in both oracles; the
+  ## payload is the text, not the raw pointer FPC/Delphi keep in the union
+  ## (a managed `AnsiString` field is impossible here - nimony miscompiles an
+  ## assignment to a managed field of an object for a type with user hooks;
+  ## see the Variant type above). The conversion copies, so the Variant is
+  ## independent of later writes through the source - the observable half of
+  ## Delphi's sharing.
+  result = Variant(VType: varString, VString: toString(s))
 
 proc vBool(b: bool): Variant {.noSideEffect.} =
-  result = Variant(VType: varBoolean)
-  result.VBoolean = if b: 1'u16 else: 0'u16
-  result.VInteger = if b: 1'i32 else: 0'i32
+  ## WordBool: 0xFFFF is True in Delphi's variant boolean (measured)
+  result = Variant(VType: varBoolean,
+                   VBoolean: (if b: 0xFFFF'u32 else: 0'u32))
 
 proc pasVarLit*(x: int64): Variant {.noSideEffect.} =
   ## Pascal integer *literals*, as dcc32 types them: the narrowest type that
@@ -1542,8 +1643,7 @@ proc toVariant*(x: bool): Variant = vBool(x)
 proc toVariant*(x: char): Variant = vStr(varString, $x)
   ## measured: a Char is stored as a one-character varString in both
 proc toVariant*(x: RootRef): Variant =
-  result = Variant(VType: varUnknown)
-  result.VObject = x
+  result = Variant(VType: varUnknown, VObject: x)
 
 # ---------------------------------------------------------------------------
 # Variant: predicates and inspection
@@ -1555,16 +1655,21 @@ proc VarIsClear*(v: Variant): bool = v.VType == varEmpty
   ## measured: Null is NOT clear (Clear == Unassigned/varEmpty)
 proc VarIsArray*(v: Variant): bool = (v.VType and varArray) != TVarType(0)
 proc VarArrayDimCount*(v: Variant): int32 =
-  let a = cast[VariantArray](v.VArray)
-  if a == nil: result = 0 else: result = int32(a.dims.len)
+  ## the array payload is a real `VariantArray` (no RootRef cast any more); a
+  ## cross-branch read is unchecked (as in Delphi's union), so the tag guard
+  ## stays
+  if not VarIsArray(v) or v.VArray == nil: result = 0
+  else: result = int32(v.VArray.dims.len)
 proc VarArrayLowBound*(v: Variant; dim: int32): int32 =
-  let a = cast[VariantArray](v.VArray)
-  if a == nil or dim < 1 or dim > a.dims.len: result = 0
-  else: result = a.dims[dim - 1].lo
+  if not VarIsArray(v) or v.VArray == nil or dim < 1 or
+     dim > v.VArray.dims.len:
+    result = 0
+  else: result = v.VArray.dims[dim - 1].lo
 proc VarArrayHighBound*(v: Variant; dim: int32): int32 =
-  let a = cast[VariantArray](v.VArray)
-  if a == nil or dim < 1 or dim > a.dims.len: result = -1
-  else: result = a.dims[dim - 1].hi
+  if not VarIsArray(v) or v.VArray == nil or dim < 1 or
+     dim > v.VArray.dims.len:
+    result = -1
+  else: result = v.VArray.dims[dim - 1].hi
 
 proc isIntTag(t: TVarType): bool =
   t in {varSmallint, varInteger, varShortInt, varByte, varWord, varLongWord,
@@ -1575,13 +1680,22 @@ proc isStrTag(t: TVarType): bool =
   t in {varString, varOleStr, varUString}
 
 proc asInt64(v: Variant): int64 =
-  ## the *signed* reading Delphi's arithmetic uses per tag
-  if v.VType in {varInt64, varUInt64}: result = v.VInt64
-  elif v.VType == varLongWord: result = int64(v.VLongWord)
-  elif v.VType == varWord: result = int64(v.VWord)
-  elif v.VType == varByte: result = int64(v.VByte)
-  elif v.VType == varSmallint: result = int64(v.VSmallint)
-  elif v.VType == varShortInt: result = int64(v.VShortInt)
+  ## the *signed* reading Delphi's arithmetic uses per tag. Only tags whose
+  ## own branch is an integer (plus WordBool) reach this; anything else keeps
+  ## the old `VInteger` default, which is the union's low 32 bits.
+  case v.VType
+  of varInt64, varUInt64: result = v.VInt64
+  of varLongWord: result = int64(v.VLongWord)
+  of varWord: result = int64(v.VWord)
+  of varByte: result = int64(v.VByte)
+  of varSmallint: result = int64(v.VSmallint)
+  of varShortInt: result = int64(v.VShortInt)
+  of varCurrency: result = v.VCurrency
+  of varBoolean:
+    # WordBool: 0xFFFF is True, and *arithmetic* converts it to -1
+    # (measured: `True + 1` = 0 in both oracles) while the union's
+    # VInteger view reads the raw 65535 (vcase.pas pins both)
+    result = int64(cast[int16](uint16(v.VBoolean and 0xFFFF'u32)))
   else: result = int64(v.VInteger)
 
 proc asFloat64(v: Variant): float64 =
@@ -1589,7 +1703,9 @@ proc asFloat64(v: Variant): float64 =
   of varSingle: result = float64(v.VSingle)
   of varDouble, varDate: result = v.VDouble
   of varCurrency: result = float64(v.VCurrency) / 10000.0
-  of varBoolean: result = float64(v.VBoolean)
+  of varBoolean: result = float64(asInt64(v))
+    # measured: `True + 1.5` is 0.5 in FPC (varDouble) - the WordBool is
+    # converted to -1, not to 65535
   else: result = float64(asInt64(v))
 
 proc variantToStr(v: Variant): string =
@@ -1599,7 +1715,7 @@ proc variantToStr(v: Variant): string =
   ## dcc32 but '.' in FPC (we follow FPC - the pinned DecimalSeparator)
   case v.VType
   of varEmpty, varNull: result = ""
-  of varBoolean: result = if v.VBoolean != 0'u16: "True" else: "False"
+  of varBoolean: result = if v.VBoolean != 0'u32: "True" else: "False"
   of varCurrency:
     let n = v.VCurrency
     let neg = n < 0
@@ -1616,18 +1732,17 @@ proc variantToStr(v: Variant): string =
     result = (if neg: "-" else: "") & s
   of varSingle: result = FloatToStr(v.VSingle)
   of varDouble, varDate: result = FloatToStr(v.VDouble)
-  of varString:
-    # either a nimony string (managed VString) or an explicit AnsiString (the
-    # raw pointer FPC/Delphi keep in the union) - read whichever is set
-    if cast[uint](v.VAnsiString) != 0:
-      result = ptrToNimString(cast[uint](v.VAnsiString))
-    else:
-      result = v.VString
-  of varOleStr, varUString:
+  of varString, varOleStr, varUString:
+    # all three are payload-by-text: a plain string, an AnsiString (converted
+    # on construction) or a WideString
     result = v.VString
   of varLongWord: result = $v.VLongWord
   of varWord: result = $v.VWord
   of varByte: result = $v.VByte
+  of varSmallint: result = $v.VSmallint
+  of varShortInt: result = $v.VShortInt
+  of varInt64, varUInt64: result = $v.VInt64
+  of varError: result = $v.VError
   else: result = $asInt64(v)
 
 proc parseCurr(s: string): int64 {.raises.} =
@@ -1900,8 +2015,36 @@ proc `>=`*(a, b: Variant): bool = pasVarGe(a, b)
 # Delphi's tag carries the varArray bit plus the element type; the bounds
 # arrive as (lo, hi) pairs. Storage is flat with per-dimension strides.
 
+proc arrayVariant(a: VariantArray; elemType: TVarType): Variant {.noSideEffect.} =
+  ## a variant array's tag is `varArray or elemType`. A case-object
+  ## constructor needs a constant discriminator, so the element tag is
+  ## dispatched onto the enumerated vArr* consts; an element type without a
+  ## vArr* name (nothing in the corpus or the tests) falls back to
+  ## varVariant, which is Delphi's own default element type.
+  case elemType
+  of varEmpty: result = Variant(VType: vArrEmpty, VArray: a)
+  of varNull: result = Variant(VType: vArrNull, VArray: a)
+  of varSmallint: result = Variant(VType: vArrSmallint, VArray: a)
+  of varInteger: result = Variant(VType: vArrInteger, VArray: a)
+  of varSingle: result = Variant(VType: vArrSingle, VArray: a)
+  of varDouble: result = Variant(VType: vArrDouble, VArray: a)
+  of varCurrency: result = Variant(VType: vArrCurrency, VArray: a)
+  of varDate: result = Variant(VType: vArrDate, VArray: a)
+  of varOleStr: result = Variant(VType: vArrOleStr, VArray: a)
+  of varError: result = Variant(VType: vArrError, VArray: a)
+  of varBoolean: result = Variant(VType: vArrBoolean, VArray: a)
+  of varShortInt: result = Variant(VType: vArrShortInt, VArray: a)
+  of varByte: result = Variant(VType: vArrByte, VArray: a)
+  of varWord: result = Variant(VType: vArrWord, VArray: a)
+  of varLongWord: result = Variant(VType: vArrLongWord, VArray: a)
+  of varInt64: result = Variant(VType: vArrInt64, VArray: a)
+  of varUInt64: result = Variant(VType: vArrUInt64, VArray: a)
+  of varString: result = Variant(VType: vArrString, VArray: a)
+  of varUString: result = Variant(VType: vArrUString, VArray: a)
+  else: result = Variant(VType: vArrVariant, VArray: a)
+
 proc VarArrayCreate*(bounds: openArray[int32]; elemType: TVarType): Variant =
-  var a = VariantArray(dims: @[])
+  var a = VariantArray(dims: @[], values: @[])
   var i = 0
   var total = 1
   while i + 1 < bounds.len:
@@ -1912,16 +2055,15 @@ proc VarArrayCreate*(bounds: openArray[int32]; elemType: TVarType): Variant =
     i = i + 2
   a.values = newSeq[Variant](total)
   for j in 0 ..< total:
+    # Delphi initialises the elements to the element type's zero value
     a.values[j] = Variant(VType: elemType)
-  result = Variant(VType: varArray or elemType)
-  result.VArray = cast[RootRef](a)
+  result = arrayVariant(a, elemType)
 
 proc VarArrayOf*(values: openArray[Variant]): Variant =
   var a = VariantArray(dims: @[(lo: 0'i32, hi: int32(values.len) - 1)],
                        values: @[])
   for v in values: a.values.add(v)
-  result = Variant(VType: varArray or varVariant)
-  result.VArray = cast[RootRef](a)
+  result = arrayVariant(a, varVariant)
 
 proc arrayIndexOf(a: VariantArray; indices: openArray[int32]): int =
   result = 0
@@ -1934,31 +2076,28 @@ proc arrayIndexOf(a: VariantArray; indices: openArray[int32]): int =
     dec i
 
 proc `[]`*(v: Variant; i: int32): Variant {.raises.} =
-  let a = cast[VariantArray](v.VArray)
-  if a == nil:
+  if not VarIsArray(v) or v.VArray == nil:
     pasCurrentExc = EVariantError.Create("Variant is not an array")
     raise ValueError
-  result = a.values[arrayIndexOf(a, [i])]
+  result = v.VArray.values[arrayIndexOf(v.VArray, [i])]
 
 proc `[]=`*(v: var Variant; i: int32; x: Variant) {.raises.} =
-  let a = cast[VariantArray](v.VArray)
-  if a == nil:
+  if not VarIsArray(v) or v.VArray == nil:
     pasCurrentExc = EVariantError.Create("Variant is not an array")
     raise ValueError
-  a.values[arrayIndexOf(a, [i])] = x
+  v.VArray.values[arrayIndexOf(v.VArray, [i])] = x
 
 proc VarArrayGet*(v: Variant; indices: openArray[int32]): Variant =
-  let a = cast[VariantArray](v.VArray)
-  if a == nil: result = Unassigned
-  else: result = a.values[arrayIndexOf(a, indices)]
+  if not VarIsArray(v) or v.VArray == nil: result = Unassigned
+  else: result = v.VArray.values[arrayIndexOf(v.VArray, indices)]
 
 proc VarArrayPut*(v: var Variant; x: Variant; indices: openArray[int32]) =
-  let a = cast[VariantArray](v.VArray)
-  if a != nil: a.values[arrayIndexOf(a, indices)] = x
+  if VarIsArray(v) and v.VArray != nil:
+    v.VArray.values[arrayIndexOf(v.VArray, indices)] = x
 
 proc VarArrayRedim*(v: var Variant; highBound: int32) =
-  let a = cast[VariantArray](v.VArray)
-  if a != nil and a.dims.len == 1:
+  if VarIsArray(v) and v.VArray != nil and v.VArray.dims.len == 1:
+    let a = v.VArray
     let lo = a.dims[0].lo
     a.dims[0] = (lo: lo, hi: highBound)
     var total = int(highBound - lo + 1)

@@ -140,9 +140,9 @@ block:
   chk("weakSlice value", acc, "world")
 
 # --- string <-> AnsiString: correct conversion form ------------------------
-# Conversions go through readRawData/beginStore, never toCString (which
-# *mutates* by materialising a terminator - an extra allocation for a type
-# that already terminates itself).
+# Conversions go through the counted byte copy, never toCString. Raw byte
+# reads use the exported `data` field (`s.data[i]`, no detach); the model
+# itself no longer exposes a nimony-style `readRawData`.
 block:
   let src = "hello"
   let a = toAnsiString(src)
@@ -158,10 +158,10 @@ block:
 # leaves a second zero byte at data[len+1] for even lengths.
 block:
   let odd = toAnsiString("abc")            # len 3
-  chk("odd terminator", $int(cast[uint8](readRawData(odd, 3'i32)[0])), "0")
+  chk("odd terminator", $int(cast[uint8](odd.data[3])), "0")
   let even = toAnsiString("ab")            # len 2
-  chk("even terminator", $int(cast[uint8](readRawData(even, 2'i32)[0])), "0")
-  chk("even second zero", $int(cast[uint8](readRawData(even, 3'i32)[0])), "0")
+  chk("even terminator", $int(cast[uint8](even.data[2])), "0")
+  chk("even second zero", $int(cast[uint8](even.data[3])), "0")
   chk("empty is nil", $(isNil(toAnsiString("")) == true), "true")
 
 # --- no duplicate NUL when string -> AnsiString -----------------------------
@@ -190,8 +190,8 @@ block:
   var a = toAnsiString("hello")
   var b = a
   chk("read share refCount", $refCount(a), "2")
-  chk("read p0", cs(readRawData(a)[0]), "h")
-  chk("read p4", cs(readRawData(a, 4'i32)[0]), "o")
+  chk("read p0", cs(a.data[0]), "h")
+  chk("read p4", cs(a.data[4]), "o")
   chk("read no unique a", $refCount(a), "2")
   chk("read no unique b", $refCount(b), "2")
 
@@ -214,7 +214,7 @@ block:
   endStore(a)
   chk("beginStore grow", toString(a), "abcd")
   chk("beginStore grow terminator",
-      $int(cast[uint8](readRawData(a, 4'i32)[0])), "0")
+      $int(cast[uint8](a.data[4])), "0")
 
 # --- const literal: refCnt = -1 (Delphi typed const) -----------------------
 const pasLit_foo = ConstAnsiLit[7](
@@ -225,7 +225,7 @@ block:
   chk("lit refCount", $refCount(cl), "-1")
   chk("lit len", $cl.len, "7")
   chk("lit value", toString(cl), "foo bar")
-  chk("lit terminator", $int(cast[uint8](readRawData(cl, 7'i32)[0])), "0")
+  chk("lit terminator", $int(cast[uint8](cl.data[7])), "0")
   chk("lit toCString", fromCString(toCString(cl)), "foo bar")
   var m = cl
   chk("lit shared refCount", $refCount(m), "-1")

@@ -20,10 +20,13 @@ fi
 TMP="$HERE/tmp"
 mkdir -p "$TMP"
 # the runtime shim units must be importable from the generated modules.
-# The placeholder-only units (Windows, Forms, ...) go alongside them: a
-# Pascal `uses Windows` becomes `import Windows`, and the placeholders
-# directory is deliberately not on --path, so the module has to be
-# visible where the .nim anchor is compiled from.
+# The placeholder stubs (Delphi units we do not shim: Forms, Graphics, ...)
+# go alongside them too: a Pascal `uses Forms` becomes `import Forms`, and
+# the placeholders directory is deliberately not on --path, so the module
+# has to be visible where the .nim anchor is compiled from. That directory
+# is generated and gitignored (make-placeholders.sh) - its file names are
+# unit names of the closed-source trees, so absence is fine here: the public
+# samples only `uses` units the runtime itself provides.
 cp -f "$ROOT"/runtime/*.nim "$TMP/"
 cp -f "$ROOT"/runtime/placeholders/*.nim "$TMP/" 2>/dev/null || true
 
@@ -411,7 +414,7 @@ if [ -x "$ROOT/bin/pasler" ] && [ -f "$HERE/ccprobe.pas" ]; then
   else
     echo "   CC WARNING/RUN MISMATCH (want one warning + 2468)"; fail=1
   fi
-  rm -rf nimcache
+  rm -rf "$TMP/pasler-cc/nimcache"
   if (cd "$TMP/pasler-cc" && timeout 300 "$ROOT/bin/pasler" --strict \
       --run ccprobe.pas > /dev/null 2>&1); then
     echo "   STRICT MODE DID NOT FAIL"; fail=1
@@ -471,6 +474,22 @@ fi
 # that must stay green before the ansistring -> string mapping is split.
 if ! sh "$HERE/ansi/ansi-oracle.sh"; then
   echo "   ANSI ORACLE FAILED"; fail=1
+fi
+
+# The same tier on the toolchain these sources actually target: every leg a
+# Windows binary in the wine win64 prefix (FPC 3.2.2 x86_64-win64, Delphi
+# 2007 dcc32, our own bin/pasler.exe). Skips when the prefix or the Windows
+# compilers are absent (build them with build-win64.sh).
+if ! sh "$HERE/ansi/win64-oracle.sh"; then
+  echo "   WIN64 ORACLE FAILED"; fail=1
+fi
+
+# Variant conformance tier: the shim-level checks (vshim.nim) plus the
+# FPC/Delphi differential over test/variant/*.pas, on the Windows toolchain
+# as well - Delphi 2007 and FPC 3.2.2 x86_64-win64 are the targets whose
+# Variant semantics the shim models.
+if ! sh "$HERE/variant/win64-oracle.sh"; then
+  echo "   WIN64 VARIANT ORACLE FAILED"; fail=1
 fi
 
 # keep the generated artifacts for inspection, but drop the build cache

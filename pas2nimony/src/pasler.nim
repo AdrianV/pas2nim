@@ -1,3 +1,4 @@
+{.feature: "lenientnils".}
 #
 #           pasler - the Pascal front-end driver for the nimony chain
 #
@@ -34,6 +35,19 @@ import ../../nimony/src/gear2/modnames
 
 when defined(posix):
   proc usleep(usecs: cuint) {.importc: "usleep", header: "<unistd.h>".}
+elif defined(windows):
+  proc Sleep(ms: uint32) {.importc: "Sleep", header: "<windows.h>".}
+
+proc waitPastAnchor(needNs: int64) =
+  ## The nimony driver's staleness test has whole-second granularity, so our
+  ## TokenBuf NIFs must land in a later second than every anchor. This was
+  ## posix-only (`usleep`), which made the wait a no-op on Windows and let
+  ## nifler re-parse the anchors and overwrite our `.p.nif`.
+  if needNs > 0:
+    when defined(posix):
+      usleep(cuint(needNs div 1000 + 1))
+    elif defined(windows):
+      Sleep(uint32(needNs div 1_000_000 + 1))
 
 proc usage =
   const Usage = """
@@ -122,6 +136,11 @@ proc mirrorPlaceholders(nimcache, runtimeDir: string;
   ## on --path, and nimony prefers a nimcache hit over a library search, so
   ## the copy is exactly as visible as an absorbed unit - which is what a
   ## Pascal unit import means.
+  ##
+  ## The directory is generated locally and gitignored (make-placeholders.sh
+  ## derives it from the private trees, whose unit names must not be
+  ## published), so its absence is normal: a unit that needs a stub simply
+  ## stays unresolved and nimony reports it.
   let phDir = runtimeDir / "placeholders"
   var anchors = units
   anchors.add(mainFile)
@@ -335,10 +354,7 @@ proc main =
     try:
       writeFile(probe, "t")
       let nowNs = fileMtimeNs(probe)
-      let needNs = lastAnchorNs + 1_100_000_000 - nowNs
-      if needNs > 0:
-        when defined(posix):
-          usleep(cuint(needNs div 1000 + 1))
+      waitPastAnchor(lastAnchorNs + 1_100_000_000 - nowNs)
     except ErrorCode:
       discard
     var cmd = quoteShell(nimonyBin) & " " & command &
@@ -364,10 +380,7 @@ proc main =
   try:
     writeFile(probe, "t")
     let nowNs = fileMtimeNs(probe)
-    let needNs = lastAnchorNs + 1_100_000_000 - nowNs
-    if needNs > 0:
-      when defined(posix):
-        usleep(cuint(needNs div 1000 + 1))
+    waitPastAnchor(lastAnchorNs + 1_100_000_000 - nowNs)
   except ErrorCode:
     discard
 

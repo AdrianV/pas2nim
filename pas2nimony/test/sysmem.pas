@@ -1,7 +1,7 @@
 program SysMem;
 (* The Delphi memory primitives. systempas had no `AllocMem` /
   `FreeMem` / `FreeMemory` / `ReallocMem` / `ReallocMemory` at all, so
-  every unit that allocates raw nodes (tplbtree, GdfList, DynObj) died
+  every corpus unit that allocates raw nodes died
   with "undeclared identifier: 'AllocMem'"; `Move` and `FillChar` were
   missing too.
 
@@ -13,7 +13,7 @@ program SysMem;
   KNOWN GAP, deliberately not exercised here: Pascal assigns `Pointer`
   to a TYPED pointer implicitly (`p: PInts; p := AllocMem(n)`), nimony
   does not ("got: pointer but wanted: ptr array[..]"). That coercion is
-  the next blocker for the tplbtree allocation sites. *)
+  the next blocker for the corpus's allocation sites. *)
 
 uses SysUtils;
 

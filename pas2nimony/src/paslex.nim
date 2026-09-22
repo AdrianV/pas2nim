@@ -1,3 +1,4 @@
+{.feature: "lenientnils".}
 #
 #           pas2nimony - Pascal to Nimony translator
 #        (c) Copyright 2025 Adrian  (based on pas2nim by A. Rumpf)
@@ -323,7 +324,7 @@ proc opaqueDirectiveBody(L: var TLexer, tok: var TToken, closeCurly: bool) =
 proc captureIncludeName(L: var TLexer, tok: var TToken, closeCurly: bool) =
   ## the file name of an `{$I ...}` / `{$INCLUDE ...}` directive, taken
   ## raw into tok.literal. Delphi accepts it quoted ('jedi.inc') or bare
-  ## (vList.inc); the bare form ends at the directive's close marker. The
+  ## (one corpus include); the bare form ends at the directive's close
   ## quoted form deliberately does NOT go through opaqueDirectiveBody,
   ## which throws the body away - that exists for `{$HPPEMIT 'text'}`.
   ##

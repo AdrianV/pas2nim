@@ -1,6 +1,6 @@
 program WithPtrParam;
-(* The pointer-typed base of the tplbtree node layout. In
-  pascal4neko's tplbtree.inc the array is reached through a PARAMETER
+(* The pointer-typed base of the corpus's node layout. In its own
+  include the array is reached through a PARAMETER
   or LOCAL of pointer type:
 
     procedure DeleteItem(n: PNode; x: Integer);
@@ -21,7 +21,7 @@ program WithPtrParam;
 
   withalias.pas covers with r[i] (a named array alias) and
   withptr.pas covers with r.Items[i] (a record variable). This
-  covers the pointer-typed receiver, which is the lazyBtree shape. *)
+  covers the pointer-typed receiver, which is the container shape. *)
 
 type
   PNode = ^RNode;

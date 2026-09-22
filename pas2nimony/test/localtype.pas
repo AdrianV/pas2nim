@@ -2,8 +2,8 @@ program LocalType;
 (* A routine-LOCAL `type` section. nimony allows `type` inside a proc,
   but pas2nimony's statement renderer used to discard nkTypeSection,
   silently dropping the declaration and leaving every use undeclared
-  (tplbtree.inc declares `RPath` locally inside InternalDelete/
-  InternalPut). Module-level type sections were always emitted; only
+  (a corpus include declares `RPath` locally inside its delete and put
+  routines). Module-level type sections were always emitted; only
   the in-procedure case was lost. *)
 
 type

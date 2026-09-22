@@ -102,18 +102,20 @@ chk("VarToStr null", "[" & text(v) & "]", "[]")
 v = Unassigned
 chk("VarToStr unassigned", "[" & text(v) & "]", "[]")
 
-# --- varString holds a real AnsiString (FPC/Delphi pointer slot) -----------
-# The slot is a raw pointer, hard-cast to an AnsiString only here - it is not
-# a managed AnsiString field (that crashed on the raising-return path, because
-# the generated hook freed whatever bits were in the union).
+# --- varString: the payload is text, not FPC/Delphi's raw pointer slot ------
+# Both oracles tag an AnsiString varString; the *payload* here is the text
+# (a managed AnsiString field is impossible: nimony miscompiles an assignment
+# to a managed field of an object for a type with user hooks). The observable
+# half of Delphi's sharing is that the Variant keeps its own text even when
+# the source string is mutated afterwards (COW).
 proc ansiChecks() =
-  let hello = toAnsiString("hello")
+  var hello = toAnsiString("hello")
   let vh = toVariant(hello)
   chk("ansi var type", $VarType(vh), "256")
   chk("ansi var str", VarToStr(vh), "hello")
-  chk("ansi slot text",
-      ptrToNimString(cast[uint64](vh.VAnsiString)), "hello")
-  chk("ansi slot refcount", $refCount(hello), "2")
+  hello[0] = 'H'
+  chk("ansi src mutated", toString(hello), "Hello")
+  chk("ansi var kept its own text", VarToStr(vh), "hello")
   var s: string = "plain"
   let vs = toVariant(s)
   chk("plain var type", $VarType(vs), "256")

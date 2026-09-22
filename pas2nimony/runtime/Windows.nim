@@ -1,3 +1,4 @@
+{.feature: "lenientnils".}
 # Delphi Windows-unit compat surface for the corpus's MSWINDOWS
 # branches (SyncObjs first: the sync primitives and the CoWait thread
 # machinery). Stub-only on Linux: the sync objects get opaque dummy

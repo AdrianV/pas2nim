@@ -17,7 +17,7 @@ Two different things are easy to conflate, so they are stated separately.
 The parser's reach is deliberately wider than the proven tier. It is measured against a
 large third-party Delphi 2007 corpus that is kept out of this repository:
 **all 55 units of that closure translate** - 47 from Pascal source, 8 satisfied by runtime
-shims. Compilation of that tier has begun: the five `lazyBtree*` generic-container modules
+shims. Compilation of that tier has begun: the corpus's five generic-container modules
 now type-check and build under nimony (see `pas2nimony/doc/nimony-compat.md`, M15). The other
 50 are translated but not yet compiled; that gap is exactly where the remaining unknowns live.
 

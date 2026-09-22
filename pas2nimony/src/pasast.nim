@@ -1,3 +1,4 @@
+{.feature: "lenientnils".}
 #
 #           pas2nimony - Pascal to Nimony translator
 #        (c) Copyright 2025 Adrian  (based on pas2nim by A. Rumpf)
@@ -75,6 +76,8 @@ type
     exported*: bool     ## interface-section name: emit an export marker
     isRecordType*: bool ## type came from the Pascal `record` keyword
     isOutParam*: bool   ## `out` parameter (not `var`): no init proof
+    noInitParam*: bool  ## `out` param excluded from nimony init proof
+    resultNoInit*: bool ## routine result written via `addr result`: no init proof
     isImmutable*: bool  ## `const` parameter: read-only `with` base
 
 proc `[]`*(n: Node; i: int): Node {.inline.} = n.sons[i]
